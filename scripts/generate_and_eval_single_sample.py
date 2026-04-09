@@ -234,6 +234,10 @@ def main(config: EvalConfig):
 
     # Query server with constructed prompt
     custom_kernel = inference_server(custom_prompt)
+
+    custom_log_file = os.path.join("/scratch/adalal542/KernelBench/results/custom_logs", f"{config.model_name.split('/')[-1].lower()}_generated_kernel_level_{config.level}_problem_{config.problem_id}")
+    with open(custom_log_file, "w") as f:
+        f.write(custom_kernel)
     custom_kernel = extract_first_code(custom_kernel, ["python", "cpp"])
 
     # check LLM is able to generate custom kernel code
