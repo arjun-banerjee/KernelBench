@@ -114,9 +114,10 @@ def query_server(
         client = OpenAI(
             api_key=SGLANG_KEY, base_url=f"{url}/v1", timeout=None, max_retries=0
         )
+        print(model_name)
         if isinstance(prompt, str):
             response = client.completions.create(
-                model="default",
+                model=(model_name if model_name and model_name != "default" else "default"),
                 prompt=prompt,
                 temperature=temperature,
                 n=num_completions,
@@ -126,7 +127,7 @@ def query_server(
             outputs = [choice.text for choice in response.choices]
         else:
             response = client.chat.completions.create(
-                model="default",
+                model=(model_name if model_name and model_name != "default" else "default"),
                 messages=prompt,
                 temperature=temperature,
                 n=num_completions,
