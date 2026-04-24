@@ -267,11 +267,17 @@ class KernelAgent:
                 n_fc = sum(
                     1 for it in response_items if it.get("type") == "function_call"
                 )
+
                 print(
                     f"\n[Agent] Turn {turn_idx} "
                     f"({llm_latency:.1f}s, {len(response_items)} output items, "
                     f"{n_fc} function calls)"
                 )
+
+                for it in response_items:
+                    if it.get("type") == "function_call":
+                        fc = it.get("function", {})
+                        print(f"[fn] {fc.get('name')}({fc.get('arguments')})")
 
             # --- Execute tool calls ---
             function_calls = [
