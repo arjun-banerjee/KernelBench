@@ -350,6 +350,41 @@ def get_prompt_for_backend(
     )
 
 
+def get_annotated_compile_prompt(
+    ref_arch_src: str,
+    *,
+    backend: str = "triton",
+    precision: Optional[str] = None,
+    include_hardware: bool = False,
+    gpu_name: Optional[str] = None,
+    log_path: str = "/tmp/kb_annotated_compile.log",
+) -> str:
+    """Render the `annotated_compile` prompt.
+
+    Runs torch.compile (debug mode) on the reference model to capture the
+    FX graph, fusion decisions, schedule, and generated Triton kernels, then
+    renders the `annotated_compile` option template with that context.
+
+    Requires a CUDA device. Raises RuntimeError if torch.compile fails or
+    produces no Triton kernels for the reference model.
+    """
+    from kernelbench.compile_annotations import build_annotated_context
+
+    annotation_context = build_annotated_context(ref_arch_src, log_path=log_path)
+    context = {"ref_arch_src": ref_arch_src, **annotation_context}
+
+    return render_prompt_by_option(
+        prompts_toml=PROMPTS_TOML,
+        backend=backend.lower(),
+        option="annotated_compile",
+        context=context,
+        precision=precision,
+        include_hardware=include_hardware,
+        gpu_specs_py=GPU_SPECS_PY if include_hardware else None,
+        gpu_name=gpu_name,
+    )
+
+
 def get_custom_prompt(
     custom_key: str,
     *,
@@ -391,6 +426,7 @@ def get_custom_prompt(
 __all__ = [
     "get_prompt_for_backend",
     "get_custom_prompt",
+    "get_annotated_compile_prompt",
     "get_prompt_with_hardware",
     "render_prompt_by_option",
     "PromptConfig",
