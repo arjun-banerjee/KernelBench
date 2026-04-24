@@ -1,368 +1,215 @@
 """
-System and turn prompts for the KernelBench multi-turn agent.
+Prompts for the KernelBench multi-turn agent.
 
-Tool call format dialects
---------------------------
-Different models are trained on different XML tool-call conventions.
-Pass `tool_format` to `build_system_prompt()` to show the model its own dialect.
+Three public builders:
+    build_system_prompt(max_turns, max_tool_calls, backend) -> str
+        The system prompt, passed as `instructions` to the Responses API.
+        Stable across turns within a run.
 
-  "canonical"  (default) — our <tool_call><tool_name>…</tool_name>… </tool_call>
-                           Works with Claude, Gemini, GPT-4, open-source instruct models.
+    build_problem_message(ref_arch_src, backend, precision) -> str
+        The first user-role message: task statement, backend-specific output
+        format, and the reference PyTorch source.
 
-  "nemotron"   — Nemotron/Llama function-calling XML:
-                   <function=tool_name>
-                   <parameter=kernel_code>…</parameter>
-                   </function>
+    build_turn_warning_message(turns_remaining, tool_calls_remaining) -> str
+        Injected as a user-role message every turn once the warning threshold
+        is crossed.
 
-  "auto"       — Show both formats. Useful when model dialect is unknown.
-
-The parser in agent.py understands all dialects regardless of which is shown,
-so format mismatch causes confusion but never data loss.
+Tool descriptions live in `tools.py` as JSON-schema `description` fields and
+are not duplicated here.
 """
 
 from __future__ import annotations
-from typing import List, Literal
-
-ToolFormat = Literal["canonical", "nemotron", "auto"]
 
 
 # ---------------------------------------------------------------------------
-# System intro (shared across all formats)
+# Backend display-name map (shared between system prompt and problem message)
 # ---------------------------------------------------------------------------
 
-_SYSTEM_INTRO = """\
+_BACKEND_DISPLAY: dict[str, str] = {
+    "cuda": "CUDA",
+    "triton": "Triton",
+    "tilelang": "TileLang",
+    "cute": "CUTLASS/CuTe",
+}
+
+
+def _backend_display(backend: str) -> str:
+    """Return a human-readable backend name. Raises for unsupported backends."""
+    key = backend.lower()
+    if key not in _BACKEND_DISPLAY:
+        raise NotImplementedError(
+            f"Backend '{backend}' is not supported by the agent prompts. "
+            f"Supported backends: {sorted(_BACKEND_DISPLAY.keys())}."
+        )
+    return _BACKEND_DISPLAY[key]
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT_TEMPLATE = """\
 You are an expert GPU kernel engineer. Your task is to write a high-performance \
-custom CUDA/GPU kernel that replaces the PyTorch reference implementation provided, \
-while producing numerically identical results.
+custom {backend_display} kernel that replaces a PyTorch reference implementation, \
+producing numerically identical results.
 
-You will work iteratively: you can use tools to compile, test, and profile your \
-kernel before making a final submission. Think carefully about the hardware architecture \
-and optimization opportunities before writing code.\
+You work iteratively: call tools to compile, test, and profile your kernel, read \
+the results, and refine.
+
+## Session limits
+
+- You have {max_turns} turns. One turn is one response from you, which may \
+contain reasoning and zero or more tool calls.
+- You have {max_tool_calls} tool calls total across all turns.
+- Only `submit_kernel` records your final result. It ends the session.
+
+## Correctness requirements
+
+- Outputs must match the reference within tolerance: fp32 uses atol=rtol=1e-4; \
+fp16/bf16 use atol=rtol=1e-2.
+- Do not use try/except fallbacks to the reference, patch timing functions, or \
+otherwise work around correctness or timing measurement — these are detected \
+and cause evaluation failure.
 """
 
-
-# ---------------------------------------------------------------------------
-# Tool section — per-format examples
-# ---------------------------------------------------------------------------
-
-_TOOL_HEADER_CANONICAL = """
-## Available Tools
-
-Call tools using this XML format anywhere in your response.
-
-Tool with kernel code:
-```
-<tool_call>
-<tool_name>TOOL_NAME</tool_name>
-<kernel_code>
-```python
-# your full kernel code here
-```
-</kernel_code>
-</tool_call>
-```
-
-Tool with no arguments (e.g. `get_gpu_specs`):
-```
-<tool_call>
-<tool_name>get_gpu_specs</tool_name>
-</tool_call>
-```
-
-You may make multiple tool calls in one response. They are executed in order.
-**Only `submit_kernel` records the final evaluation result.**
-"""
-
-_TOOL_HEADER_NEMOTRON = """
-## Available Tools
-
-Call tools using the function-call format anywhere in your response.
-
-Tool with kernel code:
-```
-<function=TOOL_NAME>
-<parameter=kernel_code>
-```python
-# your full kernel code here
-```
-</parameter>
-</function>
-```
-
-Tool with no arguments (e.g. `get_gpu_specs`):
-```
-<function=get_gpu_specs>
-</function>
-```
-
-You may make multiple tool calls in one response. They are executed in order.
-**Only `submit_kernel` records the final evaluation result.**
-"""
-
-_TOOL_HEADER_AUTO = """
-## Available Tools
-
-Call tools using **either** of these XML formats anywhere in your response.
-
-Format A:
-```
-<tool_call>
-<tool_name>TOOL_NAME</tool_name>
-<kernel_code>```python
-# kernel code
-```</kernel_code>
-</tool_call>
-```
-
-Format B (Nemotron/Llama style):
-```
-<function=TOOL_NAME>
-<parameter=kernel_code>```python
-# kernel code
-```</parameter>
-</function>
-```
-
-For tools with no arguments, omit the code block entirely.
-You may make multiple tool calls in one response. They are executed in order.
-**Only `submit_kernel` records the final evaluation result.**
-"""
-
-_TOOL_HEADERS: dict = {
-    "canonical": _TOOL_HEADER_CANONICAL,
-    "nemotron":  _TOOL_HEADER_NEMOTRON,
-    "auto":      _TOOL_HEADER_AUTO,
-}
-
-
-# ---------------------------------------------------------------------------
-# Per-tool descriptions (format-neutral)
-# ---------------------------------------------------------------------------
-
-_TOOL_DESCRIPTIONS = {
-    "compile_kernel": (
-        "**compile_kernel** — Try to compile your kernel. Returns compiler errors or success. "
-        "Use this first to catch syntax and linker errors cheaply."
-    ),
-    "run_correctness": (
-        "**run_correctness** — Run correctness trials (no timing). Shows which trials passed "
-        "and the nature of any numerical or runtime errors."
-    ),
-    "profile_kernel": (
-        "**profile_kernel** — Profile your kernel with NVIDIA Nsight Compute. Returns memory "
-        "bandwidth utilization, compute throughput, arithmetic intensity, and roofline "
-        "bottleneck classification. Use this to understand *why* your kernel is slow."
-    ),
-    "get_gpu_specs": (
-        "**get_gpu_specs** — Return peak specs for the current GPU (memory bandwidth, TFLOPS, "
-        "shared memory, register file, etc.). Use this to calibrate your optimization strategy."
-    ),
-    "static_check": (
-        "**static_check** — Run static analysis to detect reward-hacking patterns before "
-        "submitting (try-except fallbacks, timing patches, lazy tensors, etc.)."
-    ),
-    "submit_kernel": (
-        "**submit_kernel** — Final submission. Runs full correctness check + timing measurement. "
-        "Reports your kernel's runtime in μs. This terminates the session — only call it "
-        "when you are confident in your kernel."
-    ),
-}
-
-
-# ---------------------------------------------------------------------------
-# Workflow hints and session limits (shared)
-# ---------------------------------------------------------------------------
-
-_STRATEGY_HINTS = """
-## Suggested Workflow
-
-1. Call `get_gpu_specs` to understand the hardware constraints.
-2. Study the reference code and plan your optimization strategy.
-3. Write a kernel and call `compile_kernel` to check for errors.
-4. Call `run_correctness` to verify numerical correctness.
-5. Call `profile_kernel` (if available) to identify bottlenecks.
-6. Iterate on the optimization based on profiling feedback.
-7. Call `submit_kernel` with your best kernel.
-
-## Optimization Principles
-
-- **Memory-bound kernels**: focus on coalesced access, shared memory tiling, \
-vectorized loads (float4), and reducing redundant global memory traffic.
-- **Compute-bound kernels**: maximize tensor core utilization, instruction-level \
-parallelism, and warp occupancy.
-- Avoid patterns flagged by the static checker (try-except fallbacks, timing patches).
-- All outputs must be numerically equivalent to the reference within the tolerance \
-for the specified precision (fp32: atol=rtol=1e-4, fp16/bf16: atol=rtol=1e-2).
-"""
-
-_TURN_LIMIT_NOTICE = """
-## Session Limits
-
-- You have **{max_turns} turns** (one turn = one response from you).
-- You may make up to **{max_tool_calls} tool calls total** across all turns.
-- Use your budget wisely: compile early, profile once, and submit when ready.
-"""
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def build_system_prompt(
-    available_tools: List[str],
+    *,
     max_turns: int,
     max_tool_calls: int,
-    tool_format: ToolFormat = "canonical",
+    backend: str,
 ) -> str:
-    """
-    Build the system prompt for the agent.
-
-    Args:
-        available_tools: Tool names enabled for this run (controls which tools
-                         are listed in the prompt).
-        max_turns:       Turn cap for this run.
-        max_tool_calls:  Total tool call cap.
-        tool_format:     XML dialect to show in the prompt instructions.
-                         "canonical" | "nemotron" | "auto"
-
-    Returns:
-        Full system prompt string.
-    """
-    if tool_format not in _TOOL_HEADERS:
-        raise ValueError(
-            f"Unknown tool_format '{tool_format}'. "
-            f"Choose from: {list(_TOOL_HEADERS.keys())}"
-        )
-
-    parts = [
-        _SYSTEM_INTRO,
-        _TOOL_HEADERS[tool_format],
-    ]
-
-    # List only the tools enabled for this run
-    tool_lines = ["### Tools available in this session:\n"]
-    for tool_name in available_tools:
-        desc = _TOOL_DESCRIPTIONS.get(tool_name)
-        if desc:
-            tool_lines.append(f"- {desc}")
-    parts.append("\n".join(tool_lines))
-
-    parts.append(_STRATEGY_HINTS)
-    parts.append(
-        _TURN_LIMIT_NOTICE.format(max_turns=max_turns, max_tool_calls=max_tool_calls)
+    """Build the agent's system prompt (the API's `instructions` parameter)."""
+    return _SYSTEM_PROMPT_TEMPLATE.format(
+        backend_display=_backend_display(backend),
+        max_turns=max_turns,
+        max_tool_calls=max_tool_calls,
     )
 
-    return "\n".join(parts)
+
+# ---------------------------------------------------------------------------
+# Per-backend output-format blocks
+# ---------------------------------------------------------------------------
+
+
+def _output_format_cuda() -> str:
+    return """\
+## Output format
+
+Your submission is a complete Python file that defines a class called \
+`ModelNew`. The file is executed with `exec()` before we instantiate \
+`ModelNew`, so any module-level setup runs first.
+
+Use `torch.utils.cpp_extension.load_inline` to compile and bind CUDA source at \
+module load time, then call the compiled extension from `ModelNew.forward`. Do \
+not submit raw CUDA C or a standalone .cu file."""
+
+
+def _output_format_triton() -> str:
+    return """\
+## Output format
+
+Your submission is a complete Python file that defines a class called \
+`ModelNew`. Write the kernel as a function decorated with `@triton.jit` (or \
+`@triton.autotune`) using `triton.language` (commonly aliased as `tl`). Launch \
+the kernel from `ModelNew.forward` with an appropriate grid."""
+
+
+def _output_format_tilelang() -> str:
+    return """\
+## Output format
+
+Your submission is a complete Python file that defines a class called \
+`ModelNew`. Write the kernel as a `@T.prim_func` using `tilelang.language` \
+(aliased as `T`), compile it with `tilelang.compile(..., target="cuda")`, and \
+invoke the compiled kernel from `ModelNew.forward`. Note: TileLang requires \
+fp16 or bf16 precision."""
+
+
+def _output_format_cute() -> str:
+    return """\
+## Output format
+
+Your submission is a complete Python file that defines a class called \
+`ModelNew`. Use the CUTLASS/CuTe Python bindings (`cutlass`, and the `cute::` \
+namespace in any inlined C++) to build the kernel, and invoke it from \
+`ModelNew.forward`."""
+
+
+_OUTPUT_FORMAT_BUILDERS = {
+    "cuda": _output_format_cuda,
+    "triton": _output_format_triton,
+    "tilelang": _output_format_tilelang,
+    "cute": _output_format_cute,
+}
+
+
+def _output_format(backend: str) -> str:
+    """Return the output-format block for the given backend, or raise."""
+    key = backend.lower()
+    builder = _OUTPUT_FORMAT_BUILDERS.get(key)
+    if builder is None:
+        raise NotImplementedError(
+            f"No output-format prompt for backend '{backend}'. "
+            f"Supported backends: {sorted(_OUTPUT_FORMAT_BUILDERS.keys())}."
+        )
+    return builder()
 
 
 # ---------------------------------------------------------------------------
-# First user message — the problem statement
+# Problem message (first user turn)
 # ---------------------------------------------------------------------------
 
-_LOAD_INLINE_EXAMPLE = """\
-## Required Output Format
-
-You must submit a **complete Python file** containing a `ModelNew` class that
-uses `torch.utils.cpp_extension.load_inline` to compile and call a custom CUDA
-kernel. The file is executed with `exec()` — it must be valid Python from line 1.
-
-Minimal skeleton (adapt to the actual problem):
-
-```python
-import torch
-import torch.nn as nn
-from torch.utils.cpp_extension import load_inline
-
-cuda_src = \"\"\"
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-
-__global__ void my_kernel(const float* x, float* out, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = x[i];  // replace with actual computation
-}
-
-torch::Tensor my_op(torch::Tensor x) {
-    auto out = torch::empty_like(x);
-    int n = x.numel();
-    my_kernel<<<(n+255)/256, 256>>>(x.data_ptr<float>(), out.data_ptr<float>(), n);
-    return out;
-}
-\"\"\"
-
-cpp_src = "torch::Tensor my_op(torch::Tensor x);"
-
-_ext = load_inline(
-    name="my_kernel",
-    cpp_sources=cpp_src,
-    cuda_sources=cuda_src,
-    functions=["my_op"],
-    verbose=False,
-)
-
-class ModelNew(nn.Module):
-    def __init__(self, ...):  # same args as Model
-        super().__init__()
-        # copy any parameters from Model here
-
-    def forward(self, x):
-        return _ext.my_op(x)
-```
-
-**Do NOT submit raw CUDA C code** — the harness expects a Python file."""
-
-
-def build_problem_message(
-    ref_arch_src: str,
-    backend: str,
-    precision: str,
-    hardware_info: str = "",
-) -> str:
-    hw_block = f"\n## Hardware\n{hardware_info}\n" if hardware_info else ""
-
-    return f"""\
+_PROBLEM_TEMPLATE = """\
 ## Task
 
 Optimize the following PyTorch model by replacing its forward computation with \
-a custom {backend.upper()} kernel. Your `ModelNew` class must:
+a custom {backend_display} kernel. Your `ModelNew` class must:
 
 1. Accept the same constructor arguments as `Model`.
-2. Implement a `forward()` method with the same signature.
-3. Produce numerically equivalent outputs (precision: **{precision}**).
-4. Be faster than the PyTorch reference implementation.
-{hw_block}
-{_LOAD_INLINE_EXAMPLE}
+2. Implement `forward()` with the same signature.
+3. Produce numerically equivalent outputs at {precision} precision.
+4. Be faster than the PyTorch reference.
 
-## Reference Implementation
+{output_format}
+
+## Reference implementation
 
 ```python
 {ref_arch_src}
 ```
-
-Begin by reasoning about the computation, then use the available tools to \
-build and test your kernel iteratively. When you are satisfied, call `submit_kernel`.
 """
 
 
-# ---------------------------------------------------------------------------
-# Tool result wrapper
-# ---------------------------------------------------------------------------
-
-def build_tool_results_message(tool_results_text: str) -> str:
-    return (
-        "## Tool Results\n\n"
-        + tool_results_text
-        + "\n\nContinue optimizing or call `submit_kernel` when ready."
+def build_problem_message(
+    *,
+    ref_arch_src: str,
+    backend: str,
+    precision: str,
+) -> str:
+    """Build the first user-role message describing the problem."""
+    return _PROBLEM_TEMPLATE.format(
+        backend_display=_backend_display(backend),
+        precision=precision,
+        output_format=_output_format(backend),
+        ref_arch_src=ref_arch_src.rstrip(),
     )
 
 
 # ---------------------------------------------------------------------------
-# Turn limit warning
+# Turn-limit warning
 # ---------------------------------------------------------------------------
 
-def build_turn_warning_message(turns_remaining: int, tool_calls_remaining: int) -> str:
+
+def build_turn_warning_message(
+    turns_remaining: int,
+    tool_calls_remaining: int,
+) -> str:
+    """Build the soft warning injected as a user message near the session cap."""
+    turn_word = "turn" if turns_remaining == 1 else "turns"
+    call_word = "tool call" if tool_calls_remaining == 1 else "tool calls"
     return (
-        f"**Session warning**: {turns_remaining} turn(s) and "
-        f"{tool_calls_remaining} tool call(s) remaining. "
-        "Consider calling `submit_kernel` with your best kernel."
+        f"Session warning: {turns_remaining} {turn_word} and "
+        f"{tool_calls_remaining} {call_word} remain. "
+        "Submit your best kernel soon."
     )

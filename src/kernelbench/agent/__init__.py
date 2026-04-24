@@ -8,15 +8,15 @@ Public API:
     from kernelbench.agent.nsight_parser import parse_nsight_metrics, ProfileSummary
 """
 
-from .agent import KernelAgent, parse_tool_calls
-from .tools import get_tools, ToolContext, TOOL_REGISTRY, ALL_TOOLS
+from .agent import KernelAgent
+from .tools import get_tools, ToolContext, ToolResult, TOOL_REGISTRY, ALL_TOOLS
 from .trajectory import KernelTrajectory, KernelTurn, ToolCall
 
 __all__ = [
     "KernelAgent",
-    "parse_tool_calls",
     "get_tools",
     "ToolContext",
+    "ToolResult",
     "TOOL_REGISTRY",
     "ALL_TOOLS",
     "KernelTrajectory",
