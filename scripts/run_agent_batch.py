@@ -13,8 +13,6 @@ separate *process* with an assigned CUDA device.
 For a single GPU, set num_workers=1 (agents run sequentially, GPU is reused).
 For N GPUs, set num_workers=N — problems are distributed round-robin.
 
-The vLLM / local inference server is shared; all workers call it concurrently.
-
 Output layout (mirrors generate_samples.py + eval_from_generations.py)
 -----------------------------------------------------------------------
 runs/{run_name}/
@@ -25,96 +23,101 @@ runs/{run_name}/
 
 Example usage:
   uv run python scripts/run_agent_batch.py \\
-    dataset_src=local level=5 \\
-    run_name=test_dist_agent \\
-    runs_dir=/scratch/abaner/my_kernel_runs/qwen3-coder-agent \\
-    num_workers=1 \\
-    server_type=local server_address=localhost server_port=8000 \\
-    model_name=Qwen/Qwen2.5-Coder-32B-Instruct \\
-    temperature=0 max_tokens=8192 \\
-    max_turns=8 max_tool_calls=25 \\
-    tools=compile_kernel,run_correctness,static_check,submit_kernel
-
-To add nsight profiling (requires ncu + permissions):
-    tools=compile_kernel,run_correctness,profile_kernel,get_gpu_specs,static_check,submit_kernel
+    dataset_src=local level=1 \\
+    run_name=my_batch_run \\
+    model=gpt-5 reasoning_effort=medium \\
+    num_workers=4 num_gpu_devices=4
 """
 
 import json
 import multiprocessing as mp
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
 
 import pydra
 import torch
+from openai import OpenAI
 from pydra import Config, REQUIRED
 from tqdm import tqdm
 
-from kernelbench.dataset import construct_kernelbench_dataset
-from kernelbench.utils import create_inference_server_from_presets, set_gpu_arch
 from kernelbench.agent import KernelAgent, get_tools
+from kernelbench.dataset import construct_kernelbench_dataset
+from kernelbench.utils import set_gpu_arch
 
 REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class AgentBatchConfig(Config):
     def __init__(self):
-        # Dataset
-        self.dataset_src = REQUIRED
+        # ---- Problem ----
+        self.dataset_src = REQUIRED  # "local" or "huggingface"
         self.dataset_name = "ScalingIntelligence/KernelBench"
         self.level = REQUIRED
         # Optional subset: (start_id, end_id) both inclusive, or (None, None) for all
         self.subset = (None, None)
 
-        # Run identity
-        self.run_name = REQUIRED
-        self.runs_dir = os.path.join(REPO_TOP_DIR, "runs")
+        # ---- Model / inference ----
+        self.model = REQUIRED  # e.g. "gpt-5", "gpt-5.4"
+        self.openai_api_key_env = "OPENAI_API_KEY"
+        self.openai_base_url = None  # None = openai.com; set for Azure / gateways
+        self.reasoning_effort = None  # None | "minimal" | "low" | "medium" | "high"
 
-        # Parallelism: set to number of GPU devices
-        self.num_workers = 1
-        self.num_gpu_devices = 1   # used for device assignment (worker_idx % num_gpu_devices)
-
-        # Inference
-        self.server_type = REQUIRED
-        self.model_name = REQUIRED
-        self.max_tokens = None
-        self.temperature = 0.0
-        self.server_address = None
-        self.server_port = None
-        self.is_reasoning_model = False
-        self.reasoning_effort = None
-        self.budget_tokens = 0
-
-        # Agent loop
-        self.max_turns = 8
-        self.max_tool_calls = 25
+        # ---- Agent loop ----
+        self.max_turns = 10
+        self.max_tool_calls = 30
         self.warn_turns_remaining = 2
-        # Minimum seconds to sleep between turns (helps with tight per-minute
-        # output-token quotas, e.g. Anthropic free-tier: 4k tokens/min).
         self.turn_delay_s = 0.0
-        # Tool call XML dialect shown to the model in the system prompt.
-        # "canonical" (default) | "nemotron" | "auto"
-        # Use "nemotron" for Nemotron / Llama function-calling models.
-        self.tool_format = "canonical"
-        # "default" | "all" | comma-separated list
-        self.tools = "default"
+        self.tools = "default"  # "default" | "all" | comma-separated names
 
-        # Backend / hardware
+        # ---- Backend / hardware ----
         self.backend = "cuda"
         self.precision = "fp32"
         self.gpu_arch = ["Ada"]
-        self.include_hardware_info = False
         self.timing_method = "cuda_event"
         self.num_correct_trials = 5
         self.num_perf_trials = 100
 
-        # Logging
+        # ---- Parallelism ----
+        self.num_workers = 1
+        self.num_gpu_devices = 1   # used for device assignment (worker_idx % num_gpu_devices)
+
+        # ---- Run identity ----
+        self.run_name = REQUIRED
+        self.runs_dir = os.path.join(REPO_TOP_DIR, "runs")
+
+        # ---- Logging ----
         self.verbose = False
-        self.log_prompt = False     # save initial problem prompt to file
+        self.save_trajectory = True
 
     def __repr__(self):
         return f"AgentBatchConfig({self.to_dict()})"
+
+
+def _resolve_tools(tools_arg) -> list[str] | None:
+    """Parse the `tools` config into the list passed to KernelAgent."""
+    if isinstance(tools_arg, (list, tuple)):
+        return list(tools_arg)
+    tools_arg = str(tools_arg).strip().lower()
+    if tools_arg == "default":
+        return None  # get_tools(None) → all except profile_kernel
+    if tools_arg == "all":
+        from kernelbench.agent.tools import ALL_TOOLS
+
+        return [t.name for t in ALL_TOOLS]
+    return [t.strip() for t in tools_arg.split(",") if t.strip()]
+
+
+def _force_backend_precision(backend: str, precision: str) -> str:
+    """Apply hard-coded backend/precision constraints from the eval harness."""
+    b = backend.lower()
+    if b == "tilelang":
+        return "fp16"
+    if b == "thunderkittens":
+        return "bf16"
+    return precision
 
 
 # ---------------------------------------------------------------------------
@@ -140,9 +143,6 @@ def run_agent_worker(
     Run one KernelAgent on one problem in a subprocess.
     Returns a dict summary suitable for aggregation, or None on failure.
     """
-    import os
-    import torch
-
     # Bind this process to its assigned GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(work.device_id)
     device = torch.device("cuda:0")   # always 0 after CUDA_VISIBLE_DEVICES remapping
@@ -168,6 +168,21 @@ def run_agent_worker(
             pass  # corrupted file — re-run
 
     try:
+        # Backend precision constraints
+        precision = _force_backend_precision(config.backend, config.precision)
+
+        # API key
+        api_key = os.environ.get(config.openai_api_key_env)
+        if not api_key:
+            print(f"[Worker] ERROR: env var '{config.openai_api_key_env}' is not set.")
+            return None
+
+        # OpenAI client
+        client_kwargs: dict = {"api_key": api_key}
+        if config.openai_base_url:
+            client_kwargs["base_url"] = config.openai_base_url
+        client = OpenAI(**client_kwargs)
+
         # Load problem
         dataset = construct_kernelbench_dataset(
             level=config.level,
@@ -177,36 +192,6 @@ def run_agent_worker(
         problem = dataset.get_problem_by_id(work.problem_id)
         ref_arch_src = problem.code
         problem_name = problem.name
-
-        # Save prompt if requested
-        if config.log_prompt:
-            from kernelbench.prompt_constructor_toml import get_prompt_for_backend
-            initial_prompt = get_prompt_for_backend(
-                ref_arch_src, config.backend,
-                option="one_shot", precision=config.precision,
-            )
-            prompt_path = os.path.join(
-                run_dir,
-                f"level_{config.level}_problem_{work.problem_id}_sample_0_prompt.txt",
-            )
-            with open(prompt_path, "w") as f:
-                f.write(initial_prompt)
-
-        # Build inference function
-        inference_fn = create_inference_server_from_presets(
-            server_type=config.server_type,
-            model_name=config.model_name,
-            temperature=config.temperature,
-            max_tokens=config.max_tokens,
-            verbose=False,
-            time_generation=False,
-            is_reasoning_model=config.is_reasoning_model,
-            reasoning_effort=config.reasoning_effort,
-            budget_tokens=config.budget_tokens,
-            server_address=config.server_address,
-            server_port=config.server_port,
-        )
-        inference_fn.__name__ = config.model_name
 
         # Resolve tools
         tool_names = _resolve_tools(config.tools)
@@ -218,35 +203,27 @@ def run_agent_worker(
         )
         os.makedirs(build_dir, exist_ok=True)
 
-        # Backend precision constraints
-        precision = config.precision
-        backend = config.backend.lower()
-        if backend == "tilelang":
-            precision = "fp16"
-        if backend == "thunderkittens":
-            precision = "bf16"
-
         # Run agent
         agent = KernelAgent(
             problem_id=work.problem_id,
             level=config.level,
             problem_name=problem_name,
             ref_arch_src=ref_arch_src,
-            inference_fn=inference_fn,
+            client=client,
+            model=config.model,
             run_name=config.run_name,
             tool_names=[t.name for t in tools],
             max_turns=config.max_turns,
             max_tool_calls=config.max_tool_calls,
-            backend=backend,
+            backend=config.backend,
             precision=precision,
             device=device,
             build_dir=build_dir,
             num_correct_trials=config.num_correct_trials,
             num_perf_trials=config.num_perf_trials,
             timing_method=config.timing_method,
-            include_hardware_info=config.include_hardware_info,
+            reasoning_effort=config.reasoning_effort,
             warn_turns_remaining=config.warn_turns_remaining,
-            tool_format=config.tool_format,
             turn_delay_s=float(config.turn_delay_s),
             verbose=config.verbose,
         )
@@ -254,7 +231,8 @@ def run_agent_worker(
         trajectory = agent.run()
 
         # Save trajectory JSON
-        trajectory.save(traj_path)
+        if config.save_trajectory:
+            trajectory.save(traj_path)
 
         # Also save the final submitted kernel as a .py file for compatibility
         # with eval_from_generations.py (in case someone wants to re-evaluate)
@@ -303,18 +281,6 @@ def _summary_from_dict(d: dict, level: int) -> dict:
     }
 
 
-def _resolve_tools(tools_arg) -> Optional[list]:
-    if isinstance(tools_arg, (list, tuple)):
-        return list(tools_arg)
-    tools_arg = str(tools_arg).strip().lower()
-    if tools_arg == "default":
-        return None
-    if tools_arg == "all":
-        from kernelbench.agent.tools import ALL_TOOLS
-        return [t.name for t in ALL_TOOLS]
-    return [t.strip() for t in tools_arg.split(",") if t.strip()]
-
-
 def _check_trajectory_exists(run_dir: str, level: int, problem_id: int) -> bool:
     path = os.path.join(run_dir, f"level_{level}_problem_{problem_id}_trajectory.json")
     return os.path.exists(path)
@@ -326,24 +292,21 @@ def _check_trajectory_exists(run_dir: str, level: int, problem_id: int) -> bool:
 
 @pydra.main(base=AgentBatchConfig)
 def main(config: AgentBatchConfig):
-    from kernelbench.utils import SERVER_PRESETS
-
-    # Resolve presets
-    if config.server_type and config.server_type in SERVER_PRESETS:
-        preset = SERVER_PRESETS[config.server_type]
-        if not config.model_name or config.model_name == "None":
-            config.model_name = preset.get("model_name")
-        if not config.max_tokens or config.max_tokens == "None":
-            config.max_tokens = preset.get("max_tokens", 8192)
-        if config.temperature is None or config.temperature == "None":
-            config.temperature = preset.get("temperature", 0.7)
-
-    for bool_field in ("is_reasoning_model", "include_hardware_info", "verbose", "log_prompt"):
+    # Coerce string "True"/"False" from the CLI to actual bools.
+    for bool_field in ("verbose", "save_trajectory"):
         val = getattr(config, bool_field)
         if isinstance(val, str):
-            setattr(config, bool_field, val.lower() in ["true", "1", "yes"])
+            setattr(config, bool_field, val.lower() in ("true", "1", "yes"))
 
     print(f"[run_agent_batch] Config: {config}")
+
+    # API key check
+    api_key = os.environ.get(config.openai_api_key_env)
+    if not api_key:
+        sys.exit(
+            f"[run_agent_batch] FATAL: env var '{config.openai_api_key_env}' is not set. "
+            f"Either export it or pass openai_api_key_env=<other_var_name>."
+        )
 
     # Dataset
     dataset = construct_kernelbench_dataset(
