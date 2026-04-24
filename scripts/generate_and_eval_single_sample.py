@@ -6,7 +6,11 @@ import json
 import modal
 
 from kernelbench.eval import eval_kernel_against_ref
-from kernelbench.prompt_constructor_toml import get_prompt_for_backend, get_custom_prompt
+from kernelbench.prompt_constructor_toml import (
+    get_annotated_compile_prompt,
+    get_custom_prompt,
+    get_prompt_for_backend,
+)
 from kernelbench.utils import (
     create_inference_server_from_presets,
     extract_first_code,
@@ -175,7 +179,7 @@ def main(config: EvalConfig):
 
     # Use appropriate prompt constructor based on backend
     prompt_option = str(config.prompt_option).lower()
-    valid_prompt_options = {"zero_shot", "one_shot", "few_shot"}
+    valid_prompt_options = {"zero_shot", "one_shot", "few_shot", "annotated_compile"}
     include_hardware = config.include_hardware_info
     if isinstance(include_hardware, str):
         include_hardware = include_hardware.lower() in ["true", "1", "yes"]
@@ -212,6 +216,14 @@ def main(config: EvalConfig):
             ref_arch_src=ref_arch_src,
             backend=backend,
             option=prompt_option,
+            precision=config.precision,
+            include_hardware=include_hardware,
+            gpu_name=config.hardware_gpu_name,
+        )
+    elif prompt_option == "annotated_compile":
+        custom_prompt = get_annotated_compile_prompt(
+            ref_arch_src,
+            backend=backend,
             precision=config.precision,
             include_hardware=include_hardware,
             gpu_name=config.hardware_gpu_name,
