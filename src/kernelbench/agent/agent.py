@@ -276,7 +276,7 @@ class KernelAgent:
 
                 for it in response_items:
                     if it.get("type") == "function_call":
-                        fc = it.get("function", {})
+                        fc = it.get("function_call", {})
                         print(f"[fn] {fc.get('name')}({fc.get('arguments')})")
 
             # --- Execute tool calls ---

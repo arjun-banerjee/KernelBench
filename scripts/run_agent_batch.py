@@ -73,7 +73,9 @@ class AgentBatchConfig(Config):
 
         # Parallelism: set to number of GPU devices
         self.num_workers = 1
-        self.num_gpu_devices = 1   # used for device assignment (worker_idx % num_gpu_devices)
+        self.num_gpu_devices = (
+            1  # used for device assignment (worker_idx % num_gpu_devices)
+        )
 
         # Inference
         self.server_type = REQUIRED
@@ -103,7 +105,7 @@ class AgentBatchConfig(Config):
         # Backend / hardware
         self.backend = "cuda"
         self.precision = "fp32"
-        self.gpu_arch = ["Ada"]
+        self.gpu_arch = ["Hopper"]
         self.include_hardware_info = False
         self.timing_method = "cuda_event"
         self.num_correct_trials = 5
@@ -111,7 +113,7 @@ class AgentBatchConfig(Config):
 
         # Logging
         self.verbose = False
-        self.log_prompt = False     # save initial problem prompt to file
+        self.log_prompt = False  # save initial problem prompt to file
 
     def __repr__(self):
         return f"AgentBatchConfig({self.to_dict()})"
@@ -121,15 +123,17 @@ class AgentBatchConfig(Config):
 # Work item
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class WorkArgs:
     problem_id: int
-    device_id: int      # CUDA device index this worker should use
+    device_id: int  # CUDA device index this worker should use
 
 
 # ---------------------------------------------------------------------------
 # Worker function (runs in a child process)
 # ---------------------------------------------------------------------------
+
 
 def run_agent_worker(
     work: WorkArgs,
@@ -145,10 +149,12 @@ def run_agent_worker(
 
     # Bind this process to its assigned GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(work.device_id)
-    device = torch.device("cuda:0")   # always 0 after CUDA_VISIBLE_DEVICES remapping
+    device = torch.device("cuda:0")  # always 0 after CUDA_VISIBLE_DEVICES remapping
 
     if config.gpu_arch:
-        arch = config.gpu_arch if isinstance(config.gpu_arch, list) else [config.gpu_arch]
+        arch = (
+            config.gpu_arch if isinstance(config.gpu_arch, list) else [config.gpu_arch]
+        )
         set_gpu_arch(arch)
 
     # Skip if trajectory already exists (resume support)
@@ -158,7 +164,9 @@ def run_agent_worker(
     )
     if os.path.exists(traj_path):
         if config.verbose:
-            print(f"[Worker] Skipping problem {work.problem_id}: trajectory already exists.")
+            print(
+                f"[Worker] Skipping problem {work.problem_id}: trajectory already exists."
+            )
         # Load and return summary from existing trajectory
         try:
             with open(traj_path) as f:
@@ -181,9 +189,12 @@ def run_agent_worker(
         # Save prompt if requested
         if config.log_prompt:
             from kernelbench.prompt_constructor_toml import get_prompt_for_backend
+
             initial_prompt = get_prompt_for_backend(
-                ref_arch_src, config.backend,
-                option="one_shot", precision=config.precision,
+                ref_arch_src,
+                config.backend,
+                option="one_shot",
+                precision=config.precision,
             )
             prompt_path = os.path.join(
                 run_dir,
@@ -271,6 +282,7 @@ def run_agent_worker(
 
     except Exception as e:
         import traceback
+
         print(f"[Worker] ERROR on problem {work.problem_id}: {e}")
         traceback.print_exc()
         return None
@@ -311,6 +323,7 @@ def _resolve_tools(tools_arg) -> Optional[list]:
         return None
     if tools_arg == "all":
         from kernelbench.agent.tools import ALL_TOOLS
+
         return [t.name for t in ALL_TOOLS]
     return [t.strip() for t in tools_arg.split(",") if t.strip()]
 
@@ -323,6 +336,7 @@ def _check_trajectory_exists(run_dir: str, level: int, problem_id: int) -> bool:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 @pydra.main(base=AgentBatchConfig)
 def main(config: AgentBatchConfig):
@@ -338,7 +352,12 @@ def main(config: AgentBatchConfig):
         if config.temperature is None or config.temperature == "None":
             config.temperature = preset.get("temperature", 0.7)
 
-    for bool_field in ("is_reasoning_model", "include_hardware_info", "verbose", "log_prompt"):
+    for bool_field in (
+        "is_reasoning_model",
+        "include_hardware_info",
+        "verbose",
+        "log_prompt",
+    ):
         val = getattr(config, bool_field)
         if isinstance(val, str):
             setattr(config, bool_field, val.lower() in ["true", "1", "yes"])
@@ -376,18 +395,26 @@ def main(config: AgentBatchConfig):
         if _check_trajectory_exists(run_dir, config.level, pid):
             already_done += 1
         else:
-            work_items.append(WorkArgs(
-                problem_id=int(pid),
-                device_id=i % config.num_gpu_devices,
-            ))
+            work_items.append(
+                WorkArgs(
+                    problem_id=int(pid),
+                    device_id=i % config.num_gpu_devices,
+                )
+            )
 
     total = len(problem_ids)
     print(f"[run_agent_batch] Level {config.level}: {total} problems total")
     print(f"  Already completed: {already_done}")
     print(f"  To run:           {len(work_items)}")
-    print(f"  Workers:          {config.num_workers}  (GPU devices: {config.num_gpu_devices})")
-    print(f"  Tools:            {_resolve_tools(config.tools) or 'default (no profiling)'}")
-    print(f"  Max turns:        {config.max_turns}  |  Max tool calls: {config.max_tool_calls}")
+    print(
+        f"  Workers:          {config.num_workers}  (GPU devices: {config.num_gpu_devices})"
+    )
+    print(
+        f"  Tools:            {_resolve_tools(config.tools) or 'default (no profiling)'}"
+    )
+    print(
+        f"  Max turns:        {config.max_turns}  |  Max tool calls: {config.max_tool_calls}"
+    )
 
     if not work_items:
         print(f"\n✅ All {total} trajectories already exist in {run_dir}")
@@ -410,6 +437,7 @@ def main(config: AgentBatchConfig):
         # Parallel across GPUs
         with tqdm(total=len(work_items), desc="Agent runs") as pbar:
             from concurrent.futures import ProcessPoolExecutor, as_completed
+
             with ProcessPoolExecutor(max_workers=config.num_workers) as executor:
                 futures = {
                     executor.submit(run_agent_worker, work, config, run_dir): work
@@ -423,17 +451,19 @@ def main(config: AgentBatchConfig):
                             results.append(result)
                     except Exception as e:
                         work = futures[future]
-                        print(f"[run_agent_batch] Worker failed for problem {work.problem_id}: {e}")
+                        print(
+                            f"[run_agent_batch] Worker failed for problem {work.problem_id}: {e}"
+                        )
 
     elapsed = time.time() - t_start
     n_correct = sum(1 for r in results if r.get("correctness"))
     n_compiled = sum(1 for r in results if r.get("compiled"))
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"[run_agent_batch] Done in {elapsed:.1f}s")
     print(f"  Attempted: {len(work_items)}  |  Results returned: {len(results)}")
     print(f"  Compiled:  {n_compiled}/{len(results)}")
     print(f"  Correct:   {n_correct}/{len(results)}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # Aggregate all results (including previously completed ones)
     _aggregate_results(run_dir, config.level, problem_ids)
@@ -446,7 +476,9 @@ def _aggregate_results(run_dir: str, level: int, problem_ids):
     """
     all_results = {}
     for pid in problem_ids:
-        traj_path = os.path.join(run_dir, f"level_{level}_problem_{pid}_trajectory.json")
+        traj_path = os.path.join(
+            run_dir, f"level_{level}_problem_{pid}_trajectory.json"
+        )
         if not os.path.exists(traj_path):
             continue
         try:
@@ -469,8 +501,16 @@ def _aggregate_results(run_dir: str, level: int, problem_ids):
     )
     print(f"\n[Aggregate] Results written to: {out_path}")
     print(f"  Problems evaluated: {n}")
-    print(f"  Compiled:           {n_compiled}/{n}  ({100*n_compiled/n:.1f}%)" if n else "")
-    print(f"  Correct:            {n_correct}/{n}  ({100*n_correct/n:.1f}%)" if n else "")
+    print(
+        f"  Compiled:           {n_compiled}/{n}  ({100 * n_compiled / n:.1f}%)"
+        if n
+        else ""
+    )
+    print(
+        f"  Correct:            {n_correct}/{n}  ({100 * n_correct / n:.1f}%)"
+        if n
+        else ""
+    )
     print(f"  Avg turns used:     {avg_turns:.1f}")
 
 
