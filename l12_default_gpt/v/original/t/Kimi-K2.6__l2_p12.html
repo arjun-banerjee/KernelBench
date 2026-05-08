@@ -1,0 +1,2018 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L2 P12 · original</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 12</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_default</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 06:37:12 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/original/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab current">default</span><span class="tier-tab disabled">all</span></div><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-error">error</span>
+  <span style="font-size:13px;">12_Gemm_Multiply_LeakyReLU.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">7 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">6</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">original</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-02T22:03:32Z</div></div>
+</div>
+
+
+
+</div><details class="ref-source"><summary>reference PyTorch source (the prompt the agent sees)</summary><pre class="block">import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    &quot;&quot;&quot;
+    Simple model that performs a Gemm, multiplies the result, and applies LeakyReLU.
+    &quot;&quot;&quot;
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.multiplier = multiplier
+        self.leaky_relu = nn.LeakyReLU(negative_slope)
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = x * self.multiplier
+        x = self.leaky_relu(x)
+        return x
+
+batch_size = 1024
+in_features  = 8192  
+out_features = 8192
+multiplier = 2.0
+negative_slope = 0.1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, multiplier, negative_slope]</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 74.2s · 8,446 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 74.2s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to create a custom CUDA kernel replacing the forward computation of the reference model. The reference model does:
+- Linear layer: y = x @ W^T + b, where W is (out_features, in_features) and b is (out_features). Actually nn.Linear stores weight as [out_features, in_features] and does x @ weight.t() + bias.
+- Multiply by multiplier: y = y * multiplier
+- LeakyReLU: y = max(0, y) + negative_slope * min(0, y) or equivalently y = (y &gt;= 0) ? y : y * negative_slope. With multiplier applied, we can fuse all three into one kernel.
+
+So the custom kernel should compute:
+output[i, j] = (sum_k x[i,k] * W[j,k] + b[j]) * multiplier
+Then apply LeakyReLU: output[i,j] = val &gt;= 0 ? val : val * negative_slope.
+
+We can fuse everything into a single CUDA kernel: each thread computes one output element (i, j). Do a dot product of row i of x with row j of W (since W is stored transposed relative to x? Wait: nn.Linear weight is [out_features, in_features]; forward uses weight.t() when computing if input is [batch, in_features]. Actually in PyTorch, linear(input, weight, bias) does input.matmul(weight.t()) + bias. Weight shape: [out_features, in_features]. So x (batch, in_features) @ weight.t() (in_features, out_features) -&gt; (batch, out_features). Equivalent to for each output row i (batch index) and column j (out feature), compute sum_k x[i, k] * weight[j, k] + bias[j].
+
+So in kernel, each thread computes one (i, j). Use float accum. Then apply multiplier and leaky_relu.
+
+Given sizes: batch=1024, in_features=8192, out_features=8192. So output matrix is 1024x8192 = 8,388,608 elements. Compute is O(batch * out_features * in_features) = 1024 * 8192 * 8192 ≈ 68.7 billion multiply-adds. That&#x27;s large; the reference likely uses cuBLAS for gemm plus elementwise ops. To beat cuBLAS+elementwise, we need a fused kernel that avoids writing intermediate gemm output to memory and the extra reads/writes. However, cuBLAS is extremely optimized, and a naive fused kernel for a 8192-dim dot product per thread might be memory-bound or compute-bound depending on occupancy. Let&#x27;s think about the arithmetic intensity.
+
+Compute: 2 * batch * out_features * in_features = 137.4e9 FLOPs (68.7B mul-adds). Memory traffic: reading x: batch*in_features = 8.4M floats (33.5 MB). Reading W: out_features*in_features = 67.1M floats (268.4 MB). Reading bias: out_features = 8192 floats (32 KB). So total reads ~302 MB. Writing output: batch*out_features = 8.4M floats (33.5 MB). So total DRAM traffic ~335 MB. Compute intensity = 137.4e9 FLOPs / 335e6 bytes = 410 FLOPs per byte. If we assume A100 HBM bandwidth 2 TB/s and ~300 TFLOPS FP32, the kernel is compute-bound. However, a naive per-thread dot product with 8192 iterations will use a lot of registers and may have low occupancy. But given the compute intensity, we want to maximize throughput by having enough warps to hide latency, perhaps using shared memory tiling or vectorized loads.
+
+But wait: the reference PyTorch will call cuBLAS which is heavily optimized and will likely achieve near peak TFLOPS. Then the elementwise multiply and leaky_relu are fused into a single kernel (PyTorch likely fuses them). Actually PyTorch&#x27;s eager mode will do: gemm (cuBLAS) -&gt; mul_ (or mul) -&gt; leaky_relu. If we set `torch.set_float32_matmul_precision(&#x27;high&#x27;)`? Not sure. But cuBLAS + two elementwise kernels. The gemm writes ~33.5 MB, then mul reads and writes that, then leaky_relu reads and writes that. Total extra memory traffic ~100 MB. The total compute is same. So our fused kernel saves ~100 MB of memory traffic (30% reduction) but the compute is the dominant cost. If cuBLAS gets near 90% of peak TFLOPS, it&#x27;s hard to beat with a custom kernel unless we also get very high TFLOPS.
+
+But the evaluation says &quot;run faster than the PyTorch reference&quot;. Usually these tasks are designed so that a simple fused kernel can win because the reference is memory-bound or has small sizes. However, 8192 is large, and cuBLAS is very fast. But maybe the test batch size is 1024, so M=1024, N=8192, K=8192. cuBLAS uses tensor cores (TF32 or FP16) on A100? Wait, the problem states &quot;produce numerically equivalent outputs at fp32 precision&quot;. If we use TF32, that would not be equivalent. PyTorch might use TF32 by default on Ampere if allowed? Actually by default since PyTorch 1.7, float32 matmul uses TF32 on Ampere unless disabled. But the problem says &quot;fp32 precision&quot; and tolerance is 1e-4. If reference uses TF32, it might be slightly less accurate. But our kernel must match the reference. If reference uses TF32, we can also use TF32? But implementing TF32 manually is complex. Usually in these tasks, the reference is standard FP32 cuBLAS. We assume FP32. However, if reference uses TF32, then a simple FP32 kernel might provide exact FP32, but reference might be TF32 so outputs differ slightly beyond tolerance? The tolerance is 1e-4 for fp32, which is quite loose, so TF32 vs FP32 might still be within tolerance. But we need to be safe: use FP32 accumulator.
+
+But can a simple thread-per-element kernel beat cuBLAS? Let&#x27;s think about typical cuBLAS performance for M=1024, N=8192, K=8192. This is not a huge square matrix but it&#x27;s decent. On A100, cuBLAS FP32 performance might be around 50-100 TFLOPS? Actually A100 does 19.5 TFLOPS FP32 dense, 156 TFLOPS TF32. Wait A100 specs: FP32: 19.5 TFLOPS (non-tensor), TF32: 156 TFLOPS. If PyTorch uses TF32 for matmul by default, then the reference compute is effectively 156 TFLOPS, but our custom FP32 kernel is limited to 19.5 TFLOPS. That would be impossible to beat. However, the tolerance is 1e-4, so maybe reference DOES NOT use TF32? Let&#x27;s check PyTorch default: On CUDA &gt;= Ampere, torch.backends.cuda.matmul.allow_tf32 defaults to True. So yes, by default PyTorch uses TF32 for matmuls. But the reference model is just `nn.Linear`, which calls `addmm` or `matmul`, which will use TF32 if allowed. The problem says &quot;produce numerically equivalent outputs at fp32 precision&quot;. This implies the output of our kernel should match the reference output. If the reference uses TF32, we need to match TF32 results. But can we? Maybe the evaluation environment disables TF32? Or maybe they run with `torch.backends.cuda.matmul.allow_tf32 = False`. Many of these tasks set strict fp32.
+
+Alternatively, we can implement a fused kernel that uses tensor cores via WMMA? That&#x27;s extremely advanced. Given this is a coding task for custom CUDA kernels, they usually expect you to write a simple fused kernel and it will be faster because the reference is not using cuBLAS Tensor Cores but generic GEMM? Actually `nn.Linear` calls `torch.nn.functional.linear`, which dispatches to `addmm` for 2D inputs. `addmm` will use cuBLAS, which uses TF32 on Ampere if allowed. But maybe the evaluation runs on an older GPU like V100? Let&#x27;s check GPU specs. We need to call get_gpu_specs to know.
+
+We should call `get_gpu_specs` first. Also we need to write the kernel, compile and test. Let&#x27;s follow an iterative approach.
+
+But before writing code, we need to understand the evaluation hardware. Let&#x27;s call get_gpu_specs.
+</div></details><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div></details><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 173.0s · 80,420 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 173.0s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the problem:
+
+1. We have a simple model: Linear (GEMM) -&gt; multiply by scalar -&gt; LeakyReLU
+2. Input: batch_size=1024, in_features=8192, out_features=8192
+3. The reference uses PyTorch operations.
+
+The dimensions are:
+- x: [1024, 8192]
+- weight: [8192, 8192]
+- bias: [8192]
+- output: [1024, 8192]
+
+This is a large matrix multiplication. Since M=1024, K=8192, N=8192, we can use cuBLAS for the GEMM and then fuse the scalar multiply and LeakyReLU into a single element-wise CUDA kernel.
+
+However, for even better performance, we could try to fuse everything - but the GEMM itself should be done by cuBLAS. The batch size is 1024 and both dimensions are 8192, so the GEMM is:
+- M=1024, K=8192, N=8192
+- Compute: 2 * M * K * N = 2 * 1024 * 8192 * 8192 ≈ 137 billion ops
+- At 67 TFLOPS (FP32 peak), that&#x27;s about 2ms minimum just for compute
+- Memory bandwidth: output is 1024 * 8192 * 4 ≈ 32MB, weights are 8192*8192*4 ≈ 256MB, input is 1024*8192*4 ≈ 32MB
+- Total memory: ~320MB, at 3.35 TB/s that&#x27;s ~0.1ms, so compute bound.
+
+For a fused elementwise kernel after GEMM:
+- Read 32MB, write 32MB, plus a tiny bit of compute
+- At 3.35 TB/s, ~0.02ms
+
+So the main optimization is:
+1. Use cuBLAS for GEMM
+2. Fuse the multiply and LeakyReLU into a single kernel
+
+But wait, we could potentially also fuse the multiply into the GEMM using beta scaling if cuBLAS supports it, but nn.Linear computes x @ W^T + b, so there&#x27;s already a bias add. The multiply by scalar happens after.
+
+Actually, can we use cuBLAS&#x27;s alpha parameter for the multiply after? Not directly, because alpha scales the GEMM result before adding bias. Actually, in cublasSgemm or similar, we could use alpha to scale, but we still need bias addition. PyTorch&#x27;s linear uses something like output = alpha * (x @ W^T) + beta * bias. Actually, W is transposed in PyTorch linear... wait.
+
+In PyTorch nn.Linear:
+- weight shape: [out_features, in_features]
+- x shape: [batch_size, in_features]
+- output = x @ weight.T + bias
+
+For cublas, we can use transposed or non-transposed. If weight is stored as [out_features, in_features], for cublasGemmEx:
+- A = x [M, K]
+- B = weight.T would require a transpose. Alternatively we can view:
+  - A = weight [N, K] (transposed: weight^T is [K, N])
+  - Actually, cublasDgemm with opA=CUBLAS_OP_N, opB=CUBLAS_OP_T:
+    - A is M×K (x)
+    - B is N×K (weight)
+    - C is M×N (output)
+    - C = alpha * A * B^T + beta * C
+  - So C = alpha * x @ weight^T + beta * C. This is exactly what we need if we initialize C with bias.
+
+So we can:
+1. Use cublasSgemm with alpha=multiplier, and add bias during the output initialization or using beta.
+2. But then we need LeakyReLU too.
+
+Option 1: Use cublasSgemm with alpha=1.0, compute GEMM + bias, then fused multiply + LeakyReLU kernel.
+Option 2: Use cublasSgemm with alpha=multiplier, and set C initially to bias * multiplier? No, because we need C = multiplier * (x @ W^T) + multiplier * bias = multiplier * (x @ W^T + bias). So if we set alpha=multiplier and beta=0, and initialize C with bias, then we&#x27;d get multiplier * x @ W^T + 0 * bias, missing the bias multiplication. But if we initialize C with multiplier * bias and use alpha=multiplier, beta=1, then C = multiplier * x @ W^T + 1 * (multiplier * bias) = multiplier * (x @ W^T + bias). That works!
+
+Wait, C = α * op(A) * op(B) + β * C
+If we initialize C with bias * multiplier, and use α=multiplier, β=1, then:
+C = multiplier * (x @ W^T) + 1 * (multiplier * bias)
+This is correct for the multiply step.
+
+Then we just need LeakyReLU on C.
+
+So: use cublasGemmEx with α=multiplier, β=1, and C initialized to multiplier * bias. Then apply LeakyReLU elementwise.
+
+This saves one full memory pass for the multiply.
+
+Let me write a kernel that:
+1. Creates a workspace/output buffer
+2. Initializes it with bias * multiplier
+3. Calls cublasSgemm or similar with α=multiplier, β=1
+4. Applies LeakyReLU in place
+
+Actually, for fp32, cublasSgemm is fine.
+
+But wait, the reference uses nn.Linear which might use tensor cores. If I write my own cublas call, I can use cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_TF32 to use tensor cores, which should match or beat PyTorch.
+
+Actually, PyTorch uses cublasLtMatmul which might be highly optimized. Using raw cublas might not be faster. But fused multiply+LeakyReLU can save time.
+
+Let me think about this more carefully. The reference in PyTorch likely does:
+1. cublasLtMatmul (fused with bias) → this is very fast
+2. Element-wise multiply
+3. Element-wise LeakyReLU
+
+PyTorch might fuse multiply + LeakyReLU into a single kernel already through its JIT or eager mode optimizations. Actually, in eager mode, multiply and LeakyReLU are separate kernel launches.
+
+So even just fusing multiply + LeakyReLU helps, plus we can do the clever bias pre-scaling to fuse the multiply into the GEMM.
+
+But wait, nn.Linear in PyTorch adds bias after the GEMM. If we use cublas with β=1 and C initialized to bias, we get the same result as adding bias. But if we want to also multiply by scalar, initializing C to bias * multiplier and using α=multiplier, β=1 gives us exactly what we want.
+
+However, there&#x27;s a problem: for each batch element, we need bias * multiplier. So we&#x27;d initialize the output tensor to broadcasted bias * multiplier. This is an extra kernel launch, but it&#x27;s just a vector expanded to a matrix.
+
+Alternatively, we can just do the GEMM normally (α=1, β=1, C initialized to bias), then launch a single fused kernel for multiply + LeakyReLU. This avoids any potential precision issues and is simpler.
+
+Let me check what the actual overhead is. For a 1024x8192 output:
+- 8.4M elements
+- Fused kernel: read 32MB, write 32MB → ~0.02ms
+- Two separate kernels: roughly same memory traffic but two launches
+- Kernel launch overhead is ~0.003-0.005ms, so saving 1 launch saves ~0.005ms
+
+The total runtime for this GEMM on H100:
+- At peak 67 TFLOPS, theoretical minimum for 137 GFLOPS is ~2ms
+- Realistic cublas efficiency ~80-90% for this size, so maybe 2-3ms
+
+So saving 0.005ms from kernel fusion is minor, but the fused kernel approach is standard.
+
+Another optimization: use cublasLt with epilogue fusion? cublasLt supports RELU as an epilogue, but not LeakyReLU directly. It supports GELU and RELU. For LeakyReLU, we&#x27;d need to check.
+
+Actually, cublasLt epilogue supports CUBLASLT_EPILOGUE_RELU, but not LeakyReLU with configurable slope. There&#x27;s CUBLASLT_EPILOGUE_DRELU etc. For arbitrary negative_slope, there&#x27;s no direct epilogue support.
+
+So our best bet:
+1. Use cublas Lt or cublas for the GEMM
+2. Fuse multiply + LeakyReLU in a custom kernel
+
+But actually, is using raw cublas/cublasLt going to be faster than PyTorch&#x27;s highly optimized dispatcher? PyTorch uses cublasLt internally, and it might use heuristics and autotuning. If we just call cublasSgemm, it might be slower.
+
+Let me reconsider. Maybe the best approach is:
+- Use PyTorch&#x27;s matmul for the GEMM part (calling torch.matmul or F.linear), which will use PyTorch&#x27;s optimized cublasLt path
+- Then write a custom fused kernel for multiply + LeakyReLU
+
+But the problem says to replace with a custom CUDA kernel. We can still call torch.matmul from the forward and then our custom elementwise kernel. However, that only optimizes the elementwise part.
+
+Wait, let me re-read the instructions: &quot;Replace the forward computation of the PyTorch model below with a custom CUDA kernel.&quot; This could mean replacing the entire forward with one or more custom kernels, or it could mean we should use custom CUDA for the bottleneck.
+
+Actually, I think the safest and most practical approach is:
+1. Call `torch.nn.functional.linear(x, weight, bias)` for the GEMM+Bias (using PyTorch&#x27;s optimized path)
+2. Then use a custom fused kernel for multiply + LeakyReLU
+
+Alternatively, we can do everything in one custom kernel that uses cublas internally. Let me check if that&#x27;s better.
+
+For cublas on H100 with TF32 tensor cores, cublasGemmEx with CUDA_R_32F and CUBLAS_COMPUTE_32F_FAST_TF32 should be very fast.
+
+Let me write a kernel that:
+1. Calls cublasGemmEx for the GEMM part with C = x @ W^T + bias
+2. Fused multiply + LeakyReLU
+
+Actually, let&#x27;s look at whether PyTorch&#x27;s matmul is faster. PyTorch has extensive tuning for cublasLt. For this specific size [1024, 8192] x [8192, 8192], it will likely use a well-tuned algorithm. My manual cublas call might not beat it.
+
+However, if we do a custom kernel that includes the cublas call and then fuses the epilogue, we save one memory round-trip plus a kernel launch. That could win.
+
+Let me think about another approach: can we use CUTLASS? That&#x27;s probably overkill.
+
+Let me draft a solution using cublas and a custom fused epilogue kernel.
+
+Actually, there&#x27;s an even simpler approach that might work well: use Triton. But the instructions say to use `torch.utils.cpp_extension.load_inline`, so they expect raw CUDA.
+
+Let me write the CUDA code:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cublas_v2.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define BLOCK_SIZE 256
+
+__global__ void fused_mul_leakyrelu_kernel(float* data, float multiplier, float negative_slope, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        float val = data[idx] * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {
+    int M = x.size(0);
+    int K = x.size(1);
+    int N = weight.size(0);
+    
+    auto output = torch::empty({M, N}, x.options());
+    
+    cublasHandle_t handle;
+    cublasCreate(&amp;v2handle);
+    
+    float alpha = 1.0f;
+    float beta = 1.0f;
+    
+    // C = alpha * A * B^T + beta * C
+    // A = x [M, K], B = weight [N, K] (treated as column-major or we use CUBLAS_OP_T)
+    // For cublasSgemm with column-major:
+    // A is K x M? No, cublas is column-major.
+    // PyTorch tensors are row-major.
+    
+    // For cublasSgemm:
+    // C (M x N) = A (M x K) * B (K x N)
+    // In column-major: C is N x M, A is K x M, B is N x K
+    // C^T = B^T * A^T? This is confusing.
+    
+    // Let&#x27;s use the fact that:
+    // op(A) = m x k, op(B) = k x n, C = m x n
+    // If A is row-major MxK, in cublas column-major it&#x27;s viewed as KxM with transpose
+    // So we want: C [M, N] = A [M, K] * B [K, N]
+    // In cublas: C is N x M (column-major)
+    // A^T is M x K in column-major = K x M? No wait.
+    // 
+    // For row-major C = A * B, in column-major C^T = B^T * A^T
+    // So in cublas terms: op(C) = N x M
+    // op(A_op) = op(B) = N x K (with B being K x N row-major, so we need op(B) = B^T)
+    // op(B_op) = op(A) = K x M (with A being M x K row-major, so we need op(A) = A^T)
+    // 
+    // Wait, let me think again.
+    // Row-major: C[i,j] = sum_k A[i,k] * B[k,j]
+    // Column-major: C[j,i] = sum_k B[j,k] * A[i,k]? No.
+    // 
+    // In column-major, C[j*M + i] = C[i][j] in row-major.
+    // A[i][k] is at A[k*M + i] in column-major.
+    // B[k][j] is at B[j*K + k] in column-major.
+    // So C[j*M + i] = sum_k A[k*M + i] * B[j*K + k]
+    // This is: C^T = B^T * A where dimensions are (N x M) = (N x K) * (K x M)
+    // So if we define in cublas:
+    // A_cublas = B (column-Major, dimensions K x N, so shape [K, N] in row-major, but PyTorch weight is [N, K])
+    // Wait, PyTorch weight is [N, K] row-major. In column-major, that&#x27;s [K, N].
+    // So if we pass weight with no transpose, it&#x27;s K x N, which is our B_cublas.
+    // x is [M, K] row-major. In column-major, that&#x27;s [K, M].
+    // So x with no transpose is K x M, which is A_cublas.
+    // Then C_cublas = alpha * B_cublas * A_cublas + beta * C_cublas
+    // C_cublas is N x M.
+    //
+    // cublasSgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
+    // Here: op(A) is m x k, op(B) is k x n, C is m x n.
+    // We want: op(A) = K x N? No wait, C = op(A) * op(B) in column-major.
+    // C is N x M, so m=N, n=M.
+    // op(A) should be N x K, op(B) should be K x M.
+    // A is weight, column-major K x N (K rows, N cols in col-major). 
+    // For op(A) to be N x K, we need transpose of weight.
+    // B is x, column-major K x M. For op(B) to be K x M, no transpose.
+    // 
+    // So: cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &amp;alpha, weight_ptr, K, x_ptr, K, &amp;beta, output_ptr, N)
+    // Wait, lda should be the leading dimension of A. A is weight^T? 
+    // When we pass CUBLAS_OP_T, A is accessed as if it were K x N in column-major, so after transpose it&#x27;s N x K.
+    // The leading dimension of original A (weight in column-major) is K.
+    // For x (column-major K x M), ldb is K, and with CUBLAS_OP_N it&#x27;s K x M.
+    // ldc is N.
+    // 
+    // Let me verify:
+    // cublasSgemm(&#x27;T&#x27;, &#x27;N&#x27;, N, M, K, alpha, weight, K, x, K, beta, output, N)
+    // In column-major: C (N x M) = A^T (N x K) * B (K x M)
+    // In row-major: C^T (M x N) = B^T (M x K) * A (K x N)
+    // C (N x M) in col-major = C^T (M x N) in row-major. Wait no.
+    // C_col_major[j*M + i] corresponds to C_row_major[i][j].
+    // The equation C_col = A^T_col * B_col gives:
+    // C_col[j*M + i] = sum_k A_col[k*N + j] * B_col[k*M + i]
+    // In row-major, A_row is weight[j][k], B_row is x[i][k].
+    // So C_row[i][j] = sum_k weight[j][k] * x[i][k]
+    // But we want C[i][j] = sum_k x[i][k] * weight[j][k]
+    // Multiplication is commutative for scalars, so this is correct!
+    // 
+    // Actually wait, PyTorch linear computes x @ W^T + b.
+    // x[i,:] dot W[j,:] is exactly what we computed:
+    // C_row[i][j] = sum_k x[i][k] * weight[j][k]
+    // Yes, that&#x27;s correct! Because weight[j][k] is W[j,k].
+    // And x @ W^T gives C[i][j] = sum_k x[i][k] * W^T[k][j] = sum_k x[i][k] * W[j][k].
+    // So yes, this is correct.
+
+    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                N, M, K,
+                &amp;alpha,
+                weight.data_ptr&lt;float&gt;(), K,
+                x.data_ptr&lt;float&gt;(), K,
+                &amp;beta,
+                output.data_ptr&lt;float&gt;(), N);
+    
+    // But wait, I also need to add bias. How do I initialize output with bias?
+    // Currently beta is 1 and output is uninitialized! That&#x27;s wrong.
+    
+    // We need to initialize output with broadcasted bias.
+    // We can use a custom kernel to do this, or use torch operations.
+    // Actually, we can do: output = bias.unsqueeze(0).expand(M, N).contiguous()
+    // But that&#x27;s a memory copy.
+    
+    // Or we can set beta = 0, compute GEMM, then add bias with a custom kernel that also does multiply + LeakyReLU.
+    // That&#x27;s actually simpler and ensure we don&#x27;t accidentally read uninitialized memory.
+    // 
+    // Or: cublasSgemm with beta=0, then fused kernel for bias + multiply + LeakyReLU.
+    // That&#x27;s 3 ops fused into 1 kernel: read output, read bias, compute, write output.
+    // Memory traffic: read 32MB (output, from GEMM) + read 32KB (bias) + write 32MB.
+    // The output from GEMM is already in cache, so this should be fast.
+
+    cublasDestroy(handle);
+    return output;
+}
+```
+
+Actually, I realize I need to handle the cublas handle more carefully. Creating/destroying per forward is bad.
+
+Let me rewrite. Actually, for a benchmark, handle creation in each call might be okay if they only measure a few iterations, but it&#x27;s bad practice.
+
+I can use `cublasCreate` and `cublasDestroy` or maintain a persistent handle. For load_inline, I can define a simple struct with thread-local or static handle. Actually, CUDA allows having a static cublas handle.
+
+But wait, the benchmark might run the forward pass many times. Creating the handle each time could be expensive.
+
+Let me use a static handle approach or use `at::cuda::getCurrentCUDABlasHandle()` which gives the handle from PyTorch&#x27;s pool. That&#x27;s actually the best approach.
+
+```cpp
+cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+```
+
+This avoids creating/destroying and uses PyTorch&#x27;s (thread-local) handle.
+
+For the GEMM with bias, I have several options:
+1. Use `cublasSgemm` with `beta=0`, then fused bias+multiply+leakyrelu
+2. Use `cublasSgemm` with `beta=1`, but initialize output with bias first
+3. Use `cublasSgemm` with `alpha=multiplier, beta=0`, initialize output with `bias * multiplier`, then just apply LeakyReLU
+
+Option 3: cublasSgemm with alpha=multiplier, beta=1, output initialized to bias * multiplier.
+Actually, if output is initialized to bias * multiplier on all rows, then:
+C = multiplier * (x @ W^T) + 1 * (multiplier * bias) = multiplier * (x @ W^T + bias)
+Then we just apply LeakyReLU.
+
+The initialization of output to bias * multiplier:
+- bias is [N] float
+- We need to set output[M, N] = bias[0, N] * multiplier
+- This is a broadcasted write. We can do this with a simple kernel or with torch.
+
+If we do it with torch: `output.copy_(bias.unsqueeze(0) * multiplier)` - this creates a temporary and does a copy. Or `output = bias.unsqueeze(0).expand(M, N).contiguous() * multiplier` - this creates the tensor.
+Actually: `output = (bias * multiplier).unsqueeze(0).expand(M, N).contiguous()` - wait, expand + contiguous creates a copy.
+
+A custom kernel to fill output with bias * multiplier is easy and efficient.
+
+But actually, option 1 is simpler and has the same memory efficiency:
+- `output = gemm(x, W^T)` using alpha=1, beta=0
+- Launch fused kernel: output[i,j] = (output[i,j] + bias[j]) * multiplier, then LeakyReLU
+  = LeakyReLU((gemm(x, W^T)[i,j] + bias[j]) * multiplier)
+
+This fused kernel reads output (32MB), reads bias (negligible), writes output (32MB).
+Total extra work: 32MB read + 32MB write.
+
+With option 3:
+- Fill output with bias * multiplier: write 32MB
+- GEMM: read x (32MB) + read W (256MB), write/read output (32MB for partial sums, it&#x27;s complicated but output is accumulated)
+- LeakyReLU: read 32MB, write 32MB
+- Total: write 32MB (fill) + GEMM I/O + read 32MB + write 32MB (LeakyReLU)
+
+With option 1:
+- GEMM: read x + read W, write output
+- Fused kernel: read output, write output
+- Total: GEMM I/O + read 32MB + write 32MB
+
+This seems equivalent. Actually for cuBLAS GEMM with beta=0, it still writes the output. So the fused kernel adds one read and one write of 32MB.
+
+I&#x27;ll go with option 1 for simplicity, or I can try to initialize with bias and use beta=1. Actually, cuBLAS with beta=1 reads the existing C matrix, so it&#x27;s read-modify-write on output. For large matrices, this might not be much slower than beta=0.
+
+Actually, for cuBLAS, beta=0 sometimes allows not reading C, while beta=1 requires reading C. But for large GEMMs, the compute dominates.
+
+Option 1 (beta=0, then fused epilogue):
+- GEMM: read x + W, write C. ~320MB + compute.
+- Fused: read C, write C. ~64MB.
+- Total: ~384MB + compute.
+
+Option 3 (init C with bias*multiplier, beta=1, then LeakyReLU):
+- Init C: write 32MB.
+- GEMM: read x + W, read C, write C. ~352MB + compute.
+- LeakyReLU: read C, write C. ~64MB.
+- Total: ~448MB + compute.
+
+So option 1 is better!
+
+Actually wait, with option 3, we could init C with bias, alpha=1, beta=1, then fused multiply+leakyrelu.
+- Init C: write 32MB
+- GEMM: read x+W, read C, write C ~352MB
+- Fused multiply+leakyrelu: read C, write C ~64MB
+- Total: 448MB + compute
+
+Option 1 is clearly better.
+
+So the plan is:
+1. Call cublasGemmEx for GEMM with beta=0 (or use torch.matmul)
+2. Launch a fused kernel that does: C = LeakyReLU((C + bias) * multiplier)
+
+Wait, but if I use torch.matmul, I can&#x27;t easily fuse bias + multiply + LeakyReLU because PyTorch&#x27;s linear already adds bias.
+
+Actually, let me compare:
+A. `torch.nn.functional.linear(x, weight, bias)` → uses cublasLt, very fast, includes bias
+B. `torch.matmul(x, weight.t())` → then custom fused kernel for bias+multiply+LeakyReLU
+
+Option A for GEMM+Bias is very optimized by PyTorch. Then we need separate multiply + LeakyReLU, which PyTorch might not fuse automatically. So:
+- A: ~2-3ms for GEMM+Bias
+- Multiply: ~0.01ms
+- LeakyReLU: ~0.01ms
+- Total: ~2-3ms + overhead
+
+Option B:
+- matmul: ~2-3ms for GEMM
+- Fused kernel: ~0.02ms for bias+multiply+LeakyReLU
+- Total: ~2-3ms + 0.02ms
+
+If I use custom cublas:
+- cublas GEMM: ~2-3ms (might be same or slightly slower than PyTorch)
+- Fused kernel: ~0.02ms
+
+So the question is whether PyTorch&#x27;s multiply+LeakyReLU is already fused. In PyTorch eager mode, `x * multiplier` and `leaky_relu(x)` are separate operations, each launching a kernel. So a custom fused kernel should be faster.
+
+But even more importantly, can my custom cublas call match PyTorch&#x27;s cublasLt? PyTorch uses cublasLt with algorithm selection and heuristics. A raw cublasSgemm call might use a less optimal algorithm.
+
+Actually, for fp32, cublasLt might not have a huge advantage over cublas. But to be safe, I should use `at::cuda::getCurrentCUDABlasHandle()` and call `cublasGemmEx` or `cublasSgemm`. Wait, PyTorch&#x27;s blas handle uses cublas, and `cublasGemmEx` might dispatch to cublasLt internally in newer cuBLAS versions.
+
+Actually, maybe I should just use PyTorch&#x27;s `F.linear` for the GEMM (it&#x27;s the most optimized part) and write a custom fused kernel for multiply+LeakyReLU. That way I definitely beat the reference without risking slower GEMM.
+
+But wait, if I use PyTorch&#x27;s F.linear, then multiply, then my custom fused kernel - that&#x27;s worse than the reference. The reference does F.linear, then multiply, then LeakyReLU. If I replace the whole forward with F.linear + custom kernel, I only fuse multiply+LeakyReLU. The reference might already be fused by PyTorch&#x27;s operator fusion in some cases? No, in eager mode it won&#x27;t be.
+
+Actually, if I use `torch.nn.functional.leaky_relu(x * multiplier)`, PyTorch might compile this into a single kernel in eager mode? No, `*` and `leaky_relu` are separate calls.
+
+So my plan:
+1. `x = torch.nn.functional.linear(x, self.weight, self.bias)`  # GEMM + bias, PyTorch optimized
+2. Custom CUDA kernel: multiply + LeakyReLU fused
+
+But can I do better? What if I use my own cublas call for GEMM+bias and then fuse multiply+LeakyReLU? That saves reading/writing the output once (the multiply step).
+
+Actually in the reference:
+1. cublasLt matmul (fused GEMM + bias) → writes output
+2. Elementwise multiply → reads output, writes output
+3. Elementwise LeakyReLU → reads output, writes output
+
+Total memory for elementwise: 4 passes over output (read+write twice) = 128MB
+
+If I do:
+1. cublasLt matmul (fused GEMM + bias) → writes output
+2. Custom fused multiply+LeakyReLU → reads output, writes output
+
+Total memory for elementwise: 2 passes = 64MB
+
+Saved: 64MB at ~3TB/s = ~0.02ms. That&#x27;s tiny compared to 2-3ms GEMM.
+
+Wait, but H100 has 3.35 TB/s bandwidth. 64MB / 3.35TB/s = 64 / 3,350,000 ms = 0.019ms. So we save ~0.02ms. On a 2-3ms total, that&#x27;s ~1% improvement. Hmm, that&#x27;s not much.
+
+But what if I use custom cublas with epilogue-style approach?
+1. cublas GEMM (beta=0) → writes output
+2. Fused kernel: bias + multiply + LeakyReLU → reads output, writes output
+
+Total elementwise: still 2 passes = 64MB. Same as before.
+
+Actually, the true reference might not use cublasLt for this. PyTorch&#x27;s nn.Linear uses `addmm` or `linear` which for this size might be:
+- cublasLtMatmul with Epilogue Bias if available
+
+The reference time is unknown. We just need to beat it.
+
+Actually, there&#x27;s another optimization: use TensorFloat-32 (TF32). PyTorch enables TF32 by default for matmuls on Ampere and newer. My custom cublas call should also enable it to match.
+
+Let me check: `CUBLAS_COMPUTE_32F_FAST_TF32` enables TF32. PyTorch might use this by default.
+
+Let me think about another approach. What if we use a custom CUTLASS kernel? That&#x27;s too complex for this setting.
+
+What if we use a Triton kernel for the whole thing? The instructions say to use load_inline for CUDA, but Triton can be defined in Python. However, the instructions specifically mention &quot;custom CUDA kernel&quot; and &quot;load_inline&quot;.
+
+Actually, I think a very good approach is:
+1. Keep the GEMM as `torch.nn.functional.linear` (PyTorch optimized path)
+2. Write a fused multiply+LeakyReLU kernel in CUDA
+3. But also handle the fact that we can initialize the weight and bias differently or use some other tricks?
+
+Wait, there&#x27;s another idea. The size M=1024, N=8192, K=8192.
+Can we use INT8 or BF16? The problem says &quot;Produce numerically equivalent outputs at fp32 precision.&quot; So we need fp32 output. But we can do the GEMM in TF32 or TF16 and cast back? No, that won&#x27;t be numerically equivalent to fp32 within 1e-4 for arbitrary inputs. Actually, TF32 might be close enough for random [0,1] inputs... but let&#x27;s not risk it.
+
+Actually, let me just write a solid implementation:
+1. Use `at::cuda::getCurrentCUDABlasHandle()` and `cublasGemmEx` for GEMM
+2. Use a custom kernel that fuses bias add, multiply, and LeakyReLU
+
+Actually, let me reconsider option 3 more carefully:
+- Allocate output
+- Fill output with bias * multiplier (custom kernel or torch)
+- Call cublasGemm with alpha=multiplier, beta=1
+
+Step 1 (fill): write 32MB
+Step 2 (GEMM): read x (32MB), read W (256MB), read output (32MB), write output (32MB). But wait, cuBLAS with beta=1 might do C += A*B in a tile-based way. The read of C might be partially absorbed by caches.
+
+Actually, the total memory traffic for GEMM with beta=1 is: read A + read B + read C + write C. That&#x27;s 32 + 256 + 32 + 32 = 352MB.
+With beta=0: read A + read B + write C = 320MB.
+Difference is 32MB read + potentially less cache pressure.
+
+For a compute-bound kernel, this difference is negligible.
+
+I&#x27;ll try both approaches and see which is faster. Let me implement the simplest one first:
+
+**Approach A**: Use `torch.matmul` or `F.linear` for GEMM, then custom fused epilogue.
+
+Wait, actually, if I look at this size again: M=1024, K=8192, N=8192.
+M*N = 8.4M elements, M*K = 8.4M, N*K = 67M.
+The weight matrix is quite large: 67M floats = 256MB.
+
+For Tensor Cores, the tile sizes need to align well. 1024, 8192 are all multiples of 8, 16, etc.
+
+Actually, I wonder if for compute-bound operations like this GEMM, the primary bottleneck is just the GEMM itself, and PyTorch&#x27;s implementation is already near-optimal. The elementwise ops are negligible.
+
+To get a real speedup over the reference, I need to:
+1. Match PyTorch&#x27;s GEMM performance
+2. Fuse the elementwise ops
+
+Using PyTorch&#x27;s `F.linear` for GEMM+bias guarantees #1. Fusing multiply+LeakyReLU achieves #2.
+
+So let&#x27;s go with:
+```python
+x = F.linear(x, self.weight, self.bias)
+x = fused_mul_leakyrelu(x, self.multiplier, self.negative_slope)
+```
+
+But wait, maybe PyTorch does fuse multiply + LeakyReLU when using the JIT or when specific conditions are met? In eager mode, no. The `*` creates a new tensor, then `leaky_relu` creates another new tensor. Actually wait, in PyTorch eager mode, `leaky_relu` can operate in-place with `negative_slope`. But the reference code is:
+
+```python
+x = self.gemm(x)
+x = x * self.multiplier
+x = self.leaky_relu(x)
+```
+
+This is all out-of-place, creating 3 temporary tensors (well, `self.gemm(x)` creates one, then `x * multiplier` creates another, then `leaky_relu` creates a third).
+
+If I do `x = F.linear(x, self.weight, self.bias)`, that&#x27;s one tensor.
+Then `x = fused_mul_leakyrelu(x, multiplier, negative_slope)` reuses `x` in place. No new allocations.
+
+Actually, the memory allocation and deallocation overhead might be significant! PyTorch has a caching allocator, so allocations of the same size are fast. But still, creating fewer tensors is better.
+
+So using PyTorch&#x27;s GEMM + custom fused kernel should be a solid win.
+
+Let me check if there&#x27;s even more I can do. What if I write a custom kernel that does GEMM using cublas, then the fused epilogue in one wrapper? It would have the same performance but more code. Not necessary.
+
+Actually, I think I should try doing everything in one shot with cublas for maximum street cred. Let me try that. If it compiles and is correct, it should be at least as fast as PyTorch&#x27;s approach.
+
+Here&#x27;s the code structure:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cpp_source = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cublas_v2.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void fused_mul_leakyrelu_kernel(float* data, float multiplier, float negative_slope, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        float val = data[idx] * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {
+    int64_t M = x.size(0);
+    int64_t N = weight.size(0);
+    int64_t K = x.size(1);
+    
+    torch::Tensor output = torch::empty({M, N}, x.options());
+    
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    
+    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                N, M, K,
+                &amp;alpha,
+                weight.data_ptr&lt;float&gt;(), K,
+                x.data_ptr&lt;float&gt;(), K,
+                &amp;beta,
+                output.data_ptr&lt;float&gt;(), N);
+    
+    // Fused bias + multiply + LeakyReLU
+    int64_t total_elements = M * N;
+    const int threads = 256;
+    const int blocks = (total_elements + threads - 1) / threads;
+    
+    fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        output.data_ptr&lt;float&gt;(),
+        multiplier,
+        negative_slope,
+        total_elements
+    );
+    
+    return output;
+}
+&quot;&quot;&quot;
+```
+
+Wait, I need to add bias in the fused kernel! Currently I only do multiply + LeakyReLU, but I need bias + multiply + LeakyReLU!
+
+Let me fix:
+```cpp
+__global__ void fused_bias_mul_leakyrelu_kernel(float* data, const float* bias, float multiplier, float negative_slope, int64_t M, int64_t N) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = M * N;
+    if (idx &lt; total) {
+        int64_t col = idx % N;
+        float val = data[idx] + bias[col];
+        val = val * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+```
+
+So the approach is:
+1. cublasSgemm (beta=0) for x @ W^T
+2. Fused kernel: +bias, *multiplier, LeakyReLU
+
+This is good. But actually, using `at::cuda::getCurrentCUDABlasHandle()` and `cublasSgemm` - wait, in newer PyTorch, the blas handle might actually dispatch to cublasLt. Let me check...
+
+Actually, PyTorch&#x27;s `at::cuda::getCurrentCUDABlasHandle()` returns a `cublasHandle_t`, and `cublasSgemm` with this handle uses cuBLAS classic, not cuBLASLt. For H100, cuBLASLt is usually faster.
+
+Hmm, can I use cuBLASLt? That&#x27;s significantly more complex.
+
+Alternative: use `torch::addmm(bias.unsqueeze(0), x, weight.t())` which is PyTorch&#x27;s optimized GEMM+bias, then my custom fused kernel for multiply+LeakyReLU.
+
+Wait, `torch::addmm` computes `beta * bias + alpha * (x @ weight.t())`. If I use `addmm` with alpha=1, beta=1, that&#x27;s exactly GEMM + bias. It&#x27;s highly optimized.
+
+Then I can do `output = output * multiplier` followed by LeakyReLU in a single custom kernel.
+
+Plan B:
+1. `output = torch::addmm(bias, x, weight.t())` in C++ 
+2. Custom kernel for multiply + LeakyReLU
+
+Actually wait, `addmm` might not be exactly what I need. `addmm(input, mat1, mat2, beta, alpha)`:
+`out = beta * input + alpha * (mat1 @ mat2)`
+
+For linear: `out = x @ W^T + bias`, so `input = bias` (but needs broadcasting), `mat1 = x`, `mat2 = W^T`.
+
+PyTorch&#x27;s addmm expects `input` to be broadcastable to the output shape. `bias` is [N], output is [M, N]. In PyTorch C++, `addmm_out` handles this.
+
+Using `at::addmm(bias, x, weight.t())` should work and will call the highly optimized path.
+
+Then my custom kernel does multiply + LeakyReLU.
+
+But wait, is `torch::addmm` in C++ as fast as Python `F.linear`? They should use the same underlying dispatch.
+
+Actually, let me think about this differently. If I write:
+```python
+class ModelNew(nn.Module):
+    def forward(self, x):
+        y = torch.nn.functional.linear(x, self.weight, self.bias)
+        return fused_mul_leakyrelu(y, self.multiplier, self.negative_slope)
+```
+
+This is simple and very likely to be correct and fast. The only custom CUDA needed is the elementwise fused kernel.
+
+But the instructions say &quot;Replace the forward computation... with a custom CUDA kernel&quot;. If most of the work is still done by PyTorch&#x27;s F.linear, is that acceptable? I think so, as long as the forward is implemented correctly and is faster.
+
+However, to really maximize speedup, I should also handle the GEMM in custom code if possible, because then I can potentially fuse more. But cuBLASLt is hard to beat.
+
+Let me also consider: can I use `torch._cublas` or something internal? Probably not a good idea.
+
+What about `torch.matmul` with `out=` parameter? That avoids one allocation.
+
+Actually, for maximum speedup, I should probably:
+1. Do the GEMM with PyTorch&#x27;s optimized path (either in Python or C++)
+2. Fuse the elementwise ops
+
+And in Python it would be:
+```python
+y = F.linear(x, self.weight, self.bias)
+return fused_mul_leakyrelu(y, self.multiplier, self.negative_slope)
+```
+
+In C++ it would be:
+```cpp
+auto y = at::linear(x, weight, bias);
+return fused_mul_leakyrelu(y, multiplier, negative_slope);
+```
+
+Actually, writing this in C++ through load_inline might not be faster than Python because the Python overhead for these large ops is negligible. But doing it in C++ avoids some Python overhead.
+
+Wait, `load_inline` compiles C++ code that we call from Python. The function calls have Python binding overhead. For a large GEMM it doesn&#x27;t matter.
+
+Let me also consider: what if I write the entire forward in Python but still compile a custom kernel just for the fused multiply+LeakyReLU? That should work fine.
+
+Actually, the instructions say &quot;Use `torch.utils.cpp_extension.load_inline` to compile and bind CUDA source at module load time, then call the compiled extension from `ModelNew.forward`&quot;. So I need to:
+1. Load inline a C++ extension with my CUDA kernel
+2. Call it from `ModelNew.forward`
+
+I can call `my_cuda.fused_linear(x, weight, bias, multiplier, negative_slope)` or just call the fused epilogue after doing linear in Python.
+
+I&#x27;ll do the whole thing in CUDA for elegance:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cublas_v2.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void fused_mul_leakyrelu_kernel(float* data, float multiplier, float negative_slope, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        float val = data[idx];
+        val = val * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {
+    // Use PyTorch&#x27;s optimized linear for GEMM + bias
+    torch::Tensor y = at::linear(x, weight, bias);
+    
+    int64_t n = y.numel();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    
+    fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        y.data_ptr&lt;float&gt;(), multiplier, negative_slope, n
+    );
+    
+    return y;
+}
+&quot;&quot;&quot;
+
+functions = [&quot;forward_cuda&quot;]
+
+# Register with load_inline
+module = load_inline(
+    name=&quot;my_cuda&quot;,
+    cpp_sources=[cuda_source],
+    functions=functions,
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+```
+
+Wait, but `at::linear` might cause issues inside a custom kernel? Actually, no, we can call PyTorch ATen ops from C++ just fine.
+
+Hmm, but will `at::linear` be as fast as Python&#x27;s `nn.functional.linear`? Yes, it&#x27;s the same implementation.
+
+Actually, I realize I could try to be more clever. What if I do:
+
+1. `auto y = at::addmm(bias, x, weight.t())` - this is the raw GEMM + bias
+2. Fused multiply + LeakyReLU
+
+`at::addmm` avoids any Python overhead and uses the same cublasLt backend.
+
+Let me use `at::linear` since it&#x27;s simpler and handles weight transposition internally.
+
+Actually wait, for this problem, `nn.Linear` already holds the weight as [out_features, in_features]. `at::linear` expects the same format. Let me verify:
+
+PyTorch `at::linear(input, weight, bias)` computes `input * weight.t() + bias` where `weight` is 2D.
+PyTorch `nn.Linear` stores weight as `[out_features, in_features]`.
+So `at::linear(x, weight, bias)` works directly. Yes.
+
+But actually, using `at::linear` inside C++ still doesn&#x27;t fuse anything. The speedup will come from avoiding the separate multiply and LeakyReLU kernels in Python.
+
+Wait, but if I do `at::linear` then my custom kernel, vs doing `F.linear` in Python then calling my custom kernel - there&#x27;s essentially no difference. Both spend 99% of time in the GEMM.
+
+If the reference is:
+1. F.linear (GEMM + bias)
+2. multiply (*)
+3. leaky_relu
+
+And my version is:
+1. F.linear (GEMM + bias)
+2. Custom fused kernel for multiply + leaky_relu
+
+I save one kernel launch and associated memory bandwidth. That should be enough for a small but measurable speedup.
+
+Alternatively, what if I use `at::addmm` to compute GEMM + bias into an output, then launch a custom kernel that reads the output, adds bias, multiplies, and applies LeakyReLU? Wait, I already added bias with addmm.
+
+OK let me think about whether I can do even better with custom cublas.
+
+What if I call `cublasGemmEx` with `CUBLAS_COMPUTE_32F_FAST_TF32` to use tensor cores? PyTorch also uses TF32 by default for matmuls (since PyTorch 1.7+). So that should be equivalent.
+
+Actually, let me try a different approach. I&#x27;ll write the C++ code to:
+1. Call PyTorch&#x27;s `at::linear` or `at::addmm` for the GEMM+bias
+2. Then call my fused kernel for multiply+LeakyReLU
+
+This is safe and should work well. But actually, I realize I can do better with a custom cublas call if I use the right parameters.
+
+Wait, what if I compute `at::addmm(bias, x, weight.t(), 1.0, multiplier)`? This computes `bias + multiplier * (x @ weight.t())`. But I need `(x @ weight.t() + bias) * multiplier`. These are different:
+- `bias + multiplier * (x @ W^T)` vs `multiplier * (x @ W^T) + multiplier * bias`
+The second one is `multiplier * (x @ W^T + bias)`. 
+
+If I want `multiplier` factored in, I can do:
+`auto y = at::addmm(bias * multiplier, x, weight.t(), 1.0, multiplier);`
+This gives `bias * multiplier + multiplier * (x @ W^T) = multiplier * (x @ W^T + bias)`. Perfect!
+
+Then I only need LeakyReLU. But LeakyReLU is not linear, so I can&#x27;t fold it into addmm.
+
+So:
+`y = at::addmm(bias * multiplier, x, weight.t(), 1.0, multiplier)`
+`y = leaky_relu(y)`
+
+This saves me one kernel launch (the multiply) but I still need a LeakyReLU kernel.
+
+Can PyTorch&#x27;s `at::leaky_relu` be called from my kernel? Yes, but then it&#x27;s the same as before.
+
+Or I can write a custom LeakyReLU kernel and fuse everything:
+`y = at::addmm(bias * multiplier, x, weight.t(), 1.0, multiplier)`
+Then custom kernel for LeakyReLU.
+
+This is slightly better because I only need one custom kernel (LeakyReLU) instead of a fused multiply+LeakyReLU. But compute-wise and memory-wise, it&#x27;s the same.
+
+Actually, wait. `bias * multiplier` creates a temporary tensor. For bias of size 8192, that&#x27;s 32KB. Negligible.
+
+Hmm, but I need to be careful about using PyTorch ops inside a `load_inline` function. If I write C++ code that calls `at::addmm`, it will work, but then what additional headers do I need? The custom CUDA code is compiled in a context where PyTorch headers are already available.
+
+Actually, there&#x27;s another issue. If I use `at::addmm` or `at::linear` inside my custom C++ function, and then I call another kernel, the `at::addmm` might not be completed before my kernel launches. But CUDA operations from PyTorch should enqueue to the same stream. By default, my kernel should also launch on the current stream, and there should be an implicit stream dependency. But actually, when using raw CUDA kernels in C++ extensions, we might need to make sure we&#x27;re on the right CUDA stream.
+
+PyTorch operations use the current CUDA stream. Raw kernel launches also use the default stream (stream 0) unless specified otherwise. If we use `at::cuda::CUDAStreamGuard` or similar... Actually, for `load_inline` with simple kernels, the default stream should be fine if no other streams are used.
+
+But wait - PyTorch async operations might use whatever is the current stream. If I do:
+```cpp
+auto y = at::addmm(...);
+my_kernel&lt;&lt;&lt;...&gt;&gt;&gt;(y.data_ptr&lt;float&gt;(), ...);
+```
+
+The `my_kernel` might start before `at::addmm` finishes if they&#x27;re on different streams or if there&#x27;s no proper synchronization. Actually, if `at::addmm` enqueues to stream S and `my_kernel` enqueues to stream 0, and if stream S != 0, then there could be a race condition.
+
+To be safe, I should ensure the kernel runs on the same stream as PyTorch. I can use:
+```cpp
+auto stream = at::cuda::getCurrentCUDAStream();
+my_kernel&lt;&lt;&lt;blocks, threads, 0, stream.stream()&gt;&gt;&gt;(...);
+```
+
+This is important! If I don&#x27;t sync to the right stream, I might get wrong results.
+
+Actually, in many PyTorch C++ extensions, people just launch raw kernels without specifying the stream, and it works because PyTorch often uses the default stream. But with newer PyTorch and stream pools, it&#x27;s safer to specify.
+
+Actually, let me look at this more carefully. PyTorch&#x27;s current CUDA stream for a device is often the default stream in simple cases, but can be different. Using `at::cuda::getCurrentCUDAStream()` is the right approach.
+
+So my plan:
+1. Compute `y = at::addmm(bias, x, weight.t())` or use `at::linear`
+2. Or better, use custom cublas to avoid potential stream issues and to have more control
+
+Actually, let me just use cublas directly to avoid any stream uncertainty:
+
+```cpp
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+// ...
+cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+// The handle operates on the current stream automatically
+```
+
+And for my kernel:
+```cpp
+auto stream = at::cuda::getCurrentCUDAStream();
+my_kernel&lt;&lt;&lt;blocks, threads, 0, stream&gt;&gt;&gt;(...);
+```
+
+This is clean and safe.
+
+Let me draft the full code now.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+CUDA_SOURCE = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+#include &lt;cublas_v2.h&gt;
+
+__global__ void fused_mul_leakyrelu_kernel(float* data, float multiplier, float negative_slope, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        float val = data[idx] * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {
+    int64_t M = x.size(0);
+    int64_t K = x.size(1);
+    int64_t N = weight.size(0);
+    
+    torch::Tensor output = torch::empty({M, N}, x.options());
+    
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    
+    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                N, M, K,
+                &amp;alpha,
+                weight.data_ptr&lt;float&gt;(), K,
+                x.data_ptr&lt;float&gt;(), K,
+                &amp;beta,
+                output.data_ptr&lt;float&gt;(), N);
+    
+    // Fused bias + multiply + LeakyReLU
+    int64_t total = M * N;
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    
+    auto stream = at::cuda::getCurrentCUDAStream();
+    
+    // Launch as fused kernel
+    // We could do a separate kernel for bias add, then multiply + leakyrelu
+    // But let&#x27;s do one kernel: output = leakyrelu((output + bias) * multiplier)
+    // Actually, we need to pass bias which is [N]
+    
+    // Wait, I need to rewrite the kernel to handle bias
+    // Let me use a separate fused kernel that handles 2D indexing with bias
+    
+    return output;
+}
+&quot;&quot;&quot;
+
+# ...
+```
+
+Let me rewrite the kernel to handle 2D with bias:
+
+```cpp
+__global__ void fused_bias_mul_leakyrelu_kernel(float* data, const float* bias, float multiplier, float negative_slope, int64_t M, int64_t N) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = M * N;
+    if (idx &lt; total) {
+        int64_t col = idx % N;
+        float val = data[idx] + bias[col];
+        val = val * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+```
+
+Wait, but if total can be up to 8.4M, and we use 256 threads per block, we need about 32,768 blocks. That&#x27;s fine for modern GPUs.
+
+However, computing `idx % N` with large numbers might be expensive. `%` is a slow operation. We can use:
+```cpp
+int64_t row = idx / N;
+int64_t col = idx - row * N;  // or idx % N
+```
+
+Division and modulo are both expensive. But for compute-bound kernels, it&#x27;s fine. We could also use a 2D grid.
+
+Actually, for elementwise ops, memory bandwidth is the bottleneck, not compute. So division cost might matter. Let me think...
+
+With 8.4M elements, and each thread processing 1 element:
+- Memory: 32MB read + 32MB write = 64MB
+- At 3.35 TB/s: ~19 microseconds
+- During this time, we do a few arithmetic ops per element. Division is slow but might still be hidden by memory latency.
+
+Alternatively, use a 2D grid:
+```cpp
+__global__ void fused_bias_mul_leakyrelu_kernel(float* data, const float* bias, float multiplier, float negative_slope, int64_t M, int64_t N) {
+    int64_t row = blockIdx.y * blockDim.y + threadIdx.y;
+    int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &lt; M &amp;&amp; col &lt; N) {
+        int64_t idx = row * N + col;
+        float val = data[idx] + bias[col];
+        val = val * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+```
+
+With 2D blocks, say 16x16 = 256 threads per block. Grid: (N/16, M/16) = (512, 64) = 32,768 blocks total. Same number of blocks.
+
+Actually, with `N=8192`, `blockDim.x=128`, `blockDim.y=2` gives 256 threads.
+`gridDim.x = (8192+127)/128 = 64`, `gridDim.y = (1024+1)/2 = 512`.
+Total blocks = 64 * 512 = 32,768.
+
+This avoids integer division. The 2D indexing is very natural.
+
+But actually, for a simple 1D grid with `idx % N`, on modern GPUs with tens of thousands of threads running concurrently, the division latency is well-hidden by memory latency. And the compiler might optimize it.
+
+Let me check if I can use `int` instead of `int64_t` for indices. `M * N = 1024 * 8192 = 8,388,608`, which fits in a 32-bit signed integer (max ~2.1B). So I can use `int` for speed.
+
+```cpp
+__global__ void fused_bias_mul_leakyrelu_kernel(float* data, const float* bias, float multiplier, float negative_slope, int M, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = M * N;
+    if (idx &lt; total) {
+        int col = idx % N;
+        float val = data[idx] + bias[col];
+        val = val * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+```
+
+Using `int` is faster on GPUs. `total = 8,388,608` fits in `int`.
+
+But `cublasSgemm` expects `int` parameters anyway, so this is consistent.
+
+Let me also think about whether `cublasSgemm` is the right call. For FP32 on H100, cuBLAS will use appropriate algorithms. But PyTorch uses cublasLt for GEMM, which might be faster.
+
+To be safe and match PyTorch&#x27;s performance for the GEMM part, I can use `at::addmm` instead of raw cublas. Let me reconsider this.
+
+If I use `at::addmm` in C++:
+```cpp
+auto output = at::addmm(bias, x, weight.t());
+```
+
+Then apply my fused kernel for multiply + LeakyReLU.
+
+The `at::addmm` call is highly optimized by PyTorch and uses cublasLt. The only risk is stream synchronization, but if I launch my kernel on the same stream, it should be fine.
+
+Actually, `at::addmm` returns a tensor. Then I read from it in my kernel. Since both are on the same CUDA stream, my kernel will be enqueued after `addmm` completes.
+
+So:
+```cpp
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {
+    auto y = at::addmm(bias, x, weight.t());
+    int n = y.numel();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    fused_mul_leakyrelu_kernel&lt;&lt;&lt;(n + 255) / 256, 256, 0, stream&gt;&gt;&gt;(
+        y.data_ptr&lt;float&gt;(), multiplier, negative_slope, n
+    );
+    return y;
+}
+```
+
+But wait - `at::addmm` out-of-place creates a new tensor `y`. But the reference also creates intermediate tensors. And if PyTorch&#x27;s caching allocator is efficient, this should be fine.
+
+Actually, does `addmm` with bias broadcast correctly? `bias` is [N], `x` is [M, K], `weight.t()` is [K, N]. The output of `x @ weight.t()` is [M, N]. `addmm(bias, x, weight.t())` should broadcast `bias` to [M, N]. Yes, this works in PyTorch.
+
+But let me double check the sign of `at::addmm`. It computes `beta * input + alpha * (mat1 @ mat2)`. With default `beta=1, alpha=1`, this is `input + mat1 @ mat2`. So `at::addmm(bias, x, weight.t())` gives `bias + x @ weight.t()`. This is correct.
+
+Then the fused multiply+LeakyReLU:
+```cpp
+__global__ void fused_mul_leakyrelu_kernel(float* data, float multiplier, float negative_slope, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        float val = data[idx] * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+```
+
+This should be correct and fast.
+
+Wait, is there a way to avoid the `addmm` allocation? We could use `addmm_out` with a pre-allocated output. But `at::addmm_out` is available.
+
+```cpp
+torch::Tensor output = torch::empty({M, N}, x.options());
+at::addmm_out(output, bias, x, weight.t(), 1, 1);
+```
+
+This uses `output` directly without creating a new temporary. PyTorch will dispatch to cublasLt with the output tensor as the destination.
+
+Then apply the fused kernel to `output`. This avoids one allocation.
+
+Actually, let me check the exact ATen signature. In PyTorch C++:
+```cpp
+Tensor &amp; addmm_out(Tensor &amp; out, const Tensor &amp; self, const Tensor &amp; mat1, const Tensor &amp; mat2, Scalar beta, Scalar alpha)
+```
+
+Yes! This is perfect.
+
+Let me also consider: could we use `at::linear_out`? There might not be a direct `linear_out`.
+
+So the optimal approach is:
+1. Pre-allocate output tensor
+2. `at::addmm_out(output, bias, x, weight.t(), 1, 1)` for GEMM + bias
+3. Launch fused multiply + LeakyReLU kernel on the same stream
+
+This minimizes allocations and matches PyTorch&#x27;s GEMM performance.
+
+One concern: `at::addmm_out` might not support broadcasting bias to the output shape in the same way as regular `addmm`. Actually, it does - PyTorch handles broadcasting consistently.
+
+Let me now write the complete code.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+
+__global__ void fused_mul_leakyrelu_kernel(float* __restrict__ data, float multiplier, float negative_slope, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        float val = data[idx] * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {
+    int64_t M = x.size(0);
+    int64_t N = weight.size(0);
+    auto output = torch::empty({M, N}, x.options());
+    
+    at::addmm_out(output, bias, x, weight.t(), 1, 1);
+    
+    int n = M * N;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    
+    auto stream = at::cuda::getCurrentCUDAStream();
+    fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads, 0, stream.stream()&gt;&gt;&gt;(
+        output.data_ptr&lt;float&gt;(), multiplier, negative_slope, n
+    );
+    
+    return output;
+}
+&quot;&quot;&quot;
+```
+
+Wait, I need to check if `stream.stream()` is the right way to get the raw CUDA stream. `at::cuda::CUDAStream` has a `stream()` method that returns `cudaStream_t`. Yes.
+
+But actually, in many examples, people just use:
+```cpp
+cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+```
+
+Or:
+```cpp
+AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+```
+
+Actually, for kernels, I can do:
+```cpp
+auto stream = at::cuda::getCurrentCUDAStream();
+fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads, 0, stream&gt;&gt;&gt;(...);
+```
+
+Wait, `CUDAStream` can be implicitly converted to `cudaStream_t`? Let me check... In PyTorch:
+```cpp
+class CUDAStream {
+ public:
+  operator cudaStream_t() const { return stream(); }
+};
+```
+
+Yes! `at::cuda::CUDAStream` has an implicit conversion to `cudaStream_t`. So `&lt;&lt;&lt;..., stream&gt;&gt;&gt;` should work if we&#x27;ve extracted the `CUDAStream` object. But actually, the syntax for kernel launch expects a `cudaStream_t`. Since there&#x27;s an implicit conversion, this should be fine.
+
+But to be safe, I&#x27;ll use `.stream()`:
+```cpp
+cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream().stream();
+my_kernel&lt;&lt;&lt;blocks, threads, 0, cuda_stream&gt;&gt;&gt;(...);
+```
+
+Now let me write the complete module:
+
+```python
+CUDA_SOURCE = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+
+__global__ void fused_mul_leakyrelu_kernel(float* __restrict__ data, float multiplier, float negative_slope, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        float val = data[idx] * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+
+at::Tensor forward_cuda(at::Tensor x, at::Tensor weight, at::Tensor bias, float multiplier, float negative_slope) {
+    int64_t M = x.size(0);
+    int64_t N = weight.size(0);
+    auto output = at::empty({M, N}, x.options());
+    
+    at::addmm_out(output, bias, x, weight.t(), 1, 1);
+    
+    int n = static_cast&lt;int&gt;(M * N);
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads, 0, stream&gt;&gt;&gt;(
+        output.data_ptr&lt;float&gt;(), multiplier, negative_slope, n
+    );
+    
+    return output;
+}
+&quot;&quot;&quot;
+
+my_cuda = load_inline(
+    name=&quot;my_cuda&quot;,
+    cpp_sources=[CUDA_SOURCE],
+    functions=[&quot;forward_cuda&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+        
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        
+        # Initialize similar to nn.Linear
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        if self.bias is not None:
+            bound = 1 / (in_features ** 0.5)
+            nn.init.uniform_(self.bias, -bound, bound)
+    
+    def forward(self, x):
+        return my_cuda.forward_cuda(x, self.weight, self.bias, self.multiplier, self.negative_slope)
+```
+
+Wait, I should double-check the initialization. nn.Linear uses `kaiming_uniform_` with `a=math.sqrt(5)`. Let me verify:
+```python
+torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+```
+
+And bias: `bound = 1 / math.sqrt(fan_in)` where `fan_in = in_features`.
+
+Actually, nn.Linear uses:
+```python
+init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+bound = 1 / math.sqrt(fan_in)
+init.uniform_(self.bias, -bound, bound)
+```
+
+So I need `import math`.
+
+But actually, the evaluation probably doesn&#x27;t care about initialization as long as weights and biases exist. The reference model is initialized before comparison. So I can just write:
+```python
+self.gemm = nn.Linear(in_features, out_features)
+```
+and extract weight/bias from it, or just create parameters directly.
+
+Actually, let me look at the reference again:
+```python
+class Model(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.multiplier = multiplier
+        self.leaky_relu = nn.LeakyReLU(negative_slope)
+```
+
+So the reference uses `nn.Linear` which does the standard initialization. For my `ModelNew` to be comparable, I should match this. I can simply do:
+```python
+self.gemm = nn.Linear(in_features, out_features)
+self.weight = self.gemm.weight
+self.bias = self.gemm.bias
+```
+
+But then `self.gemm` is a submodule. That&#x27;s fine, but I&#x27;m not using it in forward.
+
+Actually, for the correctness check, they&#x27;ll instantiate `Model` and `ModelNew` with the same arguments and then compare outputs on the same input. The weights might be randomly initialized differently. Wait - do they copy weights? Usually in these benchmarks, they initialize both models and then run with random weights. For correctness, the outputs just need to match with *those* weights.
+
+Actually, looking at evaluation patterns, they usually instantiate the model with `get_init_inputs()` and then the test framework might do something like:
+```python
+model = Model(*get_init_inputs())
+model_new = ModelNew(*get_init_inputs())
+# compare outputs for same input
+```
+
+Since each is initialized independently, their weights are different. Wait, that can&#x27;t be right for numerical comparison... Actually, if they compare `model(x)` vs `model_new(x)`, the weights need to be the same.
+
+In many of these tasks, after instantiation they might copy state dict or do something else. But looking at the instructions more carefully, for &quot;correctness&quot; they probably just verify that `ModelNew` behaves like `Model` when given the same parameters. But since random init is different, they might not compare `Model` output to `ModelNew` output directly...
+
+Actually, the `run_correctness` tool likely compares `ModelNew` against the *reference computation* using the same weights. It might instantiate `ModelNew` and then compare against a manually computed reference, or it might copy parameters.
+
+Given the standard practice, I think the safest is to make `ModelNew` use `nn.Parameter` and standard initialization. But even simpler:
+
+```python
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / (fan_in ** 0.5)
+        nn.init.uniform_(self.bias, -bound, bound)
+```
+
+Actually, let me look at whether I can just reuse `nn.Linear` for parameter creation:
+```python
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super().__init__()
+        gemm = nn.Linear(in_features, out_features)
+        self.weight = gemm.weight
+        self.bias = gemm.bias
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+```
+
+This is clean and matches initialization exactly.
+
+Now, one more thing: do I need to register weight and bias as parameters? If I do `self.weight = gemm.weight`, since `gemm` is not stored (it&#x27;s a local variable), the parameter will still be registered because `nn.Parameter` gets registered when assigned to `self`. Actually wait:
+
+When you do `self.weight = gemm.weight`, `gemm.weight` is already an `nn.Parameter`. Setting it on `self` registers it in `ModelNew`&#x27;s parameters. But we also need to make sure we don&#x27;t have a dangling reference to `gemm`.
+
+This should work:
+```python
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super().__init__()
+        gemm = nn.Linear(in_features, out_features)
+        self.weight = gemm.weight
+        self.bias = gemm.bias
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+        self.register_parameter(&#x27;weight&#x27;, self.weight)
+        self.register_parameter(&#x27;bias&#x27;, self.bias)
+```
+
+Wait, `self.weight = gemm.weight` already registers it. Let me verify: in `nn.Module.__setattr__`, if the value is an `nn.Parameter`, it is added to `_parameters`. So `self.weight = gemm.weight` works and registers it. But `gemm` is a local variable that gets garbage collected. Its parameters are now owned by both `gemm` (temporarily) and `self`. When `gemm` is GC&#x27;d, the parameters survive because `self` also holds references. This is fine.
+
+Alternatively, to be cleaner:
+```python
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / (fan_in ** 0.5)
+        nn.init.uniform_(self.bias, -bound, bound)
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+```
+
+This is clean and explicit.
+
+Now, let me compile and test this. First, let me make sure the code handles the data types correctly. The inputs are fp32. Both x, weight, and bias are fp32.
+
+One more concern: when calling `at::addmm_out` inside a custom C++ extension, does it work with the same autograd graph? The `load_inline` functions are not differentiable by default unless we also define backward. But for forward-only evaluation (which is what the benchmark measures), this is fine.
+
+Wait, actually, the instructions just say &quot;Replace the forward computation&quot;. The evaluation likely only tests forward. For training (backward), it might not matter. But to be safe, if we want autograd to work:
+
+The result of `forward_cuda` won&#x27;t have a backward method. But the reference only asks for forward. The `run_correctness` tool might check forward only.
+
+Actually, looking at similar tasks, `run_correctness` usually checks forward outputs only. Let me assume that.
+
+But wait - if they do `model_new(x)` and expect gradients, it won&#x27;t work. Hmm. Let me think about whether I need to worry about autograd.
+
+The reference implementation has parameters, so in principle training could happen. But the task says &quot;Replace the forward computation&quot;. The correctness check might just do forward passes.
+
+If I want to support autograd, I could wrap the call in `torch.autograd.Function`. But that&#x27;s extra complexity.
+
+Actually, for these GPU optimization tasks, the evaluation typically focuses on forward pass speed and correctness. Let me check if there&#x27;s any mention of backward... No, just the forward method.
+
+I&#x27;ll proceed with the non-differentiable custom op. If autograd is needed, the benchmark will fail. But actually, wait - can I make it differentiable easily?
+
+If I write a `torch.autograd.Function`:
+```python
+class FusedLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias, multiplier, negative_slope):
+        output = my_cuda.forward_cuda(x, weight, bias, multiplier, negative_slope)
+        # ... save tensors for backward
+        return output
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        # ... compute gradients
+        pass
+```
+
+But writing backward for this is non-trivial and requires more CUDA code. For a forward-only benchmark, it&#x27;s unnecessary.
+
+Actually, looking at the `submit_kernel` description, it says &quot;correctness only&quot; for `run_correctness`, and &quot;correctness check AND timing measurement&quot; for `submit_kernel`. It doesn&#x27;t explicitly mention backward. Let me assume forward-only.
+
+Wait, one thing. The benchmark may create a model and then run the forward several times. The weights are fixed during benchmarking. So autograd graph creation doesn&#x27;t matter.
+
+Let me look one more time at the problem statement. It says:
+&quot;Replace the forward computation of the PyTorch model below with a custom CUDA kernel.&quot;
+
+And then describes correctness requirements for `forward()`. So I think forward-only is correct.
+
+Actually, there&#x27;s another concern: the reference runs with fp32, and the tolerance is `atol=rtol=1e-4`. `at::addmm_out` should produce the same result as `nn.Linear` since they use the same underlying cuBLAS. The fused multiply+LeakyReLU is deterministic. So we should be within tolerance.
+
+One more optimization idea: use `__restrict__` in the kernel to help compiler. Also use vectorized loads/stores.
+
+For vectorized memory access, we can process 4 floats at a time:
+```cpp
+__global__ void fused_mul_leakyrelu_kernel(float* __restrict__ data, float multiplier, float negative_slope, int n) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (idx + 3 &lt; n) {
+        float4 val = reinterpret_cast&lt;float4*&gt;(data)[idx / 4];
+        val.x = val.x * multiplier;
+        val.y = val.y * multiplier;
+        val.z = val.z * multiplier;
+        val.w = val.w * multiplier;
+        val.x = val.x &gt; 0 ? val.x : val.x * negative_slope;
+        val.y = val.y &gt; 0 ? val.y : val.y * negative_slope;
+        val.z = val.z &gt; 0 ? val.z : val.z * negative_slope;
+        val.w = val.w &gt; 0 ? val.w : val.w * negative_slope;
+        reinterpret_cast&lt;float4*&gt;(data)[idx / 4] = val;
+    }
+    // handle tail...
+}
+```
+
+This uses 128-bit loads/stores which saturate memory bandwidth better. But for LeakyReLU, conditionals might cause divergence. However, since all threads in a warp typically see similar values (especially with random [0,1] inputs, which are all positive), branch divergence might be minimal.
+
+Actually, the inputs are `torch.rand` which is uniform [0,1]. After GEMM + bias, values might be positive or negative depending on weights. But with Kaiming init and M=1024, N=8192, K=8192, the outputs have mean ~0 and some variance.
+
+Branch divergence in LeakyReLU: half the values might be positive, half negative. This means on average, half the threads in a warp take each branch. This is actually not too bad - the warp executes both paths but with some threads masked.
+
+Vectorized memory access might still be worth it. But for a first attempt, let me keep it simple. We can optimize later if needed.
+
+Actually, let me think about this more. The benchmark on H100 has 3.35 TB/s memory bandwidth. For non-vectorized float loads:
+- Each load is 32 bits
+- To saturate 3.35 TB/s, we need 3.35e12 / 4 = 8.375e9 loads per second
+- H100 has many SMs, so this is achievable with good memory coalescing
+
+Vectorized loads help slightly by reducing instruction count. For a simple elementwise kernel, it probably won&#x27;t make a huge difference, but it can help.
+
+For now, let me write the simple version and test it. If the speedup is not enough, I can add vectorization.
+
+Let me also think about another optimization: using `std::max` or conditional operator. On GPUs, `fmaxf` or `?:` both compile to similar instructions. With `--use_fast_math`, `fmaxf` might be faster.
+
+Actually, for `val &gt; 0 ? val : val * negative_slope`, the compiler can optimize this to a single conditional operation.
+
+One more thing: should I use `multiplier` and `negative_slope` as `float` or `__half`? They are python floats, passed as `float` to CUDA. That&#x27;s fine.
+
+Let me now write the full kernel module and test compile. I&#x27;ll include necessary imports and make sure everything is self-contained.
+
+Wait, there&#x27;s also the option to use `cublasGemmEx` with `CUDA_R_32F` and `CUBLAS_COMPUTE_32F_FAST_TF32` to use Tensor Cores. But PyTorch&#x27;s `addmm` already uses TF32 by default (when `torch.backends.cuda.matmul.allow_tf32=True`, which is the default). So it should already be using TF32.
+
+Actually, PyTorch&#x27;s default for `allow_tf32` has changed over versions. On newer versions, it&#x27;s True by default for matmuls. The `at::addmm_out` will use whatever the current setting is.
+
+For maximum performance and to ensure we&#x27;re matching PyTorch, using `at::addmm_out` is better than manual cublas.
+
+Let me draft the complete code now.
+
+One issue: do I need to include `c10/cuda/CUDAStream.h` or similar? `ATen/cuda/CUDAContext.h` should include what we need for `at::cuda::getCurrentCUDAStream()`.
+
+Let me write it:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+
+__global__ void fused_mul_leakyrelu_kernel(float* __restrict__ data, float multiplier, float negative_slope, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        float val = data[idx] * multiplier;
+        data[idx] = val &gt; 0.0f ? val : val * negative_slope;
+    }
+}
+
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {
+    int64_t M = x.size(0);
+    int64_t N = weight.size(0);
+    
+    // Pre-allocate output
+    auto output = torch::empty({M, N}, x.options());
+    
+    // GEMM + bias using PyTorch&#x27;s optimized path (cublasLt)
+    at::addmm_out(output, bias, x, weight.t(), 1, 1);
+    
+    // Fused multiply + LeakyReLU
+    int n = static_cast&lt;int&gt;(M * N);
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads, 0, stream&gt;&gt;&gt;(
+        output.data_ptr&lt;float&gt;(), multiplier, negative_slope, n
+    );
+    
+    return output;
+}
+&quot;&quot;&quot;
+
+fused_ops = load_inline(
+    name=&quot;fused_ops&quot;,
+    cpp_sources=[cuda_source],
+    functions=[&quot;forward_cuda&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / (fan_in ** 0.5)
+        nn.init.uniform_(self.bias, -bound, bound)
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+    
+    def forward(self, x):
+        return fused_ops.forward_cuda(x, self.weight, self.bias, self.multiplier, self.negative_slope)
+```
+
+Wait, but `nn.init._calculate_fan_in_and_fan_out` requires importing `nn.init` or using `torch.nn.init`. Let me use `torch.nn.init` explicitly.
+
+Actually, `nn.init.kaiming_uniform_` and `nn.init.uniform_` are fine if I have `import torch.nn as nn`.
+
+But looking at the reference, `Model.__init__` uses `self.gemm = nn.Linear(...)`. For `ModelNew`, I could just use that:
+```python
+gemm = nn.Linear(in_features, out_features)
+self.weight = gemm.weight
+self.bias = gemm.bias
+```
+
+This avoids any init code and guarantees exact match.
+
+Actually, `self.weight = gemm.weight` creates a parameter reference, but `gemm` gets GC&#x27;d and might unregister its parameters? Let me think...
+
+No, `nn.Module` registers parameters in its own `_parameters` dict when `__setattr__` is called with a Parameter. When `gemm` is created, its weight/bias are in `gemm._parameters`. Then when we do `self.weight = gemm.weight`, `ModelNew.__setattr__` sees a Parameter and adds it to `self._parameters[&#x27;weight&#x27;]`. The Python reference count for the Parameter tensor is now 2 (one from `gemm._parameters[&#x27;weight&#x27;]`, one from `self._parameters[&#x27;weight&#x27;]`). When `gemm` is deleted, the reference count drops to 1, but it survives because `self` still holds it. So this works.
+
+Actually, is there a simpler way?
+```python
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super().__init__()
+        # Use PyTorch&#x27;s Linear to create properly initialized parameters
+        temp_linear = nn.Linear(in_features, out_features)
+        self.register_parameter(&#x27;weight&#x27;, temp_linear.weight)
+        self.register_parameter(&#x27;bias&#x27;, temp_linear.bias)
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+```
+
+This is cleaner. Or even:
+```python
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        bound = 1 / (in_features ** 0.5)
+        nn.init.uniform_(self.bias, -bound, bound)
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+```
+
+This works too. `nn.Linear` uses exactly this init.
+
+Let me verify the nn.Linear init code:
+```python
+init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+if self.bias is not None:
+    fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+    bound = 1 / math.sqrt(fan_in)
+    init.uniform_(self.bias, -bound, bound)
+```
+
+But `fan_in` for a weight of shape `[out_features, in_features]` is `in_features`. So `bound = 1 / math.sqrt(in_features)`.
+
+My code above has `bound = 1 / (in_features ** 0.5)` which is the same. Good.
+
+OK, I think the code is solid. Let me test compilation first. I&#x27;ll write the complete Python module.
+
+Wait, one subtle issue. When `load_inline` compiles, it might not find `at::addmm_out` because `addmm_out` is defined in `ATen/ops/addmm.h` or similar. But `torch/extension.h` includes the necessary headers. Let me verify...
+
+`torch/extension.h` includes `torch/all.h`, which includes ATen headers. `at::addmm_out` is in the `at` namespace and is a generated ATen operator. It should be available.
+
+Actually, in C++ extensions, `at::addmm_out` should work fine. It&#x27;s used in many PyTorch C++ extensions.
+
+Let me compile and see.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;ATen/cuda/CUDAContext.h&gt;\n\n__global__ void fused_mul_leakyrelu_kernel(float* __restrict__ data, float multiplier, float negative_slope, int n) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx &lt; n) {\n        float val = data[idx] * multiplier;\n        data[idx] = val &gt; 0.0f ? val : val * negative_slope;\n    }\n}\n\ntorch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {\n    int64_t M = x.size(0);\n    int64_t N = weight.size(0);\n    \n    auto output = torch::empty({M, N}, x.options());\n    \n    at::addmm_out(output, bias, x, weight.t(), 1, 1);\n    \n    int n = static_cast&lt;int&gt;(M * N);\n    const int threads = 256;\n    const int blocks = (n + threads - 1) / threads;\n    \n    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();\n    fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads, 0, stream&gt;&gt;&gt;(\n        output.data_ptr&lt;float&gt;(), multiplier, negative_slope, n\n    );\n    \n    return output;\n}\n\&quot;\&quot;\&quot;\n\nfused_ops = load_inline(\n    name=\&quot;fused_ops\&quot;,\n    cpp_sources=[cuda_source],\n    functions=[\&quot;forward_cuda\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    extra_cflags=[\&quot;-O3\&quot;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, multiplier, negative_slope):\n        super(ModelNew, self).__init__()\n        self.weight = nn.Parameter(torch.empty(out_features, in_features))\n        self.bias = nn.Parameter(torch.empty(out_features))\n        nn.init.kaiming_uniform_(self.weight, a=5**0.5)\n        bound = 1 / (in_features ** 0.5)\n        nn.init.uniform_(self.bias, -bound, bound)\n        self.multiplier = multiplier\n        self.negative_slope = negative_slope\n    \n    def forward(self, x):\n        return fused_ops.forward_cuda(x, self.weight, self.bias, self.multiplier, self.negative_slope)\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;fused_ops&#x27;: [1/2] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_ops -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /home/prabhune/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -O3 -c /scratch/tejas/PopcornBench/runs/l12_default/original/Kimi-K2.6/level_2_problem_12_cache/k_ae0ebe75436c/fused_ops/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_ops -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /home/prabhune/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -O3 -c /scratch/tejas/PopcornBench/runs/l12_default/original/Kimi-K2.6/level_2_problem_12_cache/k_ae0ebe75436c/fused_ops/main.cpp -o main.o 
+In file included from /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include/ATen/cuda/CUDAContext.h:4,
+                 from /scratch/tejas/PopcornBench/runs/l12_default/original/Kimi-K2.6/level_2_problem_12_cache/k_ae0ebe75436c/fused_ops/main.cpp:4:
+/scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include/ATen/cuda/CUDAContextLight.h:9:10: fatal error: cuda_runtime_api.h: No such file or directory
+    9 | #include &lt;cuda_runtime_api.h&gt;
+      |          ^~~~~~~~~~~~~~~~~~~~
+compilation terminated.
+ninja: build stopped: subcommand failed.
+</div></details></div></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>llm latency: 94.4s</span></div><details open><summary>reasoning</summary><div class="block reasoning">The compilation failed because `cpp_sources` was interpreted as C++ code (not CUDA code). We need to use `cuda_sources` parameter instead. Let me fix this and also make sure the code is properly structured.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;ATen/cuda/CUDAContext.h&gt;\n\n__global__ void fused_mul_leakyrelu_kernel(float* __restrict__ data, float multiplier, float negative_slope, int64_t n) {\n    int64_t idx = static_cast&lt;int64_t&gt;(blockIdx.x) * blockDim.x + threadIdx.x;\n    if (idx &lt; n) {\n        float val = data[idx] * multiplier;\n        data[idx] = val &gt; 0.0f ? val : val * negative_slope;\n    }\n}\n\ntorch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {\n    int64_t M = x.size(0);\n    int64_t N = weight.size(0);\n    \n    auto output = torch::empty({M, N}, x.options());\n    \n    at::addmm_out(output, bias, x, weight.t(), 1, 1);\n    \n    int64_t n = M * N;\n    const int threads = 256;\n    const int blocks = (n + threads - 1) / threads;\n    \n    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();\n    fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads, 0, stream&gt;&gt;&gt;(\n        output.data_ptr&lt;float&gt;(), multiplier, negative_slope, n\n    );\n    \n    return output;\n}\n\&quot;\&quot;\&quot;\n\nfused_ops = load_inline(\n    name=\&quot;fused_ops\&quot;,\n    cuda_sources=[cuda_source],\n    functions=[\&quot;forward_cuda\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    extra_cflags=[\&quot;-O3\&quot;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, multiplier, negative_slope):\n        super(ModelNew, self).__init__()\n        self.weight = nn.Parameter(torch.empty(out_features, in_features))\n        self.bias = nn.Parameter(torch.empty(out_features))\n        nn.init.kaiming_uniform_(self.weight, a=5**0.5)\n        bound = 1 / (in_features ** 0.5)\n        nn.init.uniform_(self.bias, -bound, bound)\n        self.multiplier = multiplier\n        self.negative_slope = negative_slope\n    \n    def forward(self, x):\n        return fused_ops.forward_cuda(x, self.weight, self.bias, self.multiplier, self.negative_slope)\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: TypeError.
+TypeError: load_inline() missing 1 required positional argument: &#x27;cpp_sources&#x27;</div></details></div><div class="turn"><div class="turn-head"><span class="turn-id">turn 3</span><span>llm latency: 28.2s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me look at the correct API for `load_inline`. It seems we need both `cpp_sources` and `cuda_sources`. Or just `cpp_sources` but then the CUDA code should be in the C++ source using the `cuda::` namespace. Actually in PyTorch `load_inline`, when using CUDA you typically use `cpp_sources` with an `extern` declaration and `cuda_sources` for the kernel. But both are needed.
+
+Actually, the `load_inline` can take `cpp_sources` and optionally `cuda_sources`. Let me try with both but specifying `cuda_sources` for CUDA and `cpp_sources` for the host wrapper.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncpp_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n\ntorch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope);\n\&quot;\&quot;\&quot;\n\ncuda_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;ATen/ATen.h&gt;\n#include &lt;ATen/cuda/CUDAContext.h&gt;\n\n__global__ void fused_mul_leakyrelu_kernel(float* __restrict__ data, float multiplier, float negative_slope, int64_t n) {\n    int64_t idx = static_cast&lt;int64_t&gt;(blockIdx.x) * blockDim.x + threadIdx.x;\n    if (idx &lt; n) {\n        float val = data[idx] * multiplier;\n        data[idx] = val &gt; 0.0f ? val : val * negative_slope;\n    }\n}\n\ntorch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {\n    int64_t M = x.size(0);\n    int64_t N = weight.size(0);\n    \n    auto output = torch::empty({M, N}, x.options());\n    \n    at::addmm_out(output, bias, x, weight.t(), 1, 1);\n    \n    int64_t n = M * N;\n    const int threads = 256;\n    const int blocks = (n + threads - 1) / threads;\n    \n    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();\n    fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads, 0, stream&gt;&gt;&gt;(\n        output.data_ptr&lt;float&gt;(), multiplier, negative_slope, n\n    );\n    \n    return output;\n}\n\&quot;\&quot;\&quot;\n\nfused_ops = load_inline(\n    name=\&quot;fused_ops\&quot;,\n    cpp_sources=[cpp_source],\n    cuda_sources=[cuda_source],\n    functions=[\&quot;forward_cuda\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    extra_cflags=[\&quot;-O3\&quot;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, multiplier, negative_slope):\n        super(ModelNew, self).__init__()\n        self.weight = nn.Parameter(torch.empty(out_features, in_features))\n        self.bias = nn.Parameter(torch.empty(out_features))\n        nn.init.kaiming_uniform_(self.weight, a=5**0.5)\n        bound = 1 / (in_features ** 0.5)\n        nn.init.uniform_(self.bias, -bound, bound)\n        self.multiplier = multiplier\n        self.negative_slope = negative_slope\n    \n    def forward(self, x):\n        return fused_ops.forward_cuda(x, self.weight, self.bias, self.multiplier, self.negative_slope)\n&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div><div class="turn"><div class="turn-head"><span class="turn-id">turn 4</span><span>llm latency: 7.8s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Good, it compiled. Now let&#x27;s check correctness.
+</div></details><details><summary>call → run_correctness</summary><div class="block tool-args"><span class="role-tag">call</span><b>run_correctness</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncpp_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n\ntorch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope);\n\&quot;\&quot;\&quot;\n\ncuda_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;ATen/ATen.h&gt;\n#include &lt;ATen/cuda/CUDAContext.h&gt;\n\n__global__ void fused_mul_leakyrelu_kernel(float* __restrict__ data, float multiplier, float negative_slope, int64_t n) {\n    int64_t idx = static_cast&lt;int64_t&gt;(blockIdx.x) * blockDim.x + threadIdx.x;\n    if (idx &lt; n) {\n        float val = data[idx] * multiplier;\n        data[idx] = val &gt; 0.0f ? val : val * negative_slope;\n    }\n}\n\ntorch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {\n    int64_t M = x.size(0);\n    int64_t N = weight.size(0);\n    \n    auto output = torch::empty({M, N}, x.options());\n    \n    at::addmm_out(output, bias, x, weight.t(), 1, 1);\n    \n    int64_t n = M * N;\n    const int threads = 256;\n    const int blocks = (n + threads - 1) / threads;\n    \n    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();\n    fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads, 0, stream&gt;&gt;&gt;(\n        output.data_ptr&lt;float&gt;(), multiplier, negative_slope, n\n    );\n    \n    return output;\n}\n\&quot;\&quot;\&quot;\n\nfused_ops = load_inline(\n    name=\&quot;fused_ops\&quot;,\n    cpp_sources=[cpp_source],\n    cuda_sources=[cuda_source],\n    functions=[\&quot;forward_cuda\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    extra_cflags=[\&quot;-O3\&quot;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, multiplier, negative_slope):\n        super(ModelNew, self).__init__()\n        self.weight = nn.Parameter(torch.empty(out_features, in_features))\n        self.bias = nn.Parameter(torch.empty(out_features))\n        nn.init.kaiming_uniform_(self.weight, a=5**0.5)\n        bound = 1 / (in_features ** 0.5)\n        nn.init.uniform_(self.bias, -bound, bound)\n        self.multiplier = multiplier\n        self.negative_slope = negative_slope\n    \n    def forward(self, x):\n        return fused_ops.forward_cuda(x, self.weight, self.bias, self.multiplier, self.negative_slope)\n&quot;
+}</div></details><details><summary>result ← run_correctness (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>run_correctness</b>
+run_correctness PASSED: (5 / 5) trials all matched the reference.
+Numerical precision: max_abs_err=0.00e+00  mean_abs_err=0.00e+00  max_rel_err=0.00e+00</div></details></div><details class="turn-collapse"><summary><b>turn 5</b> · 1 tool call(s) · 242.3s · 26,697 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 5</span><span>llm latency: 242.3s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze what we have:
+
+1. The correctness passed, so our kernel is correct.
+2. Now I need to optimize the performance. Let me think about the approach.
+
+The current approach:
+1. Calls PyTorch&#x27;s `at::addmm_out` for the GEMM (matrix multiplication + bias)
+2. Runs a simple element-wise kernel for multiplication and LeakyReLU
+
+We have batch_size=1024, in_features=8192, out_features=8192 on an H100.
+
+The GEMM size is M=1024, N=8192, K=8192. This is a significant computation. 
+
+Since addmm is already quite optimized in PyTorch/cuBLAS, the main optimization opportunity is to fuse the multiplication and LeakyReLU into the GEMM output, avoiding a separate kernel launch and memory pass.
+
+But wait - let me think about if we can avoid the bias add overhead and fuse more. Since addmm_out already does GEMM + bias addition, using it directly is efficient for the compute part. The separate element-wise kernel means another full pass over the output.
+
+Can we use a custom CUTLASS kernel to fuse the GEMM with the mul+LeakyReLU? That would be much more complex.
+
+Alternatively, we could implement a simpler approach:
+1. Use cuBLAS directly for the GEMM without bias
+2. Then a single fused kernel for bias + mul + LeakyReLU
+
+Or even better for small batches: use addmm for GEMM+bias and then fuse mul+LeakyReLU.
+
+Actually, in terms of practical speedup:
+- The GEMM here computes M*N*K*2 = 1024*8192*8192*2 = 137 billion FLOPs
+- The H100 can do 1979 TFLOPS in BF16 tensor cores or 67 TFLOPS in FP32
+- In FP32, 137 GFLOPs / 67 TFLOPS = ~2 ms compute time
+- But with cuBLAS and tensor cores, even in FP32 it should be faster
+
+For a 1024x8192 matrix (8.4M elements), the memory bandwidth for the elementwise pass is about 2 reads + 1 write = ~3*8.4M*4B = 101MB. At 3.35 TB/s that&#x27;s 0.03ms.
+
+So the GEMM dominates. The speedup from fusing the elementwise ops might be small but could still help.
+
+Let me see if there&#x27;s a way to get more speedup. Actually, let me check if PyTorch&#x27;s `torch.nn.functional.linear` followed by fused operations is better.
+
+Wait - perhaps I should look at using CUTLASS for a custom kernel. But that&#x27;s complex.
+
+Actually, maybe we can go further by fusing the bias + mul + LeakyReLU operations together. Currently we use addmm_out (which does GEMM + bias), then a separate pass. If instead we do GEMM alone and then fuse bias+mul+LeakyReLU, that avoids the intermediate memory write in addmm.
+
+Actually addmm_out just passes the output tensor as the C matrix in C=alpha*A*B + beta*C, so the bias is effectively added. That&#x27;s already efficient - the write happens to the output tensor directly.
+
+But the follow-up elementwise pass is an additional memory pass over the output.
+
+Can I fuse this differently? What if I:
+1. Call at::mm instead of addmm (just the matrix multiply into a fresh output)
+2. Then launch a kernel that reads output, applies bias+mul+LeakyReLU, and writes back
+
+This is the same number of passes. With addmm_out, we get GEMM+bias in one pass, saving one read. Then we do mul+LeakyReLU.
+
+Actually, there&#x27;s another optimization: use at::addmm_out and then our elementwise kernel, but make sure we use enough parallelism. 1024*8192 = 8,388,608 elements. At 256 threads per block, that&#x27;s 32768 blocks. The H100 has 132 SMs or so, so we need plenty of blocks to saturate.
+
+Wait, let me reconsider. Can I fuse the mul and LeakyReLU into cuBLAS via Epilogue? PyTorch&#x27;s GEMM uses cuBLAS which supports epilogues, but we&#x27;d need to write a custom CUTLASS or cuBLAS kernel. Given the complexity, probably not worth it in the remaining time.
+
+Let me think about another approach: since the GEMM dominates, can we use Tensor Cores? The H100 has amazing FP16/BF16 performance. But the problem requires numerical equivalence at FP32 precision (atol=1e-4). So we&#x27;d need to compute in higher precision or use TF32.
+
+Actually wait - the model stores parameters in Float (nn.Linear default) and we need fp32 equivalence. The parameters are 8192x8192, so 256MB for weights + 32KB for bias. 
+
+For speed, could we use cuBLAS with TF32 tensor cores? That would still be fp32 output but with slightly different precision... The correctness check might fail.
+
+Actually, PyTorch by default uses TF32 on Ampere+ for matmul if enabled. But for the reference, if we&#x27;re comparing to PyTorch&#x27;s result, we should match exactly. If PyTorch uses TF32 but we use FP32, there could be small differences.
+
+Actually, let me check: on H100, if `torch.backends.cuda.matmul.allow_tf32` is true (default), then PyTorch&#x27;s matmul uses TF32 tensor cores, not FP32. So to match exactly, we might need to consider this.
+
+But wait, if PyTorch is using TF32 and we&#x27;re using cuBLAS&#x27; default, we&#x27;d probably match. Let me just make sure we&#x27;re using the same settings.
+
+Actually, looking more carefully: `at::addmm_out` goes through the same code path as PyTorch&#x27;s linear, so it should produce identical results when called the same way.
+
+Let me try a CUTLASS-approach for a truly fused kernel. But that&#x27;s very complex and time-consuming.
+
+Another thought: can we transpose the weight to NHWC or some other format to improve performance? Not sure that helps.
+
+Actually, let me try using `torch.mm` (without bias) and then fusing bias+mul+leakyrelu in a single kernel. That avoids the overhead of the cuBLAS epilogue setup for bias, but the memory difference is negligible.
+
+Here&#x27;s another idea: use CUTLASS to write a custom GEMM with a fused epilogue that does Bias * Multiplier -&gt; LeakyReLU. But CUTLASS is very complex to use via `load_inline`.
+
+Let me try a different approach entirely: use the `cublasGemmEx` API directly. But we&#x27;d need to handle bias addition ourselves since cublas GEMM doesn&#x27;t directly support bias except via the beta parameter on C.
+
+Wait, actually there&#x27;s cublasGemmBiasStridedBatched but not for regular GEMM with bias.
+
+Actually, cublas supports fused epilogues via cublasLt. Let me see if I can write a kernel using cublasLt with an epilogue that includes GELU or ReLU, but does it include LeakyReLU? I don&#x27;t think so - cublasLt supports ReLU and GELU but I don&#x27;t recall LeakyReLU.
+
+Hmm, but what if we do cublas GEMM with alpha=multiplier? Then we get multiplied output. And then... no, bias is still separate.
+
+Actually, another thought: what if we preprocess the weights to bake in the multiplier? Then we could do `weight&#x27; = weight * multiplier` and `bias&#x27; = bias * multiplier`, and then the GEMM+bias would produce the multiplied output directly, and we&#x27;d only need LeakyReLU afterwards.
+
+This doesn&#x27;t help with fusing, but it does reduce computation. But actually, `addmm_out` with alpha=multiplier would already do the multiply natively in cuBLAS.
+
+Wait, at::addmm_out does `output = beta*bias + alpha*matmul(x, weight^T)` where alpha defaults to 1. Can I set alpha to the multiplier?
+
+Let me check: `at::addmm_out(output, bias, x, weight.t(), beta, alpha)`. So we could potentially do `at::addmm_out(output, bias, x, weight.t(), 1.0, multiplier)`. But wait, that multiplies both the GEMM result AND adds bias with the multiplier only if we structure it correctly... Actually, `addmm` computes `beta*input + alpha*mat1 @ mat2`. If we want `(x @ W.T + b) * multiplier`, that&#x27;s `multiplier*(x @ W.T) + multiplier*b`. So we&#x27;d need to pass `alpha=multiplier, beta=multiplier`. But then we&#x27;d need to set `input = bias` scaled by `multiplier`, or pass `alpha=multiplier` and have bias already scaled.
+
+Hmm, but biasing correctly in addmm is tricky. Let me think:
+
+`addmm(input, mat1, mat2, beta, alpha)` = `beta*input + alpha*mat1@mat2`
+If input = bias, then:
+`beta*bias + alpha*x@W.T`
+
+For `(x@W.T + bias) * multiplier`:
+`= multiplier*x@W.T + multiplier*bias`
+`= alpha*x@W.T + beta*bias` where alpha=multiplier, beta=multiplier.
+
+So we&#x27;d set input=bias, alpha=multiplier, beta=multiplier.
+
+Then we only need LeakyReLU afterward! Let me try this optimization.
+
+But wait - does `addmm_out` support floats for beta and alpha? I think it does.
+
+Let me try this: use `at::addmm_out(output, bias, x, weight.t(), multiplier, multiplier)`. Then we&#x27;d only need one LeakyReLU pass afterward, saving the multiply.
+
+But actually, in terms of memory bandwidth, the multiply is essentially free in the elementwise kernel (it&#x27;s just one FMA). The main benefit is ... well, negligible on bandwidth terms. 
+
+Actually, fusing into a single kernel (bias + mul + LeakyReLU) is better than (addmm with bias then separate mul + LeakyReLU) only if we don&#x27;t already have the correct fused form. But in this case, doing the bias+mul inside addmm and then only LeakyReLU is fine. However, LeakyReLU is still a separate pass.
+
+Let me think about this problem differently. The reference model is:
+```python
+x = self.gemm(x)  # Linear: x@W.T + b
+x = x * multiplier
+x = self.leaky_relu(x)
+```
+
+On H100, cuBLAS should handle the GEMM very efficiently. The remaining overhead is:
+1. The multiply elementwise op
+2. The LeakyReLU elementwise op
+
+PyTorch likely fuses these through its JIT or eager mode optimizations. But does it? In eager mode, `x * 2.0` creates a new tensor, then `F.leaky_relu(x, 0.1)` creates another. These are separate kernel launches and memory passes, each going through DRAM.
+
+So our fused kernel (GEMM then fused mul+leakyrelu in one pass) should be faster than the reference which does GEMM -&gt; store -&gt; load -&gt; mul -&gt; store -&gt; load -&gt; leakyrelu -&gt; store.
+
+But can we do better? What if we dispatch the GEMM with alpha=multiplier and then only do LeakyReLU? That saves the multiply but not the extra pass. And actually, addmm with alpha=multiplier might cause accuracy issues or just be equivalent.
+
+Let me try a version that uses `at::mm_out` for just the matrix multiply, and then launches a fused kernel for bias+mul+LeakyReLU. This might actually match the reference&#x27;s GEMM kernel better since nn.Linear usually calls `addmm` which might have different performance characteristics than calling `mm` + our own bias. But wait, if the reference uses `nn.Linear`, it calls `F.linear` which uses `addmm`. So to match the GEMM exactly, we should use `addmm` (or `addmm_out`).
+
+Actually, a key insight: the most important optimization for dram-bound elementwise ops is to make sure we use vectorized memory access. Loading/storing 4 floats at a time (128-bit) instead of 1 float can nearly quadruple bandwidth for these simple kernels.
+
+Let me rewrite the kernel to use float4 loads and stores for better bandwidth utilization.
+
+Also, I should use a grid-stride loop so the kernel can handle any number of elements.
+
+Let me also think about whether we should try to write our own GEMM kernel. For M=1024, N=8192, K=8192 on H100, cuBLAS is likely much better than anything we can quickly write. The matrix is tall-and-skinny (or square-ish actually), and cuBLAS LT will use optimal tile sizes. Writing a custom GEMM that beats cuBLAS for this size on H100 is extremely hard.
+
+So the best approach is:
+1. Let cuBLAS handle the GEMM
+2. Optimize the elementwise fusion as much as possible
+
+Let me create a more optimized elementwise kernel:
+- Use float4 for vectorized memory access
+- Grid-stride loop for flexibility
+- Precompute values
+
+```cuda
+__global__ void fused_kernel(const float* __restrict__ bias, float* __restrict__ data, float multiplier, float neg_slope, int64_t M, int64_t N) {
+    int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = M * N;
+    
+    const int vec_size = 4;
+    int64_t n_vec = total / vec_size;
+    
+    const float4* bias4 = reinterpret_cast&lt;const float4*&gt;(bias);
+    float4* data4 = reinterpret_cast&lt;float4*&gt;(data);
+    
+    for (int64_t i = tid; i &lt; n_vec; i += gridDim.x * blockDim.x) {
+        int row = (i * vec_size) / N;
+        int col = (i * vec_size) % N;
+        
+        float4 b = bias4[col / vec_size]; // Hmm this isn&#x27;t right, bias is 1D
+        
+        // Actually bias is shape (N,) so we can vectorize it too
+    }
+}
+```
+
+Wait, the bias layout is tricky with vectorization. Let me think more carefully.
+
+The output is M x N in row-major order. The bias is 1D of length N. For row `r` and columns `c` to `c+3`, we add `bias[c]`, `bias[c+1]`, etc.
+
+If we use float4 for the output, we need to read bias[c:c+3] as a float4 too. This works when N is a multiple of 4 (8192 is). So yes, we can vectorize.
+
+But we need to be careful: `bias` is a 1D array. If we reinterpret it as float4, we need its size to be multiple of 4, which 8192 is.
+
+However, in the original reference, addmm handles the bias. If we split GEMM and bias, the GEMM itself might not be as fast.
+
+Actually, another approach: what if we do `at::mm_out` (GEMM without bias), and then in our fused kernel we add bias, multiply, and apply LeakyReLU? This changes the GEMM from `addmm` to `mm`, which might have slightly different performance. But `mm` for C = A*B is the same core computation as the matmul in `addmm`, so cuBLAS should optimize it similarly.
+
+Actually, nn.Linear calls `F.linear` which does `input @ weight.T + bias`. The `addmm` internally does this. The actual GEMM part of addmm is `mat1 @ mat2`, and the bias addition is just adding a vector to each row, which cuBLAS handles through the beta parameter.
+
+If we do `mm_out` instead, we still get the same cuBLAS GEMM call, just without the beta part. Then we add bias in our kernel. I don&#x27;t think this would be faster.
+
+Let me reconsider. Maybe we should stick with our current design but optimize the kernel for the maximum possible throughput. Since the GEMM dominates, any speedup from elementwise fusion is a small constant factor. 
+
+But wait - maybe there aren&#x27;t many other optimizations to make. Let me check if PyTorch is already fusing the elementwise ops with its JIT compiler or something. In eager mode with `nn.Linear`, `.mul()`, and `.leaky_relu()`, each step is a separate kernel.
+
+Actually, let me also consider using CUTLASS directly. For this problem, we could use a CUTLASS GEMM with a custom epilogue:
+- Epilogue: add bias, multiply by constant, apply LeakyReLU
+
+This would be a single kernel with no DRAM traffic for intermediate results, maximizing performance. But writing CUTLASS code inline is very complex.
+
+Another idea: use Triton instead of CUDA? No, the problem asks for `torch.utils.cpp_extension.load_inline`.
+
+Let me try what we have and see the timing results. If it&#x27;s already significantly faster, we might be fine. If not, we need to dig deeper.
+
+Actually wait - our current kernel does:
+1. `addmm_out` (GEMM + bias)
+2. Elementwise mul + LeakyReLU
+
+This saves one memory pass compared to reference. Reference does:
+1. GEMM + bias
+2. Elementwise mul
+3. Elementwise LeakyReLU
+
+In eager PyTorch, each of steps 2 and 3 is a separate kernel launch and memory pass.
+
+So we save roughly 2/3 of the elementwise memory traffic, which might give a modest speedup.
+
+Let me try another optimization: launch more blocks. With 8.4M elements and 256 threads per block, using 32K blocks is already a lot. But let me use a grid-stride loop with fixed grid size, and perhaps use a larger block size. Actually 256 is standard.
+
+Let me try to vectorize with float4 to maximize bandwidth.
+
+Actually, I realize I should check how fast this is compared to the reference first. Since `run_correctness` passed but we have no timing info. Let me think if there&#x27;s any way to do a rough estimate or if I should just submit.
+
+Wait, we don&#x27;t have a timing tool besides `submit_kernel`. Let me try to further optimize before submitting.
+
+Let me write a more aggressive elementwise kernel using float4:
+
+```cuda
+__global__ void fused_kernel(float* __restrict__ data, float multiplier, float neg_slope, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Grid-stride loop with float4
+    for (int64_t i = idx; i &lt; n / 4; i += gridDim.x * blockDim.x) {
+        float4 val = reinterpret_cast&lt;float4*&gt;(data)[i];
+        val.x = val.x * multiplier;
+        val.y = val.y * multiplier;
+        val.z = val.z * multiplier;
+        val.w = val.w * multiplier;
+        
+        val.x = val.x &gt; 0.0f ? val.x : val.x * neg_slope;
+        // ... etc
+        reinterpret_cast&lt;float4*&gt;(data)[i] = val;
+    }
+    
+    // Handle tail
+    int64_t tail_start = idx + (n / 4) * 4;
+    if (tail_start &lt; n) {
+        float val = data[tail_start] * multiplier;
+        data[tail_start] = val &gt; 0.0f ? val : val * neg_slope;
+    }
+}
+```
+
+But we need to handle alignment. Since the tensor is allocated by PyTorch&#x27;s allocator, it should be 256-byte aligned, and 1024*8192=8,388,608 is divisible by 4 (it&#x27;s divisible by 256 actually). So we can safely use float4 for the entire tensor.
+
+Wait, but the output from addmm_out might have padding that affects alignment. Actually, PyTorch tensors are typically contiguous and aligned.
+
+Let me write a kernel that uses float4 explicitly.
+
+Actually, another optimization: instead of `addmm_out` followed by elementwise kernel, what if the addmm doesn&#x27;t write to output but to a temporarily allocated tensor, and our elementwise kernel does an explicit `output = input * mult, leakyrelu` to avoid overwriting in place? No, that would be worse - more memory traffic.
+
+Wait, here&#x27;s a better idea: use `cublasGemmEx` with `CUBLAS_COMPUTE_32F_FAST_16F` or TF32 for potentially faster GEMM, but that might change numerical correctness...
+
+Actually, H100 supports FP32 at 67 TFLOPS. For 137 GFLOPs, that&#x27;s around 2ms even at theoretical peak. In practice, matrix multiplies achieve 70-90% of peak, so maybe 2-3ms.
+
+The memory bandwidth for the elementwise pass is tiny in comparison. So the speedup from fusing elementwise ops is at most a few percent. We might need a more substantial optimization.
+
+Let me reconsider the whole computation. What if we do manual GEMM tiling in shared memory? For a 1024x8192 * 8192x8192, that&#x27;s a big matrix multiplication. A naive custom GEMM would be much slower than cuBLAS. But what if we use a batched approach or leverage tensor cores?
+
+Actually, since M=1024 is relatively small compared to N=8192 and K=8192, the GEMM C = A * B where A is 1024x8192 and B is 8192x8192... wait, actually that&#x27;s:
+- A = x: 1024 x 8192
+- B = weight.T: 8192 x 8192
+- C = output: 1024 x 8192
+
+This is technically a &quot;tall-skinny&quot; A but square B and C. The M dimension (1024) is relatively small, which means there&#x27;s limited parallelism on the M axis.
+
+In modern cuBLAS, this should still be well-optimized. The number of thread blocks for an 8192x8192 tile in N would be large.
+
+Hmm, I keep coming back to the same conclusion: the GEMM dominates and cuBLAS handles it well. The fusion of the elementwise ops gives a small but real improvement.
+
+Wait - could we use FP16/BF16 tensor cores and cast back? The numerical tolerance is 1e-4 for fp32. If we do the GEMM in FP16 (with automatic upcasting), the precision might be within 1e-4. But the maximum TFLOPS in FP16 is 1979, nearly 30x faster than FP32.
+
+If we do:
+1. Cast x and weight to FP16
+2. Do matmul in FP16
+3. Cast result to FP32
+4. Add bias (FP32), multiply, LeakyReLU (FP32)
+
+The FP16 matmul error for matrices of this size... the relative error of FP16 GEMM is typically around 1e-3 for large matrices. The absolute error could be larger if values are large. And we need 1e-4 tolerance.
+
+Actually, for 8192x8192 accumulations in FP16, the accuracy will likely be terrible because each element of the output is a dot product of 8192 FP16 numbers. The accumulation in FP16 tensor cores has limited precision.
+
+If we instead used TF32 (Tensor Float 32, which has 10-bit mantissa vs 23-bit for FP32), we might still pass 1e-4. TF32 is what PyTorch uses by default for matmul on Ampere+, so the reference might already be using TF32!
+
+If the reference is already using TF32, then matching it with our `addmm_out` call should be easier since PyTorch defaults to TF32 internally.
+
+Actually wait - H100 has FP32 Tensor Cores too (67 TFLOPS). These do accumulation in higher precision. But standard FP32 compute at 67 TFLOPS is still quite good.
+
+Let me think about this from a different angle. Can we just submit what we have and see if it&#x27;s faster? 
+
+Actually no - I want to be more confident. Let me try a vectorized kernel version.
+
+Actually, I think using `torch.nn.functional.linear` might dispatch through `addmm` which could be using cublasLt with epilogues for bias. Then, if we also let PyTorch handle the GEMM but fuse the elementwise part, we just match PyTorch&#x27;s GEMM performance and improve the rest. If the reference is 2x the elementwise time slower, we&#x27;d get maybe 1-2% improvement. That might be enough if they set a lenient bar.
+
+But maybe I can do better with `cublasGemmEx` using tensor cores in a mixed precision mode that still meets accuracy requirements. For TF32, the precision is about 1e-3 relative error, but for absolute error, with random inputs in [0, 1], the output values will be around 8192, so absolute error could be around 1-10, which is way above 1e-4.
+
+Actually, no. Let me reconsider. Inputs are rand() in [0,1]. Each output element is sum of 8192 products of [0,1] * weight. The weights are uniform in [-1/sqrt(N), 1/sqrt(N)] where N=8192. So weights are around ±0.011. Products are around ±0.011, sum of 8192 is around ±90. So output values are roughly in [-90, 90]. An absolute error of 1e-4 at that scale means negligible relative error. 
+
+If TF32 has ~1e-3 relative error and reference uses TF32, we&#x27;d match. But if the reference uses TF32 and we use FP32, we&#x27;re doing more precise computation but it should still match within 1e-4.
+
+Actually, if the reference uses TF32 but we use FP32, we&#x27;d get a smoother result but we&#x27;d match within 1e-4. If the reference uses FP32 and we use TF32, we&#x27;d likely fail the tolerance.
+
+Let me assume the reference uses whatever PyTorch default is, which on H100 with Ampere+ is TF32 for matmul if the tensors are in float32. And our `addmm_out` call goes through the same PyTorch dispatch, so it would use TF32 too, matching exactly.
+
+So the optimization is purely in the elementwise fusion. The fused kernel saves one memory pass and one kernel launch compared to the eager reference.
+
+Let me also try to vectorize the elementwise kernel and ensure we use an optimal grid size.
+
+Let me write an improved kernel:
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncpp_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n\ntorch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope);\n\&quot;\&quot;\&quot;\n\ncuda_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;ATen/ATen.h&gt;\n#include &lt;ATen/cuda/CUDAContext.h&gt;\n\n__forceinline__ __device__ float4 leakyrelu_mul(const float4&amp; v, float multiplier, float neg_slope) {\n    float4 r;\n    float rx = v.x * multiplier;\n    float ry = v.y * multiplier;\n    float rz = v.z * multiplier;\n    float rw = v.w * multiplier;\n    r.x = rx &gt; 0.0f ? rx : rx * neg_slope;\n    r.y = ry &gt; 0.0f ? ry : ry * neg_slope;\n    r.z = rz &gt; 0.0f ? rz : rz * neg_slope;\n    r.w = rw &gt; 0.0f ? rw : rw * neg_slope;\n    return r;\n}\n\n__global__ void fused_mul_leakyrelu_kernel(float* __restrict__ data, float multiplier, float negative_slope, int64_t n) {\n    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;\n    const int64_t total_threads = (int64_t)gridDim.x * blockDim.x;\n    \n    // Process 4 elements at a time using float4\n    float4* data4 = reinterpret_cast&lt;float4*&gt;(data);\n    const int64_t n4 = n &gt;&gt; 2;\n    \n    for (int64_t i = idx; i &lt; n4; i += total_threads) {\n        data4[i] = leakyrelu_mul(data4[i], multiplier, negative_slope);\n    }\n    \n    // Handle remaining elements\n    int64_t remainder_start = n4 &lt;&lt; 2;\n    for (int64_t i = remainder_start + idx; i &lt; n; i += total_threads) {\n        float val = data[i] * multiplier;\n        data[i] = val &gt; 0.0f ? val : val * negative_slope;\n    }\n}\n\ntorch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float multiplier, float negative_slope) {\n    int64_t M = x.size(0);\n    int64_t N = weight.size(0);\n    \n    auto output = torch::empty({M, N}, x.options());\n    \n    at::addmm_out(output, bias, x, weight.t(), 1, 1);\n    \n    int64_t n = M * N;\n    const int threads = 256;\n    const int blocks = min(65535, (int)((n + threads - 1) / threads));\n    \n    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();\n    fused_mul_leakyrelu_kernel&lt;&lt;&lt;blocks, threads, 0, stream&gt;&gt;&gt;(\n        output.data_ptr&lt;float&gt;(), multiplier, negative_slope, n\n    );\n    \n    return output;\n}\n\&quot;\&quot;\&quot;\n\nfused_ops = load_inline(\n    name=\&quot;fused_ops_v2\&quot;,\n    cpp_sources=[cpp_source],\n    cuda_sources=[cuda_source],\n    functions=[\&quot;forward_cuda\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    extra_cflags=[\&quot;-O3\&quot;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_features, out_features, multiplier, negative_slope):\n        super(ModelNew, self).__init__()\n        self.weight = nn.Parameter(torch.empty(out_features, in_features))\n        self.bias = nn.Parameter(torch.empty(out_features))\n        nn.init.kaiming_uniform_(self.weight, a=5**0.5)\n        bound = 1 / (in_features ** 0.5)\n        nn.init.uniform_(self.bias, -bound, bound)\n        self.multiplier = multiplier\n        self.negative_slope = negative_slope\n    \n    def forward(self, x):\n        return fused_ops.forward_cuda(x, self.weight, self.bias, self.multiplier, self.negative_slope)\n&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 6</span><span>llm latency: 6252.6s</span></div><div class="block assistant"><span class="role-tag">feedback</span>LLM call failed: _WorkItemTimeout: work item exceeded soft timeout budget</div></div></div>
+</body></html>
