@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 26</a></div><div class="site-subtitle">Kimi-K2.6 · hardware_translation_stub · l5_hw_translation_default_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-10 10:28:25 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 26</a></div><div class="site-subtitle">Kimi-K2.6 · hardware_translation_stub · l5_hw_translation_default_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-10 10:33:44 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">26_gemm_permute.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp16</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">hardware_translation_stub</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -3540,5 +3540,2609 @@ class ModelNew(nn.Module):
         D = _module.bmm_perm0213_cuda(A, self.B, self.d1, self.alpha)
         return D
 ```
-</div></div></details></div>
+</div></div></details><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 574.4s · 192,098 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 574.4s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the problem and design a proper kernel.
+
+The reference is a CUTLASS-based GEMM with permute. From the I/O contract:
+- Input A: [BATCH, M, K] = [96, 384, 384], dtype float16
+- B is initialized in __init__ with shape [BATCH, K, N] = [96, 384, 192]
+- Output D should have shape [BATCH/D1, M, D1, N] = [8, 384, 12, 192] based on the BMM permute 0213
+
+Wait, I need to check the reference. The hidden reference is the CUTLASS BMM with Tensor4DPermuteBMM0213. Let me check the permute:
+
+Tensor4DPermuteBMM0213: batched tensor of 3D shape [B, X, Y] reshaped as 4D [B/D1, D1, X, Y], permuted as [0, 2, 1, 3], resulting in [B/D1, X, D1, Y].
+
+For output D in BMM: the original output of BMM is [B, M, N]. With permute BMM0213, we reshape [B, M, N] to [B/D1, D1, M, N] and permute to [B/D1, M, D1, N].
+
+Wait, but in the testbed code, B is shape [problem.k(), problem.n()] = [K, N], which is [384, 192]. And the BMM uses batch_count=96.
+
+So we have:
+- A: [96, 384, 384] (batch=96, M=384, K=384)
+- B: [96, 384, 192] (batch=96, K=384, N=192)
+- Output D: [8, 384, 12, 192] (batch/D1=8, M=384, D1=12, N=192)
+
+But wait, the forward function only takes A as input. So B is stored as a buffer in __init__. That makes sense - it&#x27;s a linear layer-like operation but with BMM and output permute.
+
+Now, I need to match the reference exactly. The reference uses CUTLASS with:
+- Row-major A, B, C, D
+- BMM mode
+- Output permute Tensor4DPermuteBMM0213
+- No permute on A or B (NoPermute)
+- Actually, looking at the test cases, there are many permutations. But the specific one for evaluation... 
+
+Wait, the user said &quot;ModelNew must match the hidden evaluation reference on the tensor I/O contract below&quot;. The I/O contract shows:
+- get_inputs returns [torch.randn(BATCH, M, K, dtype=torch.float16).cuda()]
+- get_init_inputs returns [BATCH, K, N, D1, ALPHA, BETA]
+
+And looking at the CUTLASS code, there are batched GEMM cases. But which one is the hidden reference? The testbed is very general. 
+
+Actually, looking at this more carefully, the provided code is a complete CUTLASS example that tests many different permutations. But the hidden reference likely corresponds to one specific configuration. Given the get_init_inputs return [BATCH, K, N, D1, ALPHA, BETA] and get_inputs returns [A], the reference is probably the TTT BMM permute case. Or actually, we need to figure out what the actual PyTorch reference does.
+
+Wait, the user&#x27;s `ModelNew` must use custom inlined CUDA operators and produce numerically equivalent output to the hidden reference. The I/O contract is given.
+
+From get_init_inputs() returning BATCH, K, N, D1, ALPHA, BETA, and get_inputs() returning [BATCH, M, K], the reference model likely initializes B with shape [BATCH, K, N] or [K, N], then does some operation.
+
+Actually, in the CUTLASS testbed, B is also initialized. The typical workflow: A is [batch, M, K], B is [batch, K, N], and we do a BMM.
+
+But looking at the GemmPermute types, for BMM, the batch dimension is in A, B, and D. And there are permutations on A, B, and/or D.
+
+Given the init inputs include BATCH, K, N, D1, ALPHA, BETA, and get_inputs gets A of shape [BATCH, M, K], the hidden reference most likely:
+1. Creates B of shape [BATCH, K, N] (or maybe [K, N] and broadcasts?)
+2. Performs a BMM: D = alpha * A @ B + beta * C
+3. With output permute BMM0213: reshape [B, M, N] to [B/D1, D1, M, N] and permute to [B/D1, M, D1, N]
+
+But there&#x27;s also the possibility that A or B has a permute. However, looking at the init inputs not including M but the inputs including M, and D1 being in the init inputs, the most logical hidden reference is:
+- B stored as [BATCH, K, N] or just [K, N] for all batches
+- C (bias) might be zeros or not used (beta=0)
+- Output is permuted BMM0213 on D
+
+Wait, but in the CUTLASS example, `block_B` is allocated as `problem_each.n() * problem_each.k() * batch_count`, so B has shape [batch, K, N]. In PyTorch `torch.bmm`, B would need shape [batch, K, N].
+
+Since get_inputs only passes A, B must be created in __init__. The hidden reference likely does:
+```python
+class Model(nn.Module):
+    def __init__(self, batch, k, n, d1, alpha, beta):
+        super().__init__()
+        self.register_buffer(&#x27;B&#x27;, torch.randn(batch, k, n, dtype=torch.float16))
+        # maybe C as well? But beta=0 so C doesn&#x27;t matter
+        self.d1 = d1
+        self.alpha = alpha
+        self.beta = beta
+        
+    def forward(self, A):
+        # A: [B, M, K]
+        # B: [B, K, N]
+        D = torch.bmm(A, self.B) * self.alpha
+        # Then permute
+        B, M, N = D.shape
+        D = D.view(B // self.d1, self.d1, M, N).permute(0, 2, 1, 3)
+        return D
+```
+
+But we need to check if any permute is applied to A or B inputs. The init_inputs include D1 which is specifically for the BMM permute on output. There are no S1, S2, T1, T2, T3 in the init_inputs. This strongly suggests only the BMM output permute 0213 is used, with no permute on A or B.
+
+So my target is:
+1. Compute batched matrix multiply: D_orig[b,m,n] = sum_k A[b,m,k] * B[b,k,n] for b in [0, 95]
+2. Reshape and permute: D[b0, m, b1, n] where b = b0 * D1 + b1, shape [8, 384, 12, 192]
+
+Actually wait, we need to be more careful. In the CUTLASS code, B is initialized with `total_elements_B = options.problem_each.n() * options.problem_each.k() * batch_count`, and the layout is:
+```cpp
+cutlass::MatrixCoord extent_B{problem.k(), problem.n()};
+LayoutB layout_B(LayoutB::packed(extent_B));
+```
+So B is a separate matrix per batch, stored packed as [K, N] per batch. The batch stride is `layout_B.capacity(extent_B)` for trivial permute. This is equivalent to [batch, K, N] in row-major.
+
+Similarly A is [batch, M, K].
+
+So the PyTorch reference is most likely:
+```python
+D = torch.bmm(A, B)  # [B, M, N]
+D = D.view(B // D1, D1, M, N).permute(0, 2, 1, 3)  # [B//D1, M, D1, N]
+```
+
+But there&#x27;s also the alpha scaling. And beta is 0. So D = alpha * bmm(A, B).
+
+Now, for optimization on H100. H100 has much higher FP16 Tensor Core throughput. We should write a kernel that uses Tensor Cores effectively or at least achieves high throughput.
+
+For a BMM of size [96, 384, 384] x [96, 384, 192], each batch is a 384x384 @ 384x192 GEMM. With 96 batches. Total M*N*K*batch = 96 * 384 * 192 * 384 = 2.68e9 multiply-adds.
+
+For H100 with 1979 TFLOPS FP16 Tensor Core (with sparsity, or ~989 TFLOPS dense), this is heavily compute bound if we can use Tensor Cores. But using raw CUTLASS through PyTorch inline might be tricky. Actually, the requirement says we must use custom inlined CUDA operators, not library routines that replace the whole kernel. But we can write a custom kernel. Can we use CUTLASS in torch inline? That would be very hard to compile inline. Instead, we should write a custom CUDA kernel.
+
+Given the problem sizes:
+- Batch=96, M=384, K=384, N=192
+- Each batch M=384, N=192, K=384
+
+We have relatively small GEMMs per batch (384x192). But many batches.
+
+An approach that works well on H100:
+1. Swizzle batches across SMs
+2. Use warp-level mma for FP16 Tensor Cores
+3. Since M=384, N=192, K=384, we can process multiple batches per block or multiple warps handling different batch indices.
+
+Actually, 384 = 128*3 and 192 = 64*3. A good blocking scheme would be (128, 64) per block for a batch, with 4 warps across N and 2 across M or something.
+
+But wait, we can also process multiple batches per block to increase occupancy.
+
+H100 specifics:
+- SM90 architecture
+- L2 cache is larger, memory bandwidth is 3.35 TB/s
+- Tensor Cores on H100 are much faster than global memory, so this should be compute bound.
+
+For simplicity and correctness, I&#x27;ll first write a kernel that uses cp.async for loading data and performs warp-level mma with proper tensor core usage. But writing a full optimal GEMM in raw CUDA is complex.
+
+Alternatively, we can use CuBLAS through PyTorch for the BMM and then custom permute kernel, but that wouldn&#x27;t fully fuse the operations. The reference likely uses a fused CUTLASS kernel. A fused kernel that does BMM and permute in one go should be faster than two separate kernels because:
+1. It avoids writing [96, 384, 192] to global memory and then reading it back
+2. It directly writes to the permuted output layout
+
+Since M=384, N=192, K=384, the output would be [96, 384, 192] = ~14 MB. Fusing permute saves 14 MB of write+14 MB of read = 28 MB memory traffic. At 3.35 TB/s, that&#x27;s ~8 microseconds saved. The total operation at 989 TFLOPS would take about 2.7e9 FLOPs / 989e12 * 2 = ~5.4 microseconds (theoretical minimum). So memory bandwidth matters and fusion helps.
+
+The existing CUTLASS code fused the permute into the epilogue.
+
+I should write a fused BMM + permute kernel. Design:
+
+Grid configuration:
+- Each block computes a tile of (TILE_M, TILE_N) for one or more batch elements.
+- Since batches are independent, we can map batch index to z dimension.
+
+Tile sizes: For H100, we want good Tensor Core utilization. Let&#x27;s try:
+- TILE_M = 64, TILE_N = 64, TILE_K = 32 or 64
+- Use 4 warps (128 threads) or 8 warps (256 threads) per block
+
+But H100 has significant shared memory (228KB per SM, 227KB max per block). We have plenty.
+
+Actually, given M=384, N=192, we have:
+- M tiles: 384/64 = 6
+- N tiles: 192/64 = 3
+- Total tiles per batch: 18
+- Total tiles across all batches: 18 * 96 = 1728
+
+With 132 SMs on H100, we need enough parallelism. 1728 tiles is good but each tile only has 64*64*384*2 ~ 3M FLOPs. At 989 TFLOPS, we need ~3 microseconds per tile. With 1728 tiles, serial execution would be 5 milliseconds, but with 132 SMs, ~38 microseconds. That&#x27;s tiny.
+
+We actually want larger tiles or multiple batches per block to amortize overhead.
+
+Alternative: process multiple batches per block. For example, one block processes 4 batches at once, or processes a TILE_M x TILE_N for one batch but we want to ensure the grid isn&#x27;t too small.
+
+With 1728 tiles, if we use 256 threads per block, that&#x27;s 1728*256 = 442K threads. This should be fine.
+
+Let&#x27;s design a simple but effective kernel that:
+1. Each block computes a (TILE_M=64, TILE_N=64) tile of output
+2. Uses shared memory for A and B tiles
+3. Uses FP16 accumulator in registers or FP32 for accumulation
+4. Writes directly to permuted output
+
+Wait, is FP32 accumulation needed? The reference uses ElementAccumulator = float. So we need float accumulation.
+
+Kernel parameters:
+- TILE_M = 64, TILE_N = 64, TILE_K = 32
+- Threads per block: 256 (8 warps)
+- Each thread computes elements
+
+For H100, we can also use larger TILE_K to reduce shared memory traffic.
+
+Actually, given K=384, we could have TILE_K=64 or even 128. With A tile 64x64 and B tile 64x64, we need:
+- smemA: 64 * 64 * 2 = 8 KB
+- smemB: 64 * 64 * 2 = 8 KB
+- Total: 16 KB per block. Very small.
+
+Let&#x27;s increase to TILE_M = 128, TILE_N = 128, TILE_K = 64.
+- smemA: 128 * 64 * 2 = 16 KB
+- smemB: 64 * 128 * 2 = 16 KB
+- Total: 32 KB
+
+With M=384, N=192:
+- M tiles: ceil(384/128) = 3
+- N tiles: ceil(192/128) = 2
+- Tiles per batch: 6
+- Total tiles: 576
+
+576 tiles might be a bit low for full H100 utilization if each tile is fast. But 576 blocks * 256 threads = 147K threads, running on 132 SMs. Each SM can run multiple blocks.
+
+Let&#x27;s think about what tile size is best. The reference CUTLASS uses 128x128x32 main loop with 64x64x32 warp tile and 16x8x16 instruction.
+
+For H100, we could use more aggressive shapes, but a custom kernel might not easily match CUTLASS&#x27;s efficiency unless we use mma.sync instructions.
+
+Actually, a simpler approach that might perform quite well: use CuBLAS for the BMM (via torch.bmm) and then a custom permute kernel. But the prompt says the source kernel was a fused GEMM+permute, and we should re-optimize the CUDA operators. Fusing should give better performance.
+
+However, writing a fully optimal FP16 Tensor Core GEMM from scratch in raw CUDA that outperforms CuBLAS is extremely difficult. The reference is CUTLASS-based, not CuBLAS. So they expect a custom kernel.
+
+Let me think about using wmma or mma.sync.
+
+Actually, for H100, we can use PTX mma instructions. But for simplicity, I can use the `wmma` APIs. However, wmma is limited to 16x16x16 sub-warps.
+
+Or, we can do a &quot;naive&quot; but optimized kernel that doesn&#x27;t use Tensor Cores explicitly but relies on the compiler to use HMMA through inline assembly or __fmaf. But that won&#x27;t be efficient.
+
+Wait - maybe the reference expects us to use CUTLASS but just change the architecture tag from Sm80 to Sm90 and adjust tile sizes? But the instructions say &quot;use torch.utils.cpp_extension.load_inline (or equivalent) for device code&quot; and &quot;not library routines that replace the whole kernel&quot;. So we can&#x27;t just call torch.bmm or CUTLASS. We can include CUTLASS headers in our inline CUDA though!
+
+Actually, we can write inline CUDA code that includes CUTLASS and uses it. That&#x27;s technically possible but compilation of CUTLASS through torch.utils.cpp_extension.load_inline is... challenging because CUTLASS headers are not in standard include paths, and the source is huge. The eval environment might not have CUTLASS installed.
+
+So I should write a custom kernel from scratch.
+
+Given the problem parameters [96, 384, 384] x [96, 384, 192], let me design a kernel that:
+1. Is correct (numerically matches)
+2. Is reasonably optimized for H100
+
+Optimization strategy:
+- Fuse BMM + permute into a single kernel
+- Use shared memory blocking
+- Use vectorized loads (float4 for half = 8 elements)
+- Use warp-level tiling for register reuse
+- Process multiple batches or use multiple warps per tile
+
+Let&#x27;s try a design:
+- Warp tile: 16x16? Or 32x32? 
+- Each block has 8 warps (256 threads)
+- Block processes a TILE_M=64 x TILE_N=128 or similar region
+
+Actually, let&#x27;s look at the arithmetic intensity:
+- For a tile of size 64x64, we compute 64*64 = 4096 output elements.
+- Each output requires K=384 multiply-adds.
+- Total FLOPs = 4096 * 384 * 2 = 3.14M FLOPs per tile.
+- Memory read: A tile 64*384 + B tile 384*64 = 24K + 24K = 48K halfs = 96KB.
+- Arithmetic intensity: 3.14M / 96KB = ~32 FLOPs per byte.
+- H100 bandwidth: 3.35TB/s = 3.35e12 B/s. Compute: 989e12 FLOPs/s.
+- To be compute bound: need ~989/3.35 = 295 FLOPs/byte. So at 32 FLOPs/byte, we are memory bound unless we reuse data in L1/L2/shared memory.
+
+This means tiling is crucial. With K=384, if we tile K at 32:
+- Each iteration loads 64*32 + 32*64 = 4K + 4K = 8K halfs = 16KB
+- Compute per iteration: 64*64*32*2 = 262K FLOPs
+- Total shared memory iterations: 384/32 = 12
+- Writes at end: 64*64 halfs = 8KB
+
+But the issue is that the A and B tiles must be loaded from global memory each time (unless cached in L2). Since K=384 is small, L2 can cache it. But for large problems, we&#x27;d be memory bound.
+
+For H100, we should rely on the L2 cache ability and use larger tiles. Actually, since this is a BMM with small per-batch problem, we should try to maximize shared memory tile sizes.
+
+What if we have a block that processes multiple K tiles at once? Or multiple batches?
+
+Actually, looking at the data sizes:
+- A: 96 * 384 * 384 * 2 = 28.3 MB
+- B: 96 * 384 * 192 * 2 = 14.1 MB
+- D: 96 * 384 * 192 * 2 = 14.1 MB (before permute view)
+
+These fit easily in L2 cache. So L2 hit rate should be good for repeated reads.
+
+But since the evaluation is likely measuring kernel time, we should still optimize the kernel.
+
+Let me design a kernel with the following characteristics:
+
+```cuda
+#define TILE_M 128
+#define TILE_N 128
+#define TILE_K 32
+#define BLOCK_DIM_X 128  // 4 warps for N
+#define BLOCK_DIM_Y 2    // 2 warps for M
+// Actually, typical practice: 256 threads = 8 warps. We can have 2x4 warps.
+```
+
+Wait, let me think about the exact work distribution.
+
+For [B=96, M=384, N=192, K=384]:
+Total M*N*B = 96*384*192 = 7,077,888 output elements.
+
+If each block computes 128x128 elements, that&#x27;s 16,384 elements per block.
+Number of blocks = 7,077,888 / 16,384 = 432 blocks... wait, but M=384 is only 3 tiles of 128, N=192 is 2 tiles of 96? Let me make tile sizes divide the dimensions well.
+
+M=384: divisible by 128 (3 tiles), 64 (6 tiles), 96 (4 tiles)
+N=192: divisible by 64 (3 tiles), 96 (2 tiles), 128 (2 tiles), 192 (1 tile)
+
+Let&#x27;s use TILE_M=64, TILE_N=96.
+M tiles: 6, N tiles: 2. Total tiles per batch: 12. Total blocks: 12 * 96 = 1152.
+
+Or TILE_M=96, TILE_N=96.
+M tiles: 4, N tiles: 2. Tiles per batch: 8. Total blocks: 8 * 96 = 768.
+
+Or TILE_M=128, TILE_N=64.
+M tiles: 3, N tiles: 3. Tiles per batch: 9. Total blocks: 864.
+
+Given the grid should not be too small, 768 to 1152 blocks is good for occupancy.
+
+But the key is register pressure and instruction mix. H100 likes many warps per SM.
+
+Let me try a design with TILE_M=64, TILE_N=64, TILE_K=32, and 256 threads per block.
+- M tiles: 6, N tiles: 3, tiles per batch: 18. Total: 1728 blocks.
+
+Each block loads A tile [64][32] and B tile [32][64].
+- SMEM: 64*32*2 + 32*64*2 = 4K + 4K bytes = 8KB. Very low.
+- Can increase to TILE_K=64: 16KB per block. Still low.
+
+What if we use TILE_M=128, TILE_N=128, TILE_K=64, and 256 threads?
+- M tiles: 3, N tiles: 2 (actually N=192, so ceil(192/128)=2). Tiles per batch: 6. Total: 576 blocks.
+- SMEM: 128*64*2 + 64*128*2 = 16K + 16K = 32KB.
+- Each thread handles 128*128/256 = 64 elements. That&#x27;s a 8x8 grid per thread.
+- Register usage: 64 accumulators * 4 bytes = 256 bytes registers. Plus some index registers. Total maybe ~40-50 registers per thread. Low.
+
+But 576 blocks is a bit low for 132 SMs, each can run maybe 4-8 blocks concurrently (given 32K SMEM would allow 7 blocks per SM at most, so 132*7=924 blocks in flight max). 576 blocks would give 576/132 = 4.4 blocks per SM average. With 256 threads per block, that&#x27;s 1136 threads per SM. H100 can run many more (2048 per SM). So occupancy might not be max, but execution might still be fast if compute is the bottleneck.
+
+Actually, to get maximum occupancy we want more blocks or more threads per block. Or process multiple batches per block.
+
+Idea: process 2 or 4 batches per block. We can have each block handle multiple batches serially.
+
+Or simpler: just use a larger grid by using smaller tiles. With TILE_M=64, TILE_N=64, we get 1728 blocks, which is enough to fill all SMs.
+
+For the kernel implementation, I&#x27;ll use:
+- TILE_M = 64
+- TILE_N = 64
+- TILE_K = 32
+- 256 threads per block
+
+Each thread computes 16 output elements? 64*64/256 = 16. So a 4x4 or 2x8 sub-tile per thread.
+
+Wait, a cleaner approach: use a warp-level tiling where each warp computes a 32x32 or 32x64 tile. With 8 warps, we can have:
+- Warps arranged as 2x4 (M x N)
+- Each warp computes 32x16 tile
+- Block computes 64x64 tile
+
+This matches the Ampere-like structure. For H100, mma.sync can do larger tiles, but using a simple design with compiler vectorization might be easier.
+
+Actually, for maximum simplicity and good utilization, I can use a &quot;1D warp tile&quot; approach:
+- Each block: 256 threads, 8 warps.
+- Each warp (32 threads) computes an M_SUB=64 x N_SUB=8 stripe. Each thread computes M_SUB x 2 elements? Or we can have each thread compute a column.
+- Actually, let&#x27;s have each block compute TILE_M=64, TILE_N=64.
+- Warp arrangement: 4 warps along M (each warp handles 16 rows), 2 warps along N (each warp handles 32 columns). Total 8 warps.
+- But warp-level mma needs specific shapes.
+
+Wait, I think for H100 I should just do a standard shared-memory GEMM, and rely on the compiler to unroll and schedule threads. The key optimizations are:
+1. Fused permute
+2. Vectorized loads (float4 for half = 8 elements)
+3. Good shared memory usage with padding to avoid bank conflicts
+4. Unrolled loops
+5. FP32 accumulation
+
+Let me write a kernel where:
+- Tile is TILE_M x TILE_N = 64 x 64
+- Tile K = 64
+- Threads = 256
+- Each block handles one tile for one batch
+
+Load A: each of 256 threads loads a portion of [64][64] tile.
+- A has shape [B, M, K]. For loading into smem, the tile is [TILE_M][TILE_K].
+- Each thread loads 64*64/256 = 16 elements. We can load 8 float2 (4 elements each) or 4 float4 (8 halfs each).
+- Since A is row-major, we want coalesced loads. Each thread loads 8 halfs (float4).
+- 256 threads * 8 halfs = 2048 halfs. Tile is 64*64 = 4096 halfs. So each thread loads 8 halfs, and we need 2 loads per thread per tile. 
+- Actually, 4096 / 256 = 16 halfs per thread = 2 float4 loads per thread.
+
+Similarly for B: [TILE_K][TILE_N] = 64*64 = 4096 halfs. Each thread loads 2 float4.
+
+This works well.
+
+For computation: 
+- We can partition the [64][64] output tile among threads.
+- 256 threads. Each thread computes 16 elements (e.g., 4x4 or 2x8).
+- Each thread maintains 16 float accumulators.
+- For each k in 0..63 (actually K=384, multiple tiles), the thread reads its corresponding A and B values from smem and computes.
+
+Actually, I realize that with this approach, each thread reads from smemA and smemB at its own indices. To reduce bank conflicts:
+- smemA: [TILE_M][TILE_K+PAD]. Row-major. If threads in a warp read different columns (k), and same row (or different rows), there might be conflicts.
+- If each thread computes a 4x4 tile, they access 4 contiguous k values. With 32 threads in a warp, that&#x27;s 128 k values. If they all access different rows... might have conflicts.
+- Standard practice: have threads compute output elements with (m, n) layout where each thread&#x27;s n is not the same as others in the warp (to avoid B conflicts), and m is not the same (to avoid A conflicts).
+
+H100 shared memory has 32 banks. With half (2 bytes), float4 (8 halfs) spans 8 banks.
+
+Let me think of the thread-output mapping:
+- Warp size = 32.
+- If each thread computes 16 outputs, total outputs = 512 per warp. But our tile is only 64*64=4096. With 8 warps, each warp handles 512 elements. That&#x27;s 16 outputs per thread.
+- 512 elements per warp could be 16 rows x 32 cols, or 32x16, etc.
+
+If a warp handles a sub-tile of M_SUB x N_SUB = 16 x 32 = 512 elements.
+- Each thread handles (16 x 32) / 32 = 16 elements. A 2x8 sub-sub-tile per thread.
+- Thread idx in warp: lane = 0..31.
+- warp_m = warp_id / WARPS_N, warp_n = warp_id % WARPS_N
+- Block: WARPS_M=2, WARPS_N=4. Each warp handles 32 rows x 16 cols (1024 elements... wait).
+
+Let me recalculate:
+- Block tile: 64x64
+- 8 warps: 2 warps along M (32 rows each), 4 warps along N (16 cols each).
+- Each warp tile: 32x16 = 512 elements.
+- Each thread in warp: 512/32 = 16 elements. Thread handles a 2x8 sub-tile (2 rows, 8 cols).
+- Thread&#x27;s base row in block: warp_m * 32 + thread_m * 2, where thread_m = lane_id / 8? Wait.
+- We have 32 threads. If each handles 2 rows x 8 cols = 16 elements.
+- Threads arranged as 4x8: thread_m = lane_id / 8 (0..3, each handles 2 rows =&gt; 8 rows total), thread_n = lane_id % 8 (0..7, each handles 8 cols =&gt; 64 cols total? No, that doesn&#x27;t match.)
+
+Wait, warp tile is 32x16. 32 threads.
+If thread handles 2 rows x 8 cols, that&#x27;s 16 elements. But 32 threads * 16 elements = 512. Good.
+But 2 rows per thread * 16 threads for rows = 32 rows. 8 cols per thread * 2 threads for cols? No. Let&#x27;s say:
+- Threads are arranged as 16 x 2 (16 along M, 2 along N).
+- Then each thread handles 32/16=2 rows, 16/2=8 cols. Yes! 2x8.
+- lane_id from 0..31: thread_m = lane_id / 2, thread_n = lane_id % 2. Wait, that gives 16x2.
+- Thread computes output at rows [warp_m*32 + thread_m*2 + 0, +1], cols [warp_n*16 + thread_n*8 + k].
+
+For loading from smem:
+- For a given k iteration over TILE_K, each thread accesses:
+  - smemA rows: base_row + 0, base_row + 1 (for the two rows it handles)
+  - smemB cols: base_col + 0..7 (for the 8 cols it handles)
+
+If threads in a warp access different rows and different col groups, bank conflicts might be okay. smemA access: 32 threads access 32 different rows (or repeats?). Actually thread_m ranges 0..15, so 16 threads share the same warp_m... wait.
+
+In a warp, warp_m is fixed (same for all threads in warp). thread_m = lane_id / 2 ranges from 0 to 15.
+So threads access rows: warp_m*32 + thread_m*2 + offset.
+For offset 0: rows warp_m*32 + 0, 2, 4, ..., 30. These are all different.
+For offset 1: rows warp_m*32 + 1, 3, 5, ..., 31. Also all different.
+But all threads in a warp read the same &#x27;k&#x27; column from smemA. Each thread reads 2 different rows. So within a warp, at offset 0, threads read from 16 different rows, same column k. Since smemA is row-major, elements in the same column but different rows are stride (TILE_K+PAD) apart. Each row is in the same bank column but different banks because of row*stride. Actually, bank = (addr/2) % 32. addr = row*(TILE_K+PAD) + k. So (row*stride) % 32 varies with row. If stride is odd, consecutive rows map to consecutive banks. With 16 threads reading 16 different rows simultaneously, they map to 16 different banks. No bank conflicts. Good.
+
+For smemB access: threads access cols base_col + 0..7. thread_n = lane_id % 2 = 0 or 1. So 16 threads have thread_n=0 and 16 have thread_n=1. For thread_n=0: cols [warp_n*16 + 0..7]. For thread_n=1: cols [warp_n*16 + 8..15].
+But actually wait - if warp_n*16 is fixed per warp, then half the threads access cols 0..7 and half access 8..15. That&#x27;s fine. But do we have bank conflicts when accessing 8 consecutive half elements? With 32 banks, 8 halfs span 8 banks. Threads in a warp access the same 8 col groups. If multiple threads access the same row and same col group, that&#x27;s a broadcast (no conflict). If they access different rows, still each thread touches 8 banks, but other threads might overlap. However, for B, we read row &#x27;k&#x27;, and threads access different col groups (0..7 vs 8..15), but since all threads read 8 consecutive halfs, and there are 16 threads reading each group, does it conflict?
+
+Actually, reading float4 (8 halfs) from smemB[k][base_col] by 16 threads simultaneously means 16 threads are reading from 16 different addresses. Bank index = (address_in_bytes / 2) % 32. address = k*(TILE_N+PAD) + base_col + offset. If base_col differs by 8 between the two groups:
+- Group 0: base_col = warp_n*16 + 0
+- Group 1: base_col = warp_n*16 + 8
+
+For group 0: 16 threads read addresses: k*stride + 0, k*stride + 1, ..., k*stride + 7 (each thread reads a vector). Wait no - all 16 threads in group 0 read the exact same vector? No! In our design, I said each thread computes 2 rows x 8 cols. But all threads in the same warp might read B values for their 8 output columns.
+
+Wait, I need to rethink the per-thread computation pattern. Maybe I should have each thread only compute a small 1x2 or 2x1 strip to simplify memory access.
+
+Alternative approach: Instead of complex warp tiling, let&#x27;s do what CUTLASS does but simpler:
+- Load A and B tiles into shared memory.
+- Each thread computes a 1D strip of N_SUB elements (e.g., 8 elements) across N, for a specific row.
+- This is simpler: for each m_sub, all threads in a warp load B row [k][thread_n*8:(thread_n+1)*8] and A element [m_sub][k].
+
+Actually, a very simple and well-known approach:
+- Block tile: BM x BN = 64 x 64
+- Threads: 256
+- Each thread computes a 1x4 or 4x1 tile of outputs.
+- For simplicity: each thread computes a 4x4 tile of outputs = 16 outputs.
+- 256 threads * 16 = 4096 = 64x64. Good.
+
+Thread mapping:
+- thread_id = 0..255
+- thread_m = thread_id / 16 = 0..15 (4 rows each =&gt; 64 rows) -&gt; wait, 16 threads * 4 rows = 64 rows
+- thread_n = thread_id % 16 = 0..15 (4 cols each =&gt; 64 cols)
+- Each thread computes rows [thread_m*4, thread_m*4+3] and cols [thread_n*4, thread_n*4+3]
+
+But that&#x27;s a 4x4 per thread. In a warp (32 threads), we have:
+- thread_m = 0..1 (since 32/16=2?), actually with 256 threads and 16x16 mapping:
+  - A warp has 32 threads. If we divide 256 threads into 8 warps, then thread_id for warp 0 is 0..31.
+  - thread_m for warp 0: 0..1 (since thread_id/16 = 0 or 1)
+  - thread_n for warp 0: 0..15
+  - So warp 0 computes rows 0..7, cols 0..63? Wait: thread_m=0 computes rows 0..3, thread_m=1 computes rows 4..7. thread_n=0..15 computes cols 0..63 (each 4 cols).
+  - So warp 0 computes the top-left 8x64 tile.
+  
+For computation on K dimension:
+- For each k, we load A[rows][k] and B[k][cols].
+- Within warp 0:
+  - For k iteration, threads need A values for rows 0..7.
+  - 32 threads, but only 8 rows needed. So threads can load A collaboratively.
+  - For smemA access during compute: each thread needs A for its 4 rows. So 32 threads in warp access 32 A values, but only 8 unique rows. Actually each of 32 threads might access one of the 8 rows. Wait, 32 threads, each handles 4 rows = 8 unique row indices total. So each row is accessed by 4 threads. This is a broadcast! No bank conflict for A.
+
+  - For smemB: each thread needs B for its 4 cols. 32 threads * 4 cols = 128 unique col indices. But warp computes cols 0..63. So each col is accessed by 2 threads. But a thread accesses 4 contiguous cols. If 2 threads access the same 4 cols? Actually thread_n ranges 0..15, each handles cols thread_n*4 + (0..3). So 16 unique col groups. 32 threads means 2 threads per col group? No, thread_id 0..31 gives thread_m 0..1 and thread_n 0..15. So for each thread_n, there are 2 threads (thread_m=0 and 1) accessing the same 4 cols. That&#x27;s a broadcast! No bank conflict.
+
+This means: if we store smemB as [TILE_K][TILE_N+PAD], and each thread reads 4 contiguous halfs (half2 * 2), then the access pattern per warp is broadcast or strided across banks without conflicts. Very nice!
+
+Wait, but reading 4 halfs = 8 bytes. That&#x27;s half2 * 2 or a single 32-bit read * 2. Or we can read float2 (4 halfs) in one go. Let&#x27;s check bank conflicts for float2 (8 bytes). It spans 4 banks. If two threads read the same address, it&#x27;s broadcast. But if adjacent threads read adjacent 4-col groups (thread_n=0 reads cols 0..3, thread_n=1 reads cols 4..7), then addresses differ by 8 bytes = 4 banks apart. 16 threads reading 16 consecutive 8-byte vectors would cover 64 bytes = 32 banks (2 bytes per bank). Wait, with 32 banks and bank width 4 bytes on H100? Actually, shared memory is organized in 32 banks with 4 bytes per bank for 32-bit accesses. For 16-bit accesses on Ampere and newer... I think bank width is 4 bytes per bank. Let me recall: for 32-bit mode, each bank is 4 bytes. For 64-bit and 128-bit accesses, banks are combined. For 16-bit accesses, two 16-bit accesses might fall in the same bank.
+
+Actually, standard shared memory: 32 banks, each 4 bytes wide (for 32-bit access. On compute capability 7.x+, bank width is 4 bytes). A 16-bit (2-byte) address maps to bank (addr / 2) % 32. So two consecutive halfs are in different banks. A float2 (4 halfs = 8 bytes) spans 4 banks. A float4 (8 halfs = 16 bytes) spans 8 banks.
+
+For our 4x4 tile per thread, each thread for each k:
+- Reads A: 4 different values (row_m + 0..3), same k. Let&#x27;s read as half2 * 2 (or 4 separate halfs).
+- Reads B: 4 different values (col_n + 0..3), same k.
+
+If we read A as 4 separate halfs (or 2 half2s), and since multiple threads read the same row, it&#x27;s broadcast. The exact bank doesn&#x27;t matter because it&#x27;s either broadcast (if same address) or strided (if different addresses in same column but different rows).
+
+Actually, this 4x4 tiling is quite clean. Let me formalize:
+
+Thread (thread_m, thread_n) where thread_m = tid / 16, thread_n = tid % 16.
+Thread computes output at:
+for i=0..3:
+  for j=0..3:
+    C[(thread_m*4+i), (thread_n*4+j)] += A[(thread_m*4+i), k] * B[k, (thread_n*4+j)]
+
+This requires 4 A values and 4 B values per k iteration.
+A values: same column k, 4 different rows.
+B values: same row k, 4 different cols.
+
+Total A accesses per warp: 32 threads * 4 = 128 A values. But there are only 8 unique rows (0..7 for warp 0). Each row accessed by 16 threads. So 16 threads broadcast the same A address. That&#x27;s great.
+Total B accesses per warp: 128 B values. 16 unique col groups (cols [0..3], [4..7], ..., [60..63]). Each col group accessed by 2 threads (for the 2 row groups). Wait, thread_m=0 and thread_m=1 both access the same cols. So it&#x27;s broadcast? Actually same B address by 2 threads per warp.
+
+This is very efficient!
+
+We can store A as half2 for pairs, and B as float2 (contains 2 halfs? No, float2 is 2 floats. We need half2 for 2 halfs). Or we can store everything as half and read individual values. But vectorized loads into shared memory should still be float4.
+
+For the computation phase, reading A and B values:
+Option 1: Read as half. Simple.
+Option 2: Read as half2. A row pair and B col pair.
+If we read A as half2 for rows [0,1], [2,3], that&#x27;s 2 half2 reads. And B as half2 for cols [0,1], [2,3], etc.
+
+Actually, to minimize instructions, reading half is fine, the compute is 4*4 = 16 FMAs per k. K tile = 64, so 64*16 = 1024 FMAs per thread. With block synchronization, this is substantial.
+
+Wait, TILE_K=64 means the loop is 64 iterations. For each k, 16 FMAs. 1024 FMAs per thread. Each FMA is 2 FLOPs. 2048 FLOPs per thread per block. 256 threads = 524K FLOPs per block.
+
+For H100, peak is ~989 TFLOPS = 989e12 FLOPs/s. Per SM ~7.5 TFLOPS. With full occupancy, a block should complete in 524K / 7.5T = 0.07 microseconds? That seems too fast. Actually, at 989 TFLOPS for the whole GPU, compute time per block is 524K / 989e12 = 0.53 nanoseconds. That&#x27;s impossible because memory takes longer. The bottleneck is shared memory bandwidth, not compute.
+
+Shared memory bandwidth on H100 is ~15-20 TB/s per SM. Each iteration per thread reads 8 bytes (4 A + 4 B halfs) from shared memory. 256 threads * 8 bytes * 64 iterations = 131KB per block from shared memory. At 15TB/s, that&#x27;s 8.7 nanoseconds. Plus overhead. Realistically maybe 50-100 ns. L2 latency is the real issue.
+
+Anyway, this design should be efficient.
+
+Now, how to handle the output?
+After computing the 64x64 tile in FP32 accumulators, we apply alpha and convert to half.
+Then write to D with the permute layout.
+
+Output permute: [B, M, N] -&gt; [B/D1, M, D1, N]
+Given batch b, output element at [b, m, n] goes to D[b/D1, m, b%D1, n].
+
+So for block computing batch b, row base_m + local_m, col base_n + local_n:
+D_permuted_idx = (b / D1) * M * D1 * N + (base_m + local_m) * D1 * N + (b % D1) * N + (base_n + local_n)
+
+Wait, but is BMM handled correctly? A[b, m, k], B[b, k, n]. Yes.
+Output index: [b0, m, b1, n] where b = b0*D1 + b1.
+So offset = b0 * M * D1 * N + m * D1 * N + b1 * N + n.
+
+That&#x27;s straightforward.
+
+Now let me write the kernel.
+
+One concern: We need to vectorize stores to the output. If each thread writes a 4x4 block of output, are they contiguous? The output layout is [B0, M, D1, N]. Within a warp, thread_n handles different N ranges. N is the contiguous dimension in the innermost axis. But the block computes different m values. For a fixed m and varying n, the output is contiguous in memory (since innermost is N). So threads writing different N slices can write vectorized. Threads writing different M are strided by D1*N.
+
+But wait, in our thread mapping:
+- thread_m=0, thread_n=0 writes rows 0..3, cols 0..3
+- thread_m=0, thread_n=1 writes rows 0..3, cols 4..7
+
+For the same row, adjacent thread_n write adjacent columns. That&#x27;s contiguous and can be written with vectorized stores.
+For different thread_m, they write different rows, strided by D1*N.
+
+So within a warp, if we process one thread_n at a time for all thread_m, we can vectorize. But our natural pattern has each thread writing its own 4x4 tile. That means writing 4 separate half values or vectorizing the 4 N values per row into a half2 or float2.
+
+Actually, since N=192, and our tile is 64x64, for base_n=0, thread_n=0 writes cols 0..3, thread_n=1 writes cols 4..7, etc.
+A thread can write 4 halfs in a row as 2 half2 stores. That&#x27;s fine.
+
+One more thing: The output shape is [batch/D1, M, D1, N]. The evaluation might check shape exactly. So we should return D with shape [8, 384, 12, 192].
+
+Wait, is the B tensor initialized in __init__ shape [BATCH, K, N] or [K, N]? In the testbed, B is allocated as `total_elements_B = options.problem_each.n() * options.problem_each.k() * batch_count`, so [batch_count, K, N] effectively. In PyTorch, we should register_buffer with shape [BATCH, K, N].
+
+Let&#x27;s double check: init_inputs gives batch, k, n, d1, alpha, beta. So B should be shape [batch, k, n].
+
+In forward, A has shape [batch, M, k]. Wait, the get_inputs returns [torch.randn(BATCH, M, K, dtype=torch.float16).cuda()], where M and K are constants. Actually wait, M and K are module-level constants in the code: M=384, K=384. But in __init__, `k` is passed. And A is [BATCH, M, K]. So K must match k.
+
+I should use the passed parameters to initialize B. But since the test is with M=384, K=384, N=192, batch=96, I can hardcode or use vars.
+
+Actually, looking at get_init_inputs: it returns [BATCH, K, N, D1, ALPHA, BETA]. So B should be shape [BATCH, K, N].
+And A from get_inputs is [BATCH, M, K].
+
+So the bmm is valid: A @ B = [B, M, N].
+
+In the custom kernel, I&#x27;ll receive B with shape [B, K, N].
+
+But wait - in the hidden test, M and K might be different? The I/O contract only shows constants BATCH, M, N, K, D1, ALPHA, BETA. So it&#x27;s fixed sizes. But to be safe, we should handle variable sizes.
+
+However, for CUDA kernel dispatch with templated sizes (or dynamic sizes), dynamic is safer but slightly slower. Given the evaluation is fixed, I could in theory specialize, but let&#x27;s make it dynamic with parameters passed to kernel.
+
+Let me write the kernel to accept general M, N, K.
+
+One more check: does B need to be transposed? In PyTorch bmm: [B, M, K] @ [B, K, N] -&gt; [B, M, N]. Both row-major. Standard GEMM. So A[m,k] * B[k,n]. That&#x27;s exactly what we compute.
+
+Now, about the alpha scaling: The reference does alpha * A * B + beta * C. With beta=0, it&#x27;s alpha * A * B. So we multiply the result by alpha.
+
+And since ElementAccumulator = float, we accumulate in float.
+
+Now, let me think about whether there are any other details. The CUTLASS code handles both normal GEMM and batched GEMM. In the batched case, the mode is kBatched, and it passes batch_count. Each batch is independent. Layouts are all RowMajor.
+
+For the permute, there&#x27;s a separate host-based permute for reference checking. But our kernel should directly write the permuted output.
+
+Actually, I realize the CUTLASS example tests ALL of the different permutations. But the hidden reference for evaluation might be just ONE of them. Looking at the I/O contract:
+- get_init_inputs returns [BATCH, K, N, D1, ALPHA, BETA] - this has D1, which corresponds to TTTGemmBatchedPermuteD or similar? Wait, D1 appeared in the Batched section. And the input A is 3D [BATCH, M, K], suggesting Batched GEMM.
+- Which specific permutation? The init inputs don&#x27;t include S1, S2, T1, T2, T3, so it&#x27;s unlikely to be any of the normal GEMM permutations that require those.
+- D1 is used for Tensor4DPermuteBMM0213 and BMM0321. 
+
+For batched permutations:
+- TTTGemmBatchedPermuteD: A NoPermute, B NoPermute, D Tensor4DPermuteBMM0213RowMajor&lt;D1&gt;. This matches: D1 only needed for output.
+- NNNGemmBatchedPermuteD: Similar but col-major.
+
+But wait, init_inputs doesn&#x27;t specify layout. It could be either TTT or NNN. However, PyTorch tensors are row-major by default. And get_inputs returns torch.randn(...).cuda() without transposition. So A is row-major [B, M, K]. 
+
+For a row-major batched GEMM output with BMM0213 permute: output [B, M, N] reshaped to [B/D1, D1, M, N] and permuted to [B/D1, M, D1, N].
+
+In the I/O contract, the tensors are default PyTorch layout, which is row-major. So TTT (row-major) seems natural.
+
+But in the testbed code, for the batched cases:
+- TTT BMM uses: RowMajor for A, RowMajor for B, RowMajor for C/D, with BMM0213 on D.
+
+But could it be that the reference is TTTGemmBatchedPermuteD? That would mean no permute on A or B, only on D. This aligns with the init inputs not having extra parameters.
+
+However, we need to be absolutely sure. Is there any possibility that the reference includes a permute on A or B? The init inputs only have BATCH, K, N, D1. There are no S1/S2/T1/T2/T3 parameters, and those are used for the 4D/5D permutations on A/B for normal GEMMs. The only permutation-specific parameter is D1 for BMM. Plus, A has shape [BATCH, M, K] - if A had a permute, we&#x27;d need to know or it would be baked in. Since the problem mentions &quot;same tensor I/O contract&quot; and gives constants BATCH, M, N, K, D1, it strongly points to a batched GEMM with only output permute BMM0213.
+
+But to be safe, I should check if there&#x27;s any reason B would be permuted. In the CUTLASS code, for TTTGemmBatchedPermuteD, B has NoPermute. That means B is just a standard B matrix [batch, K, N]. 
+
+I will implement exactly this: BMM with output permute BMM0213.
+
+One more thing: The reference is likely `cutlass::gemm::device::GemmUniversal` with specific tile configs. For A100 it used GemmShape&lt;128,128,32&gt;. For H100, we should use larger K tiles or adjust for Hopper. But since we can&#x27;t use CUTLASS easily, our custom kernel will deal with it.
+
+Now let me write the final kernel code.
+
+Kernel design details:
+
+Grid: ( (N + BN - 1) / BN, (M + BM - 1) / BM, batch )
+Block: 256 threads
+
+Shared memory:
+- A_shared: [BM][BK+PAD_A] half
+- B_shared: [BK][BN+PAD_B] half
+
+Where BM=64, BN=128, BK=64? Or BM=64, BN=64, BK=64.
+
+I initially planned BM=64, BN=64, BK=64. Let me recalculate with BN=128.
+
+With BN=128, tiles per batch for N=192: ceil(192/128) = 2. M tiles: ceil(384/64) = 6. Total: 12 tiles/batch * 96 = 1152 blocks. Good.
+
+BM=64, BN=128, BK=64.
+SMEM A: 64 * 64 * 2 = 8KB
+SMEM B: 64 * 128 * 2 = 16KB
+Total: 24KB. Still well within limits.
+
+Each thread computes: (64 * 128) / 256 = 32 elements. That&#x27;s an 8x4 or 4x8 or similar tile.
+
+Let&#x27;s try: each thread computes 4 rows x 8 cols = 32 elements.
+256 threads / 32 elements = 8 unique assignments.
+
+Thread layout:
+- Warp: 32 threads. 4 warps along M dimension? Let&#x27;s think.
+
+Total block M=64. If each warp handles 16 rows (32 threads * 4 rows? no).
+If each thread handles 4 rows, then 64/4 = 16 threads needed for M.
+If each thread handles 8 cols, then 128/8 = 16 threads needed for N.
+So we need a 16x16 thread arrangement. 256 threads exactly.
+
+Warps handling this:
+- 16 threads for M, 16 for N. 
+- 256 threads = 16 warps? No, 256/32 = 8 warps.
+- If we split warps as 2 along M and 4 along N:
+  - Warp M index: 0..1 (32 rows each / 4 rows per thread = 8 threads per M-group... wait.)
+  
+Actually, 16x16 threads. We can map:
+- thread_id 0..255
+- thread_m = thread_id / 16 = 0..15
+- thread_n = thread_id % 16 = 0..15
+
+Each thread handles:
+- rows: thread_m * 4 + (0..3) = 4 rows
+- cols: thread_n * 8 + (0..7) = 8 cols
+
+So 64 rows total, 128 cols total. Perfect.
+
+Now, within a warp (32 threads):
+There are many ways to map 256 threads to 8 warps. But for bank conflicts, the pattern matters during compute.
+
+Let&#x27;s see: thread_m = tid / 16. For warp_id (tid/32), threads in a warp have:
+- tid = warp_id*32 + lane_id
+- thread_m = (warp_id*32 + lane_id) / 16
+  - For lane_id 0..15: thread_m = warp_id*2 + 0
+  - For lane_id 16..31: thread_m = warp_id*2 + 1
+- thread_n = (warp_id*32 + lane_id) % 16
+  - For lane_id 0..15: thread_n = lane_id
+  - For lane_id 16..31: thread_n = lane_id - 16
+
+So warp 0 handles:
+- lane 0..15: thread_m=0, thread_n=0..15. Computes rows 0..3, cols 0..127 (in groups of 8).
+- lane 16..31: thread_m=1, thread_n=0..15. Computes rows 4..7, cols 0..127.
+
+So warp 0 computes the top 8 rows, all 128 columns. That&#x27;s a 8x128 tile per warp.
+
+For A smem access during compute: all threads in warp 0 need A values for rows 0..7 (specifically, lane 0..15 need rows 0..3, lane 16..31 need rows 4..7).
+For a given k iteration, say threads need A[row][k].
+Since rows 0..7 are accessed by the warp, and there are 8 unique rows, each accessed by 4 threads. This is broadcast? Actually 4 threads access row 0, 4 threads access row 1, etc. Within a warp, 32 threads access 8 unique rows. So it&#x27;s 4-way broadcast for each row. On H100, broadcast is handled efficiently in shared memory.
+
+For B smem access: all threads in warp 0 need B values for columns 0..127 (specifically, each thread_n handles a different 8-col group). 16 unique 8-col groups. Each accessed by 2 threads (thread_m=0 and thread_m=1). So it&#x27;s 2-way broadcast per col group. Also fine.
+
+The actual addressing for B:
+smemB[k][thread_n * 8 + j] for j=0..7.
+If thread_n ranges 0..15 within the warp, the addresses are:
+thread_n=0: &amp;smemB[k][0]
+thread_n=1: &amp;smemB[k][8]
+...
+These are offset by 8 halfs = 16 bytes.
+Bank index for B: (k*(BN+PAD) + col) % 32? Actually bank = (addr_in_bytes / 2) % 32 if bank width is 2 bytes? Wait, on H100 shared memory banks are 4 bytes. The bank index for a 32-bit access is (addr / 4) % 32. For a 16-bit access, two 16-bit words fall in the same bank? No, I think for 16-bit accesses, the bank index is (addr / 2) % 32, but there are 32 banks each 4 bytes wide, meaning addresses 0..1 -&gt; bank 0, 2..3 -&gt; bank 1, ... wait.
+
+Actually, in CUDA, shared memory has 32 banks. The bank of a 32-bit word at address N is N % 32. For 64-bit, banks are paired. For 128-bit, banks are quad-paired. For 16-bit, since it&#x27;s smaller than 32-bit, two 16-bit accesses can conflict if they fall in the same 32-bit word. Actually, on modern GPUs (Ampere+), a 16-bit access is handled by the same bank as a 32-bit word, but I believe 16-bit accesses are supported with either no conflict (if in different banks) or 2-way conflict (if in the same 32-bit word). For simplicity, it&#x27;s safer to use 32-bit loads.
+
+If each thread reads B as 4 half2 (2 halfs each), that&#x27;s 4 32-bit loads. The addresses for thread_n: [k][base_col + j*2]. base_col = thread_n * 8. So base_col ranges 0, 8, 16, ..., 120. These are spaced by 8 halfs = 16 bytes = 4 32-bit words. With 32 banks, consecutive thread_n access banks that are 4 apart. So 8 consecutive threads access banks [0, 4, 8, 12, 16, 20, 24, 28] for their first half2. No conflicts! The next half2 for each thread is bank+1. Also no conflict with the first half2 of adjacent thread? thread_n=0: banks 0 and 1. thread_n=1: banks 4 and 5. No overlap. Perfect!
+
+If we further read a float2 (4 halfs = 64 bits) for B, it spans 2 banks (pair). With base_col spaced by 16 bytes (4 halfs = 32 bits = 1 bank-width unit). So base_col for thread_n = thread_n * 8. In terms of 32-bit words: base_col/2 = thread_n * 4. Bank = (base_col/2) % 32 = (thread_n * 4) % 32. Actually for 64-bit access, banks are paired: bank_pair = (addr/8) % 16. So consecutive thread_n differ by 4 in addr/4 (32-bit), so differ by 2 in addr/8 (64-bit). So thread_n=0 and thread_n=1 differ by 2 in bank_pair. No conflict.
+
+This is all very good. We can read B as half2 or float2.
+
+Now for A:
+Thread within warp needs rows base_row + offset. base_row = thread_m * 4.
+For warp 0: thread_m = 0 or 1. 
+- lane 0..15: base_row = 0. Need rows 0,1,2,3.
+- lane 16..31: base_row = 4. Need rows 4,5,6,7.
+
+We can read A rows as 2 float2 (4 halfs each). Address = (base_row + i) * (BK+PAD_A) + k. But wait, A is stored as [BM][BK+PAD]. For fixed k, A[row][k] for different rows are offset by (BK+PAD)*2 bytes. 
+If BK+PAD = 66 (64+2), then offset = 132 bytes = 33 32-bit words. Bank for row 0: (k*2/4)%32 = (k/2)%32. Bank for row 1: ((k + 66)*2/4)%32 = ((k+66)/2)%32 = (k/2 + 33)%32 = (k/2 + 1)%32. So consecutive rows are in consecutive banks! That&#x27;s perfect because 4 threads accessing rows 0..3 will hit 4 consecutive banks.
+
+Actually, the bank computation: for a 32-bit access, address is relative byte address. Word address = byte_addr / 4. Bank = word_addr % 32.
+A[row][k] byte_addr = (row * (BK+PAD) + k) * 2.
+Word_addr = (row * (BK+PAD) + k) / 2.
+For BK+PAD=66: word_addr(row) = (row * 66 + k) / 2.
+Bank(row) = ((row * 66 + k) / 2) % 32.
+For row+1: bank = ((row*66 + 66 + k)/2) % 32 = bank(row) + 33 % 32 = bank(row) + 1.
+Great! So reading consecutive rows with 32-bit accesses causes 1-bank-apart accesses. For 4 threads reading 4 different rows simultaneously, there are 4 different banks, no conflicts. Even if threads read float2 (64-bit), they span 2 consecutive banks each. 4 threads would span 8 banks. Still no conflict.
+
+This is why PAD=2 for BK=64 works well: 64+2 = 66, odd, causing consecutive rows to cycle through banks.
+
+So our shared memory padding strategy is:
+- smemA: [BM][BK + PAD_A] where PAD_A = 2 (or any small odd number to make stride odd)
+- smemB: [BK][BN + PAD_B] where PAD_B = 2 (same reasoning)
+
+Wait, for smemB the access pattern during compute is along columns for fixed k. For B[row=k][col], consecutive cols differ by 1 in bank. But we read 4 consecutive cols at once (float2). That spans 2 banks. Multiple threads reading different col groups spaced by 8 cols (4 float2 words). Bank difference = 4. No conflict.
+
+Now let&#x27;s verify the vectorized global memory loads.
+
+Global A pointer: A[b, m, k] = A + (b * M * K) + (m * K) + k.
+Tile A: rows m0..m0+BM-1, cols k0..k0+BK-1.
+Global load: we want to load BM*BK halfs = BM*BK*2 bytes.
+256 threads * 8 bytes per thread (float4 = 8 halfs) = 2048 bytes = 1024 halfs.
+BM*BK = 64*64 = 4096 halfs. So each thread needs to load 4096/256 = 16 halfs = 2 float4.
+Loads per thread:
+For thread t = 0..255:
+  load_i = t / 32? Actually:
+  Each float4 contains 8 halfs. 2 float4 = 16 halfs.
+  256 threads * 16 halfs = 4096 halfs total.
+
+Thread t handles 16 elements. Since A is row-major, we want coalesced access. We can have thread t load elements at offset t*16, t*16+1, ..., t*16+15. Or rather 2 float4 at contiguous addresses.
+
+offset = t * 16. In the tile, row = offset / BK, col = offset % BK.
+Wait, BK=64. offset=0: row=0, col=0..15. offset=16*1=16: row=0, col=16..31. ...
+But 16 is not a multiple of 64. offset=0: row 0, col 0..15 (16 halfs). float4 covers 8 halfs, so 2 float4 covers 16 halfs.
+offset=64: row 1, col 0..15.
+This is coalesced because threads in a warp have consecutive t: t=0..31. Their offsets are 0, 16, 32, ..., 496.
+Wait, t in warp 0: 0..31. Offsets: 0, 16, 32, ..., 496.
+In terms of memory addresses in the global A tile: address = base_A + offset * 2.
+Thread 0: addr 0. Thread 1: addr 32. Thread 2: addr 64. ...
+Consecutive threads access addresses 32 bytes apart.
+A warp issues 32 loads of 16 bytes each (2 float4). Total 512 bytes per warp.
+Are these coalesced? For warp-wide memory access, optimal is when threads access consecutive 16-byte segments. Here, thread t accesses 2x16-byte segments at addr+32t and addr+32t+16. For a warp, the accesses are at 0, 16, 32, 48, ..., 496, and also 512, 528, ..., 1008 (for the second float4).
+
+Actually, consecutive threads access addresses that are 32 bytes apart for the first float4. And 32 bytes apart for the second float4. 
+Warp accesses: 0..15 (thread 0), 32..47 (thread 1), 64..79 (thread 2), ... This leaves gaps! Thread 0 reads 0..15 and 16..31. Wait, 16 halfs = 32 bytes. A float4 is 16 bytes (8 halfs). So thread t reads:
+- first float4 at addr = t * 32
+- second float4 at addr = t * 32 + 16
+
+For t=0: 0..15, 16..31.
+For t=1: 32..47, 48..63.
+For t=2: 64..79, 80..95.
+
+Wait, that is actually perfectly contiguous! For the warp, addresses are 0,16,32,48,...,496. 512 addresses total (0..511 bytes), which is 256 halfs. But our tile is 64*64=4096 halfs, and there are 8 warps. Each warp loads 512 halfs. 8*512=4096. And the addresses within a warp are interleaved at 16-byte granularity but fully cover the region if we think about the whole warp. Actually, no: thread 0 loads bytes 0..15 and 16..31. Thread 1 loads bytes 32..47 and 48..63. So for the first 2 threads, bytes 0..63 are loaded. For 32 threads, bytes 0..1023 are loaded. This is perfectly contiguous! Coalesced.
+
+Similarly for B:
+Global B pointer: B[b, k, n].
+Tile B: rows k0..k0+BK-1, cols n0..n0+BN-1.
+BN=128. Total elements = 64*128 = 8192 halfs = 16384 bytes.
+256 threads * 16 bytes per thread (if we load float4) = 4096 bytes per load pass. We need 16384 / 4096 = 4 passes? Wait, 256 threads * 32 bytes (2 float4) = 8192 bytes. Total is 16384 bytes, so each thread needs to load 64 bytes = 4 float4.
+
+Let&#x27;s recalculate: For B tile [BK=64][BN=128] = 8192 halfs. 256 threads. Each thread loads 8192/256 = 32 halfs = 4 float4. 
+Thread t loads 4 float4 at offsets t*32, t*32+8, t*32+16, t*32+24 (in halfs).
+Global address: B + (k0 + row) * N + (n0 + col).
+If we store B in row-major, the element at offset = row * BN + col. But the global stride is N, not BN. 
+
+So thread t in the loading phase should map the linear offset in the tile to global coordinates.
+
+Alternative: load B directly with 2D indexing. Each thread handles specific rows and columns.
+For B, we can load rows from smem. Since B is [batch, K, N], after loading into smemB (which is [BK][BN]), we copy from global to shared.
+
+Simpler loading scheme for B:
+Each thread loads a chunk of rows. There are 64 rows (BK=64) and 256 threads. So 4 threads per row. Each row has 128 elements. 4 threads per row handle 32 elements each = 4 float4 (since float4 = 8 halfs).
+Thread t:
+ row = t / 4 = 0..63
+ chunk = t % 4 = 0..3
+ col = chunk * 32 = 0, 32, 64, 96
+ Load float4 at B[b, k0+row, n0+col], and float4 at +16 (next 8 halfs). Wait, 32 elements = 4 float4.
+
+Actually, 128 elements per row / 4 threads = 32 elements per thread. 32 halfs = 64 bytes = 4 float4.
+So for row r, thread t loads 4 float4 at columns c, c+8, c+16, c+24 where c = (t%4)*32.
+In terms of halfs: c = (t%4)*32. Float4 covers 8 halfs. So 4 float4 covers 32 halfs exactly.
+
+This gives coalesced access: threads 0,1,2,3 handle row 0, columns 0..31, 32..63, 64..95, 96..127.
+Wait, each thread handles 32 consecutive halfs (4 float4). Thread 0: cols 0..31, thread 1: cols 32..63? No, the mapping I gave: chunk=t%4, col=chunk*32. So thread 0: cols 0..31, thread 1: cols 32..63, thread 2: cols 64..95, thread 3: cols 96..127. Yes, contiguous. In a warp, 32 threads: first 4 handle row 0, next 4 handle row 1, etc. (if t/4 = row).
+For warp 0 (t=0..31): rows 0..7, with 4 threads each.
+For row 0: threads 0,1,2,3 access cols 0..31, 32..63, 64..95, 96..127. Perfect coalescing for a warp because threads access consecutive 32-byte chunks? Actually thread 0 reads at column 0 (addr 0..31 in row). Thread 1 reads at column 32 (addr 32..63). These are consecutive! Yes.
+
+Similarly for A:
+A has 64 rows, 64 cols. 256 threads. We can map similarly: 4 threads per row? No, 64 rows, 256 threads = 4 threads per row. Each row has 64 halfs = 128 bytes = 8 float4. 4 threads * 2 float4 = 8 float4 total per row. 2 float4 per thread = 16 halfs. But each row has 64 halfs, so each thread handles 16 halfs. 16 halfs = 2 float4 = 32 bytes.
+Thread t:
+ row = t / 4
+ chunk = t % 4
+ col = chunk * 16 = 0, 16, 32, 48
+ Load 2 float4: at A[b, m0+row, k0+col] and A[b, m0+row, k0+col+8].
+In a warp (32 threads): rows 0..7. 4 threads per row. Thread 0: row 0, cols 0..15. Thread 1: row 0, cols 16..31. Thread 2: row 0, cols 32..47. Thread 3: row 0, cols 48..63. Thread 4: row 1, cols 0..15...
+This is coalesced! In a warp, threads access consecutive addresses: row0/col0, row0/col16, row0/col32, row0/col48, row1/col0, etc. 
+Wait, is this coalesced? The global memory layout for A is row-major. Row 0 elements 0..63 are contiguous. Row 1 elements 0..63 are contiguous, but after gap of K-64. 
+In a warp, threads 0..3 access row0. Threads 4..7 access row1. But row1 is K*2 bytes away from row0 start. K=384, so 768 bytes away. That&#x27;s a stride. Is this coalesced?
+
+The warp issues loads for:
+Thread 0: addr = base + 0
+Thread 1: addr = base + 32 (16 halfs * 2)
+Thread 2: addr = base + 64
+Thread 3: addr = base + 96
+Thread 4: addr = base + K*2 + 0 = base + 768
+
+On H100, global memory coalescing looks at all addresses in a warp and merges them into transactions. The addresses are base+0,32,64,96,768,800,832,864,... up to 7 rows. 
+Adjacent threads 3 and 4 have addresses 96 and 768. That&#x27;s a gap of 672 bytes. The hardware will issue separate transactions. But rows 0..3 can be loaded in few transactions each (e.g., 128-byte transactions). And rows 4..7 similarly. This is fine because it results in 8 transactions for 8 rows, each transaction reading 128 bytes. Total 8*128 = 1024 bytes. 
+
+Actually, if 4 threads per row each load 32 bytes (2 float4 = 32 bytes), then per row we have 4*32 = 128 bytes. These 4 addresses are contiguous: 0..127 for row 0. This can be done in as few as 1 or 2 128-byte transactions. Very efficient.
+
+For B, 4 threads per row load 32 bytes each, total 128 bytes per row, also perfectly contiguous and easy to merge.
+
+This loading scheme is excellent.
+
+Now the computation phase:
+Each thread has:
+- 4 rows assigned: base_row = thread_m * 4. These are fixed.
+- 8 cols assigned: base_col = thread_n * 8. These are fixed.
+
+But wait, in our 16x16 thread arrangement, thread_m = tid / 16, thread_n = tid % 16.
+Each thread computes acc[4][8] = 32 accumulators.
+
+For k in 0..BK-1:
+  for i in 0..3:
+    a_val = smemA[base_row + i][k]
+    for j in 0..7:
+      acc[i][j] += a_val * smemB[k][base_col + j]
+
+This requires reading smemB[k][base_col + j] for j=0..7. We can read 4 float2 (each covers 2 halfs). Or 2 float4 (covers 4 halfs... actually float4 has 4 floats, we need half4 which doesn&#x27;t exist. We can reinterpret with half2).
+
+Actually, reading 8 halfs as 4 half2:
+  half2 b01 = *reinterpret_cast&lt;half2*&gt;(&amp;smemB[k][base_col+0]);
+  half2 b23 = *reinterpret_cast&lt;half2*&gt;(&amp;smemB[k][base_col+2]);
+  ...
+
+To avoid many loads, we can use a small local array:
+  half b_vals[8];
+  *reinterpret_cast&lt;float2*&gt;(&amp;b_vals[0]) = *reinterpret_cast&lt;float2*&gt;(&amp;smemB[k][base_col]);
+  *reinterpret_cast&lt;float2*&gt;(&amp;b_vals[4]) = *reinterpret_cast&lt;float2*&gt;(&amp;smemB[k][base_col+4]);
+
+Wait, float2 is 8 bytes = 4 halfs. So 2 float2 loads give 8 halfs. Good.
+
+Similarly for A:
+  half a_vals[4];
+  *reinterpret_cast&lt;half2*&gt;(&amp;a_vals[0]) = *reinterpret_cast&lt;half2*&gt;(&amp;smemA[base_row][k]);
+  *reinterpret_cast&lt;half2*&gt;(&amp;a_vals[2]) = *reinterpret_cast&lt;half2*&gt;(&amp;smemA[base_row+2][k]);
+
+No. smemA[row][k] stores the element at column k for row. So a_vals[i] = smemA[base_row+i][k]. Since k is the same for all 4 rows, and rows are consecutive, we can read 4 separate half values. Reading a half2 from smemA[base_row][k] gives smemA[base_row][k] and smemA[base_row][k+1]? No! smemA is [BM][BK+PAD]. The contiguous dimension is K. So smemA[row][k] and smemA[row][k+1] are adjacent. But we want smemA[base_row][k], smemA[base_row+1][k], etc. These are strided by (BK+PAD) in the second dimension. Actually no: smemA[row0][k] and smemA[row0+1][k] are offset by (BK+PAD) elements in the flattened array: addr(row+1,k) = addr(row,k) + (BK+PAD). So they are strided, not contiguous.
+
+So we must read 4 separate halfs (or 2 half2 if we read from row pairs). Since rows 0/1 and 2/3 are not contiguous... wait, consecutive rows are offset by (BK+PAD) = 66 halfs. That&#x27;s 66*2 = 132 bytes. So row0 addr and row1 addr are 132 bytes apart = 33 32-bit words. On shared memory, reading from addr and addr+132 simultaneously hits banks that are 33%32 = 1 apart. So no conflict. We can just read 4 separate halfs.
+
+Or we can read 2 half2s: 
+  half2 a01 = {smemA[base_row][k], smemA[base_row+1][k]}; // No, this doesn&#x27;t work directly.
+
+Actually, if we store A transposed in shared memory, then the K dimension is the leading dimension, and rows are adjacent. But A is [row][col] in memory. We can load it transposed to improve the compute phase access pattern. But that complicates loading.
+
+Given the 4 A reads per k per thread are cheap (broadcast), let&#x27;s just read them individually:
+  float a0 = __half2float(smemA[base_row+0][k]);
+  float a1 = __half2float(smemA[base_row+1][k]);
+  float a2 = __half2float(smemA[base_row+2][k]);
+  float a3 = __half2float(smemA[base_row+3][k]);
+
+And for B, read 8 halfs as 4 half2 via vectorized loads. Since B is stored as [BK][BN+PAD], the N dimension is contiguous. For fixed k, B[k][base_col + j] are contiguous for j=0..7. Perfect.
+
+So:
+  half2 b01 = *reinterpret_cast&lt;half2*&gt;(&amp;smemB[k][base_col]);
+  half2 b23 = *reinterpret_cast&lt;half2*&gt;(&amp;smemB[k][base_col+2]);
+  half2 b45 = *reinterpret_cast&lt;half2*&gt;(&amp;smemB[k][base_col+4]);
+  half2 b67 = *reinterpret_cast&lt;half2*&gt;(&amp;smemB[k][base_col+6]);
+
+Then compute:
+  acc[i][j] += a_i * b_j
+
+Actually since we have a_vals[4] and b_vals[8], we can do 32 FMAs. With float accumulation.
+
+But wait, smemB[k][base_col + j] involves calculating addresses. Since smemB is a 2D array, the compiler handles indexing. `&amp;smemB[k][base_col]` might not be allowed directly for reinterpret_cast if smemB is declared as `half smemB[BK][BN+PAD]`. Actually, `&amp;smemB[k][base_col]` gives a `half*`. That&#x27;s fine.
+
+However, we must be careful about alignment. BN+PAD=130 (128+2). `base_col` is multiple of 8. `k*(BN+PAD)` is a multiple of 2. So the address should be aligned to 2 bytes (half alignment). For half2 (4 bytes), base_col is a multiple of 8, so address is a multiple of 8. Yes, aligned to 4 bytes. For float2 (8 bytes), base_col must be a multiple of 4 halfs, so yes multiple of 8. Actually float2 of halfs (4 halfs) requires 8-byte alignment. base_col is a multiple of 8, so `&amp;smemB[k][base_col]` is aligned to 8 bytes if k*(BN+PAD) is even. BN+PAD=130, so k*130 is even for all k. Plus base_col is a multiple of 8. So address is multiple of 8. Good for float2!
+
+Wait, base_col = thread_n * 8. So it&#x27;s always a multiple of 8 halfs. Yes.
+
+Actually, let me think about unrolling. Since B tile is 64x128, we have 64 iterations in k. We can pragma unroll this loop. The compiler should unroll it fully or partially. Full unroll of 64 iterations with 32 FMAs each = 2048 FMAs. That&#x27;s a lot of instructions but should be okay for H100 if the loop body is small.
+
+Actually, the body also contains shared memory loads. 64 shared memory loads might be a lot for the instruction cache. We can unroll by a factor of, say, 8. But let&#x27;s just use `#pragma unroll 1` or `#pragma unroll` and let the compiler decide. Actually, `#pragma unroll` might try to fully unroll and cause long compilation or high register pressure. Let&#x27;s use `#pragma unroll 4` to be safe. Wait, the compiler is smart enough. For K=384 and BK=64, there are 6 outer iterations. Inside, the k loop is 64. 
+
+If we do `#pragma unroll 8`, we have 8 inner iterations. Total 8 FMAs * 32 = 256 FMAs per unroll. That&#x27;s reasonable.
+
+Let me also think about double-buffering or pipelining. For H100, cp.async allows prefetching. But for simplicity and register count, single buffering is fine given L2 cache.
+
+I should also check: does the problem use beta? Beta is 0, so we don&#x27;t need to read C. We just compute and write.
+
+What about alpha? It&#x27;s 1.0 in the constants. But the init function receives it, so we should use it in the kernel. Even if it&#x27;s 1.0, multiplying by 1.0 doesn&#x27;t change the result (but float arithmetic might). To match exactly: multiply float accum by alpha, then convert to half.
+
+Now, the output write:
+After the loop, we have acc[4][8] float values.
+For each i in 0..3, j in 0..7:
+  out_half = __float2half(alpha * acc[i][j]);
+  output address: 
+    b = blockIdx.z
+    m = blockIdx.y * BM + base_row + i
+    n = blockIdx.x * BN + base_col + j
+    
+    b0 = b / D1;
+    b1 = b % D1;
+    
+    idx = b0 * M * D1 * N + m * D1 * N + b1 * N + n;
+    D[idx] = out_half;
+
+For vectorized stores:
+Within a warp, threads with the same thread_m and adjacent thread_n write adjacent n values. For a fixed row (i fixed), thread_n=0 writes n=n_base+0..7, thread_n=1 writes n=n_base+8..15, etc. So all threads in a warp for fixed i write contiguous segments of N. We can write each row as 4 half2s or 2 float2s per thread. Since 8 halfs per thread float perfectly into 4 half2s.
+
+But writing row by row might be easier. Let&#x27;s do:
+  #pragma unroll
+  for (int i = 0; i &lt; 4; ++i) {
+    int m_out = blockIdx.y * BM + thread_m * 4 + i;
+    int n_out_base = blockIdx.x * BN + thread_n * 8;
+    
+    half2 o0 = __halves2half2(__float2half(alpha * acc[i][0]), __float2half(alpha * acc[i][1]));
+    half2 o1 = __halves2half2(__float2half(alpha * acc[i][2]), __float2half(alpha * acc[i][3]));
+    half2 o2 = __halves2half2(__float2half(alpha * acc[i][4]), __float2half(alpha * acc[i][5]));
+    half2 o3 = __halves2half2(__float2half(alpha * acc[i][6]), __float2half(alpha * acc[i][7]));
+    
+    int idx = b0 * M * D1 * N + m_out * D1 * N + b1 * N + n_out_base;
+    *reinterpret_cast&lt;half2*&gt;(&amp;D[idx]) = o0;
+    *reinterpret_cast&lt;half2*&gt;(&amp;D[idx+2]) = o1;
+    *reinterpret_cast&lt;half2*&gt;(&amp;D[idx+4]) = o2;
+    *reinterpret_cast&lt;half2*&gt;(&amp;D[idx+6]) = o3;
+  }
+
+Wait, there&#x27;s a subtle issue: thread_m is not the same for all threads in a warp when writing. In a warp, thread_m values are 0 and 1. So half the threads write rows 0..3 and half write rows 4..7. This means within a warp, threads are writing to two different row addresses (strided by D1*N*4). But that&#x27;s fine because memory access is per thread/warp.
+
+The critical thing is whether half2 writes are aligned. n_out_base = blockIdx.x * BN + thread_n * 8. blockIdx.x * BN is a multiple of 128. thread_n * 8 is a multiple of 8. So n_out_base is a multiple of 8. idx = ... + n_out_base. The base of the row is D1*N aligned? D1*N = 12*192 = 2304. Yes, multiple of 8. So idx is multiple of 8 halfs, i.e., multiple of 16 bytes. Good for half2 (4 bytes) and float2 (8 bytes).
+
+Can we write float2? 4 halfs = 8 bytes = float2 size. But half2 is 4 bytes. Four half2 writes is okay.
+
+Actually, for even better memory throughput, we can write float2 (8 bytes) at a time. That requires packing 4 halfs into a float2 container. 
+  float2 f2;
+  half2* h2ptr = reinterpret_cast&lt;half2*&gt;(&amp;f2);
+  h2ptr[0] = o0;
+  h2ptr[1] = o1;
+  *reinterpret_cast&lt;float2*&gt;(&amp;D[idx]) = f2;
+
+This is safe because we control the layout. float2 is just 8 bytes.
+
+Actually, let me verify the output shape. The model returns D. Should D be [batch//D1, M, D1, N]? In CUTLASS, the output tensor is allocated with the permuted shape or the original shape? In the testbed, `block_D` is allocated as `problem_each.m() * problem_each.n() * batch_count`. That&#x27;s the original [B, M, N] size = 96*384*192 = 7,077,888 elements. But the CUTLASS kernel with permute writes to this buffer? Actually, looking at the testbed:
+
+```cpp
+cutlass::TensorView&lt;ElementC, LayoutC&gt; view_D(block_D.get(), layout_C, extent_C);
+```
+
+Wait, but for permuted output, is the allocation the original or permuted? In tensor_permute_utilities, usually the memory is allocated for the original tensor and the kernel writes with the permuted indexing. Or it allocates the capacity of the permuted shape.
+
+Looking at the arguments to GemmUniversal:
+```cpp
+(void*)block_D.get(), // D pointer
+layout_C.capacity(extent_C), // batch_stride
+...
+layout_C.stride(0), // ldc
+layout_C.stride(0), // ldd
+```
+
+For batched GEMM with permute, the batch stride for D is set to 0 if non-trivial permute. This means each batch doesn&#x27;t have a linear stride, and the kernel computes the address directly. The total allocation is still `layout_C.capacity(extent_C) * batch_count` I think, or maybe just enough for the permuted result.
+
+Anyway, in PyTorch, we can return a tensor of shape [batch//D1, M, D1, N]. This is the logical permuted shape.
+
+Let me make sure: the model&#x27;s `forward` returns a tensor. The reference does something similar. Since PyTorch uses row-major contiguous storage, [B0, M, D1, N] is stored as:
+index = b0 * (M * D1 * N) + m * (D1 * N) + b1 * N + n.
+
+That&#x27;s exactly what we&#x27;re computing.
+
+Now, there is one more thing: The CUTLASS code uses `ElementAccumulator = float`. Our kernel accumulates in float. Good.
+
+Also, we need to consider edge cases where M, N, K are not divisible by tile sizes. In our problem, they are divisible. But to be safe, the kernel should handle boundaries. I&#x27;ll add checks:
+- if m &gt;= M or n &gt;= N, skip computation and don&#x27;t write.
+- But loading shared memory should still be done correctly to not access out of bounds.
+
+Given the problem sizes are exact multiples of our chosen tiles (M=384 divisible by 64, N=192 by 128? Wait, 192/128 = 1.5. Not divisible!)
+
+Ah! N=192. If BN=128, then blockIdx.x=0 covers n=0..127, blockIdx.x=1 covers n=128..255 but N=192, so n=192..255 is out of bounds. We need a boundary check.
+
+Similarly, M=384/64=6 exactly. K=384/64=6 exactly.
+
+But N=192 / 128 = 1.5. So the last tile has only 64 valid columns.
+We need to handle BN not dividing N.
+
+Alternative: Use BN=64. Then 192/64 = 3 exactly. And M=384/64 = 6 exactly. Both divide perfectly!
+
+If BN=64, then tiles per batch = 6 * 3 = 18. Total blocks = 1728. This is even better for parallelism!
+
+Let&#x27;s go with BN=64. Then:
+- BM=64, BN=64, BK=64.
+- smemA: 64*64*2 = 8KB
+- smemB: 64*64*2 = 8KB
+- Total: 16KB.
+
+Thread arrangement: 16x16 (256 threads). Each thread computes 4 rows x 4 cols = 16 elements.
+- base_row = thread_m * 4 (thread_m = tid / 16)
+- base_col = thread_n * 4 (thread_n = tid % 16)
+
+For B: 4 halfs per thread in N. Can read as 2 half2 or 1 float2.
+For A: 4 halfs per thread in M. Read as 4 separate halfs (smemA[base_row + i][k]).
+
+Wait, if base_col = thread_n * 4, then float2 covers 4 halfs and base_col is multiple of 4. Address alignment: k*(BN+PAD) + base_col. BN+PAD=66. k*66 + base_col. For base_col multiple of 4, address in bytes = 2*(k*66 + base_col). For k even, k*66 is even (66*even = even). So address is even + multiple of 8 = multiple of 8. Good for float2. For k odd, k*66 is even as well (66*odd = even). Actually 66 is even. So k*66 is always even. Thus address is always 2*(even + multiple of 4) = multiple of 8 + multiple of 8 = multiple of 8. Float2 (8 bytes) alignment guaranteed. Excellent!
+
+For smemA[base_row+i][k], we read individual halfs. Fine.
+
+Boundary check:
+During loading, we should guard against K and N overflow. But since K=384 is divisible by BK=64, and M=384 by BM=64, the only issue is the last block&#x27;s N boundary... wait, N=192 is divisible by BN=64. 192/64 = 3. So NO boundary issues for this problem! All dimensions divide evenly.
+
+But we should still write a general kernel for correctness.
+
+Actually, to keep it simple and fast, I&#x27;ll write the kernel with general bounds checks only where needed, but the compiler can optimize away the ones that are always false for our problem.
+
+Kernel outline:
+
+```cuda
+template&lt;int BM, int BN, int BK, int PAD_A=2, int PAD_B=2&gt;
+__global__ void bmm_perm0213_kernel(
+    const half* A,
+    const half* B,
+    half* D,
+    int batch, int M, int N, int K, int D1, float alpha
+) {
+    __shared__ half smemA[BM][BK + PAD_A];
+    __shared__ half smemB[BK][BN + PAD_B];
+
+    int b = blockIdx.z;
+    int m0 = blockIdx.y * BM;
+    int n0 = blockIdx.x * BN;
+    int tid = threadIdx.x;
+
+    int warp_id = tid &gt;&gt; 5;
+    int lane_id = tid &amp; 31;
+
+    // Thread arrangement: 16x16
+    int thread_m = tid / 16;      // 0..15
+    int thread_n = tid % 16;      // 0..15
+
+    // Check if this block is valid (it always is for our sizes but check anyway)
+    if (b &gt;= batch || m0 &gt;= M || n0 &gt;= N) return;
+
+    // Accumulators
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i &lt; 4; ++i)
+        for (int j = 0; j &lt; 4; ++j)
+            acc[i][j] = 0.0f;
+
+    // Main loop over K
+    for (int k0 = 0; k0 &lt; K; k0 += BK) {
+        // Load A tile [BM][BK] from global to shared
+        // 256 threads, each loads 16 halfs = 2 float4
+        int a_tid = tid;
+        #pragma unroll
+        for (int l = 0; l &lt; 2; ++l) {
+            int offset = a_tid * 16 + l * 8; // 16 halfs per thread, 8 per float4
+            int row = offset / BK;
+            int col = offset % BK;
+            if (row &lt; BM &amp;&amp; k0 + col &lt; K &amp;&amp; m0 + row &lt; M) {
+                float4 val = *reinterpret_cast&lt;const float4*&gt;(
+                    A + ((b * M + (m0 + row)) * K + (k0 + col))
+                );
+                *reinterpret_cast&lt;float4*&gt;(&amp;smemA[row][col]) = val;
+            }
+        }
+
+        // Load B tile [BK][BN] from global to shared
+        // 256 threads, each loads 16 halfs = 2 float4
+        int b_tid = tid;
+        #pragma unroll
+        for (int l = 0; l &lt; 2; ++l) {
+            int offset = b_tid * 16 + l * 8;
+            int row = offset / BN;
+            int col = offset % BN;
+            if (row &lt; BK &amp;&amp; k0 + row &lt; K &amp;&amp; n0 + col &lt; N) {
+                float4 val = *reinterpret_cast&lt;const float4*&gt;(
+                    B + ((b * K + (k0 + row)) * N + (n0 + col))
+                );
+                *reinterpret_cast&lt;float4*&gt;(&amp;smemB[row][col]) = val;
+            }
+        }
+
+        __syncthreads();
+
+        // Compute tile
+        int base_row = thread_m * 4;
+        int base_col = thread_n * 4;
+
+        #pragma unroll
+        for (int k = 0; k &lt; BK; ++k) {
+            float a_vals[4];
+            #pragma unroll
+            for (int i = 0; i &lt; 4; ++i) {
+                a_vals[i] = __half2float(smemA[base_row + i][k]);
+            }
+
+            float b_vals[4];
+            // Load B row k, cols base_col..base_col+3 as float2 (4 halfs = 8 bytes)
+            float2 b01 = *reinterpret_cast&lt;float2*&gt;(&amp;smemB[k][base_col]);
+            const half2* b_h2 = reinterpret_cast&lt;const half2*&gt;(&amp;b01);
+            b_vals[0] = __half2float(__low2half(b_h2[0]));
+            b_vals[1] = __half2float(__high2half(b_h2[0]));
+            b_vals[2] = __half2float(__low2half(b_h2[1]));
+            b_vals[3] = __half2float(__high2half(b_h2[1]));
+
+            #pragma unroll
+            for (int i = 0; i &lt; 4; ++i) {
+                float av = a_vals[i];
+                #pragma unroll
+                for (int j = 0; j &lt; 4; ++j) {
+                    acc[i][j] += av * b_vals[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write output with permute
+    int b0 = b / D1;
+    int b1 = b % D1;
+    int base_row = thread_m * 4;
+    int base_col = thread_n * 4;
+
+    #pragma unroll
+    for (int i = 0; i &lt; 4; ++i) {
+        int m_out = m0 + base_row + i;
+        if (m_out &gt;= M) continue;
+        int n_out_base = n0 + base_col;
+        if (n_out_base &gt;= N) continue;
+
+        int idx = b0 * M * D1 * N + m_out * D1 * N + b1 * N + n_out_base;
+        
+        // Produce 4 halfs
+        half2 o0 = __halves2half2(
+            __float2half(alpha * acc[i][0]),
+            __float2half(alpha * acc[i][1])
+        );
+        half2 o1 = __halves2half2(
+            __float2half(alpha * acc[i][2]),
+            __float2half(alpha * acc[i][3])
+        );
+        
+        // Only write if within bounds
+        if (n_out_base + 1 &lt; N)
+            *reinterpret_cast&lt;half2*&gt;(&amp;D[idx]) = o0;
+        else if (n_out_base &lt; N)
+            D[idx] = __float2half(alpha * acc[i][0]);
+            
+        if (n_out_base + 3 &lt; N)
+            *reinterpret_cast&lt;half2*&gt;(&amp;D[idx + 2]) = o1;
+    }
+}
+```
+
+Wait, I see an issue with the float2 reinterpretation from smemB. `smemB` is `half smemB[BK][BN+PAD_B]`. `&amp;smemB[k][base_col]` yields `half*`. Reinterpreting this as `float2*` and loading should be fine if aligned. But does shared memory allow float2 loads from arrays declared as half? Yes, as long as the pointer is aligned. We established alignment is correct (multiple of 8 bytes). But the compiler might not know alignment and generate slower code. We can cast to `(const float2*)(smemB[k] + base_col)` or similar.
+
+Actually, a cleaner way: 
+```cuda
+const half* bptr = smemB[k] + base_col;
+float2 b01 = *reinterpret_cast&lt;const float2*&gt;(bptr);
+```
+
+This is fine.
+
+However, wait - `smemB` is a 2D array. `smemB[k]` is a pointer to row k. So `smemB[k] + base_col` is correct.
+
+One more thing: the loading loops. Let me recalculate.
+
+For A tile [64][64]:
+Total elements: 4096. Each thread loads 16 elements (2 float4).
+256 threads * 16 = 4096. Good.
+offset = tid * 16 + l * 8 where l=0,1. This gives offsets tid*16 and tid*16+8, each covering 8 halfs (1 float4).
+Wait, offset is in halfs. row = offset / 64, col = offset % 64.
+For tid=0: l=0: offset=0, row=0, col=0. Load float4 at A[0..7].
+         l=1: offset=8, row=0, col=8. Load float4 at A[8..15].
+For tid=1: l=0: offset=16, row=0, col=16. Load float4 at A[16..23].
+This is perfectly coalesced and contiguous.
+
+For B tile [64][64]:
+Total elements: 4096. 256 threads * 16 = 4096.
+offset = tid * 16 + l * 8.
+row = offset / 64, col = offset % 64.
+This means consecutive threads handle different rows? row = offset / 64.
+tid=0: offset 0..15 -&gt; row 0, cols 0..15.
+tid=1: offset 16..31 -&gt; row 0, cols 16..31.
+tid=2: row 0, cols 32..47.
+tid=3: row 0, cols 48..63.
+tid=4: row 1, cols 0..15.
+This is coalesced within a warp because threads 0..3 access row 0 contiguously (0..63 bytes in the row). Thread 4 jumps to next row (stride N). In a warp of 32 threads: rows 0..7, each with 4 threads accessing contiguous 32-byte chunks. This is fine. The hardware will issue 8 memory transactions per load pass (one per row), but that&#x27;s expected.
+
+Actually, we can improve B loading by transposing the threads: assign threads to rows and chunks within row differently to maximize coalescing. But the current scheme is already decent.
+
+Alternatively, we can load B using the same pattern as A but transposed or however. Actually, looking at B&#x27;s global layout: B[b, k, n] is row-major with N as the inner dimension. In the tile, row corresponds to k and col corresponds to n. The offset formula `row * N + col` means that consecutive columns are consecutive in memory. Our loading pattern for B: within a row, 4 threads handle columns 0..15, 16..31, 32..47, 48..63 with 8 halfs each. Wait, 16 halfs per thread = 2 float4. Each float4 is 8 halfs = 16 bytes. So each thread handles two 16-byte chunks within the row.
+
+For tid=0..3 in row 0: they handle cols 0..15, 16..31, 32..47, 48..63. These are contiguous chunks. In a warp, threads 0..3 read from the same row but contiguous addresses. The warp would issue one or two wide transactions for the whole 64 bytes. Then threads 4..7 read row1, another transaction, etc. This is very efficient! Because threads in a warp reading from the same row but contiguous addresses can be merged into few transactions.
+
+Actually, wait: 4 threads per row each read 2 float4 (32 bytes total per thread). Per row, 128 bytes total. These 128 bytes are perfectly contiguous. A warp reading rows 0..7 handles 8 such 128-byte segments. Since rows are separated by N*2 bytes = 384 bytes, they can&#x27;t be merged across rows. So the warp issues 8 transactions of 128 bytes each. Very clean.
+
+Similarly for A: each row has 64 halfs = 128 bytes. 4 threads per row read the whole row contiguously. A warp reads 8 rows. But A rows are separated by K*2 = 768 bytes. So 8 transactions of 128 bytes each. Also very clean.
+
+This is excellent.
+
+Now, let me verify the `__launch_bounds__`. With 256 threads and using ~40-50 registers, we should be fine. I can add `__launch_bounds__(256)` to help the compiler.
+
+Also, for H100 (sm_90), I should compile with `-arch=sm_90`. The compile flags in load_inline should include this. Or `-gencode arch=compute_90,code=sm_90`.
+
+One more optimization: use `__restrict__` on pointers.
+
+Also, I should check if using `float2` to load from `smemB` is safe with alignment. base_col = thread_n * 4. Since smemB row has BN+PAD=66 halfs = 132 bytes. Address of `smemB[k][base_col]` = k * 132 + base_col * 2. base_col is a multiple of 4, so base_col * 2 is a multiple of 8. k*132 for any k: 132 is multiple of 4, actually 132 = 4 * 33. So k*132 is divisible by 4 but not necessarily by 8. If k is odd, k*132 = 132, 396, etc. 132 / 8 = 16.5. So for odd k, k*132 is NOT divisible by 8! 
+
+Oh no! This means `&amp;smemB[k][base_col]` is NOT aligned to 8 bytes for odd k! That means `float2` loads would be misaligned for odd k, and could crash or be slow.
+
+We need to fix alignment. Options:
+1. Ensure BN+PAD is a multiple of 4 halfs (8 bytes). If BN+PAD is a multiple of 4, then k*(BN+PAD)*2 is a multiple of 8 for all k only if (BN+PAD)*2 is a multiple of 8, i.e., BN+PAD is a multiple of 4. BN=64, if PAD=4, then BN+PAD=68, not a multiple of 4. If PAD=0, BN=64, which IS a multiple of 4. But then we&#x27;d have bank conflicts.
+
+Wait, why do we need padding? Padding is to avoid bank conflicts. If we don&#x27;t pad at all (PAD=0), then row k starts at k*BN. For shared memory bank indexing, a 32-bit access at offset `k*BN + base_col`. Since BN=64, k*64 + base_col. In bytes: `2*(k*64 + base_col)`. Word address: `(k*64 + base_col)/2 = k*32 + base_col/2`. Bank = (k*32 + base_col/2) % 32 = (base_col/2) % 32. This means all threads with the same base_col/2 access the same bank! That&#x27;s a huge conflict because base_col = thread_n * 4, so base_col/2 = thread_n * 2. For thread_n=0: bank 0. thread_n=1: bank 2. thread_n=2: bank 4. So threads in a warp access banks 0, 2, 4, 6, ..., 30 for the first half2. And for the second half2 (base_col+2): banks 1, 3, 5, ..., 31. So no conflict within a single load of half2! But what about loading 2 half2s (float2)? float2 covers 4 halfs. base_col spans 4 halfs. So it covers banks base_col/2 and base_col/2+1. For thread_n=0: banks 0 and 1. thread_n=1: banks 2 and 3. No conflict! Actually, without padding, the bank for B access at row k, col c is (k*64 + c)/2 % 32. For c=0..3 (float2 from base_col=0): banks (k*32) % 32 + 0/2 = 0 and (k*32) % 32 + 2/2 = 1. For the next thread with base_col=4: banks 2 and 3. No conflicts.
+
+Wait, I was wrong. The bank index formula: bank = (addr_in_bytes / 4) % 32 for 32-bit mode. Actually, the exact formula depends on the access width. For shared memory bank calculation on Ampere/Hopper: each bank is 4 bytes. The bank of a 32-bit word is (word_index % 32). For a 64-bit access, it uses 2 banks. For a 128-bit access, it uses 4 banks.
+
+For half elements (2 bytes), accessing a single half might map to a 32-bit bank? Actually, two consecutive halfs occupy one 32-bit bank slot. So a half2 (4 bytes) occupies exactly 1 bank. A float2 containing 4 halfs (8 bytes) occupies 2 banks.
+
+The bank index for a half2 at byte address `addr` is `(addr / 4) % 32`.
+For `smemB[k][c]` where c is the half index:
+byte_addr = (k * (BN+PAD) + c) * 2.
+For BN+PAD = 64 (no padding):
+byte_addr = (k * 64 + c) * 2.
+For half2 at c=0: byte_addr = k * 128. bank = (k * 128 / 4) % 32 = (k * 32) % 32 = 0. 
+For c=4: byte_addr = k*128 + 8. bank = (k*32 + 2) % 32 = 2.
+So regardless of k, the bank depends only on c! That&#x27;s good - no k-dependent bank conflicts.
+For thread_n=0: c=0, bank=0. thread_n=1: c=4, bank=2. thread_n=2: c=8, bank=4... etc. These are all different banks! No bank conflict for reading half2.
+
+For float2 (4 halfs) at c=0: spans banks 0 and 1 (8 bytes = 2 words = 2 banks).
+At c=4: spans banks 2 and 3. At c=8: spans 4 and 5. No conflict between threads!
+
+So NO PADDING IS NEEDED for smemB to avoid bank conflicts in the compute phase! The bank index is independent of k because the row stride is a multiple of 32 banks * 4 bytes = 128 bytes. And BN=64 halfs = 128 bytes per row.
+
+Wait, 64 halfs per row = 128 bytes. 128 bytes / 4 bytes per bank = 32 banks exactly. So the next row starts at the same bank as the previous row! But that doesn&#x27;t matter because at any given k, all threads read from the SAME row k. The bank is determined by the column. Since different threads read different columns, and the columns are spaced by 4 halfs (8 bytes = 2 banks), there is no conflict.
+
+So we can set PAD_B = 0!
+
+Similarly for A: smemA[BM][BK]. Row stride = BK = 64 halfs = 128 bytes = 32 banks exactly.
+Bank for smemA[row][k] read as a half: byte_addr = (row * 64 + k) * 2. The half itself spans 2 bytes, part of a 4-byte bank. Reading a single half by itself might cause a mixed bank issue? Actually, reading a single 16-bit value from shared memory: on Ampere+, 16-bit loads are supported. The bank is determined by the byte address / 2 or / 4? I need to be careful.
+
+According to CUDA docs: The bank of a 32-bit word is its index % 32. For accesses smaller than 32 bits, the bank is determined by the address divided by the bank width? Actually, for 16-bit accesses, two 16-bit accesses to the same 32-bit word bank might conflict. But a single 16-bit access should be fine, mapping to the bank containing that address.
+
+If we read individual halfs from smemA[base_row+i][k]:
+byte_addr = ( (base_row + i) * 64 + k ) * 2.
+Word_addr = byte_addr / 4 = ( (base_row + i) * 64 + k ) / 2.
+If (base_row+i)*64 + k is even, word_addr is integer. But row*64 + k could be odd or even. For row=0, k=1: odd. Then word_addr = 1/2 which is not integer.
+
+Actually, half elements at addresses 0-1, 2-3, 4-5, etc. A half at byte address 0 and a half at byte address 2 are in banks 0 and 1 respectively. A half at byte address 1 would be problematic (unaligned).
+
+But our k values: smemA is loaded as float4 from col=0,8,16... So all loads are half-aligned. The indices k and base_row+i are integers. The byte address is always even. For a single half at even byte address, it resides in bank = (byte_addr / 4) % 32 or (byte_addr / 2) % 32? 
+
+I recall that each bank is 4 bytes. A 16-bit access to shared memory is handled by one bank. If we read a half at byte address 0, it is in bank 0. At byte address 2, it is in bank 1. At byte address 4, bank 1. Wait, address 0-3 is bank 0. Address 4-7 is bank 1. So byte_addr / 4 = bank.
+
+Wait, if bank 0 holds bytes 0-3, bank 1 holds bytes 4-7, etc:
+- half at byte 0: spans bytes 0-1, in bank 0.
+- half at byte 2: spans bytes 2-3, in bank 0.
+- half at byte 4: spans bytes 4-5, in bank 1.
+
+So two consecutive halfs at byte 0 and byte 2 are in the same bank! That means reading them separately could conflict if done by different threads simultaneously. BUT: threads in a warp read smemA[base_row+i][k] for different i. base_row+i varies. The byte address difference is 64*2 = 128 bytes = 32 banks. So row i and row i+1 differ by 32 banks = 0 mod 32. Wait, 128/4 = 32 exactly. So row i and row i+1 access the SAME bank for the same k!
+
+Uh oh! That means if thread_m=0 reads smemA[0][k] (bank k/2 mod 32 or something) and thread_m=1 reads smemA[4][k], then row 4 is offset by 4*128 = 512 bytes = 128 banks = 0 mod 32. So they access the SAME bank! And if k is the same, the exact address is different but in the same bank. Actually, if two addresses are in the same bank but different, that&#x27;s a bank conflict!
+
+Wait, let&#x27;s calculate exactly:
+smemA[row][k] byte address = (row * 64 + k) * 2.
+Bank = floor(byte_addr / 4) % 32 = floor((row * 64 + k) / 2) % 32.
+For row=0: bank = floor(k/2) % 32.
+For row=1: bank = floor((64 + k)/2) % 32 = floor(32 + k/2) % 32 = (32 + floor(k/2)) % 32 = floor(k/2) % 32. 
+So row 0 and row 1 have the SAME bank for the same k! Indeed, because 64/2 = 32.
+
+This is a 2-way conflict for A if two threads read rows differing by 1. But in our design, a thread reads 4 rows: base_row, base_row+1, base_row+2, base_row+3. These all have the same bank for the same k! If a warp has threads reading 32 different rows (actually our warp only reads 8 rows: 0..7 for warp 0), then for a fixed k, these 8 rows map to only floor(8/2) = something... Wait:
+
+For fixed k, bank = floor((row*64 + k)/2) % 32.
+Row 0 and 1: same bank.
+Row 2 and 3: same bank (offset = floor(128/2)=64, 64%32=0).
+Row 4 and 5: same bank.
+Row 6 and 7: same bank.
+So 8 rows map to 4 unique banks.
+
+But within a warp, there are 16 threads with base_row=0 (reading rows 0..3) and 16 threads with base_row=4 (reading rows 4..7). Wait no, warp 0: lane 0..15 have base_row=0. Each reads rows 0,1,2,3 sequentially. For a given k iteration, each thread reads 4 separate halfs from shared memory. The reads are sequential in the thread. In a warp, all 32 threads execute together. Do they all read row 0 first? Yes, effectively, the reads for i=0 happen simultaneously for i=0 across all threads. Thread in lane 0 reads smemA[0][k]. Lane 1 reads smemA[0][k] also (since both have base_row=0). Actually, lanes 0..15 all have base_row=0, so they all read smemA[0][k] at the same time. That&#x27;s a broadcast! No conflict.
+Then they read smemA[1][k] simultaneously. Again broadcast.
+Then smemA[2][k], broadcast.
+Then smemA[3][k], broadcast.
+
+Then lanes 16..31 have base_row=4. They read smemA[4][k], broadcast. Etc.
+
+Within a single warp, for i=0: 16 threads read row 0 (same address = broadcast). 16 threads read row 4 (same address = broadcast). These two different addresses are in banks: floor(k/2)%32 and floor((256+k)/2)%32 = floor(k/2 + 128)%32 = floor(k/2)%32. Same bank! Even though they are different addresses, they are in the same bank. This is a 2-way bank conflict for the first load! Because the 32 threads are doing two broadcasts on the same bank.
+
+Wait, but lanes 0..15 and 16..31 are in the same warp executing simultaneously. smemA[0][k] and smemA[4][k] are at byte addresses (0*64+k)*2 and (4*64+k)*2 = (256+k)*2. The difference is 512 bytes = 128 words = 4 full cycles of 32 banks. So bank = word_addr % 32.
+Word_addr0 = floor((0+k)/2). Word_addr4 = floor((256+k)/2) = 128 + floor(k/2).
+128 % 32 = 0. So word_addr4 % 32 = floor(k/2) % 32 = word_addr0 % 32.
+Yes, same bank!
+
+So reading rows 0 and 4 simultaneously causes a 2-way bank conflict. Similarly, reading rows 1 and 5 (which happens next) also conflict. But wait, the threads don&#x27;t execute perfectly in lockstep for the 4 unrolled reads? In practice, the compiler might interleave them, but roughly yes.
+
+To fix this, we need rows to map to different banks. The bank depends on floor((row * BK + k)/2) % 32. For this to be different for row and row+4, we need BK not divisible by 64. If BK=64, then 4 rows offset by 256 halfs = 128 words = 0 mod 32.
+
+Solution: make BK an odd number of banks when multiplied by row difference? No, the problem is that 2*BK is a multiple of 128 bytes (32 banks * 4 bytes). For BK=64, 2*BK = 128 bytes = 32 banks. So any row difference that makes row*BK a multiple of 64 will cause same bank.
+
+If we use BK=66 (pad by 2), then 2*BK=132 bytes. Row difference of 1 -&gt; 132/4 = 33 banks -&gt; 1 mod 32. Row difference of 2 -&gt; 66 mod 32 = 2. Row difference of 4 -&gt; 132 mod 32 = 4. All different! That&#x27;s why padding works.
+
+So for smemA, we absolutely need PAD_A &gt; 0, and preferably such that (BK+PAD) is odd to make row difference map to different banks. With BK=64, PAD_A=2 gives 66. 66*2=132 bytes. 132/4=33 words. 33 % 32 = 1. So consecutive rows differ by 1 bank. Great.
+
+But then the float4 loading alignment issue arises for B, not A. For smemA, we load float4. Address = (row*(BK+PAD) + col) * 2. For row, col from global load: col is a multiple of 8. So address has byte component (row*66 + col)*2. For alignment to 16 bytes (float4), (row*66 + col) must be divisible by 8.
+col is multiple of 8. row*66 must be divisible by 8 for all row? 66 is not divisible by 8. row*66 mod 8 = row*2 mod 8 (since 64 is divisible by 8). So row*2 mod 8 is 0 when row is even, 2 when row=1, 4 when row=2, 6 when row=3, etc.
+So for odd row, row*66*2 has an offset of 4 bytes (2 halfs) mod 16. Adding col (multiple of 8) gives addresses that are 8-byte aligned but not 16-byte aligned for odd rows!
+
+Example: row=1. row*66 = 66. 66*2 = 132 bytes. 132 / 16 = 8.25. Not divisible by 16. col=0: addr=132. Not divisible by 16. So float4 load to odd rows is 4-byte aligned but not 16-byte aligned. That&#x27;s an alignment issue!
+
+Hmm, this is a real problem. We need to load A as float4. But with padding 2, odd rows are not 16-byte aligned.
+
+Solution: 
+Option 1: Don&#x27;t use float4 for loading A into smemA. Use half2 (4 bytes) or just half. But half2 loads are always 4-byte aligned, and with col multiple of 8, half2 at col=0 is aligned. For row=1, addr=132. 132 is divisible by 4 (yes, 132=33*4). So half2 is fine. But we lose some loading bandwidth.
+Option 2: Use a different padding or layout for A. If we know M=384 and K=384, we could transpose A in shared memory. But that&#x27;s more complex.
+Option 3: Don&#x27;t use shared memory for A at all? Or use shared memory with a different structure like [BK][BM] (transposed). If we load A into smemA as [BK][BM+PAD], then when we load from global, the layout might be different.
+
+Actually, let&#x27;s think about transposing A in shared memory. If we declare `__shared__ half smemA[BK][BM + PAD_A]`, then during loading we write:
+  smemA[col][row] = A[m][k].
+This is a transposed copy. The load from global is coalesced (row is contiguous in A). The store to shared memory writes to different rows of smemA (col indices), each thread writes to a different row? That might cause bank conflicts in shared memory stores, but if we use vectorized stores, maybe not.
+
+For compute phase, reading smemA[k][m] gives A[m][k] value. Since k is the loop variable and m is different per thread, we want smemA[k][m] to be bank-conflict-free. With smemA as [BK][BM+PAD], consecutive k values are in the leading dimension. For fixed k, smemA[k][m] accesses are along the second dimension. If BM+PAD makes the stride odd in words, we avoid conflicts.
+
+Actually, if we transposed A in shared memory:
+- `__shared__ half smemA[BK][BM + PAD_A];`
+- Loading: `smemA[col][row] = A[row_global][col_global];`
+- During compute: `a_val = smemA[k][m_local];`
+- For float4 loading into smemA: since we load A globally as float4 along K dimension, we&#x27;d be loading 8 K-values for a fixed M. But storing them into smemA would mean writing into 8 different rows of smemA (since col varies). This is not vectorized in the shared memory store. We can still do it with 8 half stores per thread or 4 half2 stores.
+
+Alternatively, for A, we can just load with 4 half2 stores per thread (8 halfs each). The load pattern I designed earlier with 2 float4 loads per thread requires alignment. Instead, use 4 half2 loads? Wait, 16 halfs per thread = 8 half2. That&#x27;s 8 loads. A bit more than 2 float4. But total is still manageable.
+
+Actually, for smemA with PAD=0 (BK=64), we can load with half2: each half2 is 4 bytes. Alignment at row, col: (row*64 + col)*2. For col multiple of 2, address is multiple of 4. Good. For col=0, address is row*128. For all rows, this is multiple of 128, thus divisible by 4. Good.
+
+But we saw that for A compute reads, rows differ by 4 map to same bank if BK=64. However, the compute read pattern is: each thread reads 4 consecutive rows. If threads within a warp read rows 0..3 and 4..7 simultaneously, there are bank conflicts (2-way). But if we reorder the warps or threads so that a warp doesn&#x27;t simultaneously read rows that map to the same bank?
+
+In our thread assignment:
+warp 0: lanes 0..15 -&gt; base_row=0 (rows 0..3); lanes 16..31 -&gt; base_row=4 (rows 4..7).
+Rows 0,4 -&gt; same bank. Rows 1,5 -&gt; same bank. 2,6 -&gt; same. 3,7 -&gt; same.
+So indeed 2-way conflict for each of the 4 reads.
+
+If we change to 4 warps along M (each warp 16 rows) and 2 along N? Let&#x27;s see:
+Block M=64. 4 warps along M means each warp handles 16 rows. With 256 threads (8 warps), we could arrange as 4x2 (M x N).
+Warp 0: rows 0..15. Warp 1: rows 16..31. Warp 2: rows 32..47. Warp 3: rows 48..63.
+Then for A reads, all threads in a warp read from rows 0..15 (different rows) but same bank pairs. Still conflict: 16 threads might map to only 8 banks. But wait, the reads are broadcast per row! Because all threads in a warp that need row 0 read the same address. In warp 0, do all threads read row 0? Let&#x27;s see.
+
+If thread arrangement is 16x16 and warp 0 handles thread_m 0..1. Each thread handles 4 rows. So warp 0 handles rows 0..7. Not 0..15.
+
+What if we change the thread-output assignment so that each thread handles 1 row and 16 columns? Then 256 threads = 16 rows x 16 columns. Warp handles different columns for the same 1 or 2 rows.
+Actually, with 8 warps, 2x4 arrangement:
+- Warp 0: rows 0..7, cols 0..15. Each thread in warp handles 4 rows x 4 cols? No, 256 threads / 8 warps = 32 threads per warp. If warp handles 8 rows x ? cols.
+  
+Let me try a different mapping: thread_m = tid &amp; 15 (0..15), thread_n = tid &gt;&gt; 4 (0..15). So 16 threads along M, 16 along N. Each thread handles 4 rows x 4 cols.
+Warp (32 threads): for tid 0..31, thread_m = tid &amp; 15 (0..15, 0..15), thread_n = tid &gt;&gt; 4 (0 or 1).
+So warp 0 handles threads with thread_n=0,1 and thread_m=0..15. That means rows: thread_m*4 to thread_m*4+3 for thread_m=0..15, which is ALL 64 rows. But only columns 0..3 and 4..7 (2 column groups). So warp 0 computes a 64x8 tile.
+
+For A reads: warp 0 needs rows 0..63. All 64 rows! But each thread needs only 4 rows. So for i=0, threads read rows 0,4,8,...60 (base_row = thread_m*4). 16 different rows! Do they map to 16 different banks?
+Bank = floor((row*64 + k)/2) % 32.
+Row differences are multiples of 4. row*64 difference: 4*64=256. 256/2=128. 128 % 32 = 0. So rows differing by 4 are in the same bank! 
+Rows 0,4,8,12,... all map to bank floor(k/2)%32. But threads read DIFFERENT rows. If 4 threads read 4 different rows that all map to the same bank, that&#x27;s a 4-way bank conflict!
+
+Mapping threads to consecutive rows:
+What if each thread handles 1 row and 16 columns? 64 rows, so 64 threads for rows. 256/64 = 4 threads per column group. 16 cols per thread. 64 threads * 16 cols = 1024, but we need 64*64=4096. No.
+
+Actually, we need exactly 4096 elements / 256 threads = 16 elements per thread. We want to avoid multiple threads in a warp accessing the same bank for smemA.
+
+The issue is that smemA[row][k] with BK=64 has period of 2 rows for banks (since row*64/2 = row*32, same bank for row and row+... wait, row*32 % 32 = 0 for all row? floor((row*64+k)/2) = row*32 + floor(k/2). Mod 32: floor(k/2) % 32. This means the bank depends ONLY on k, not on row! 
+
+Wait, I made a mistake earlier. Let&#x27;s recalculate. 
+Bank for 32-bit access: word_addr = floor(byte_addr / 4). byte_addr = (row * BK + k) * 2.
+word_addr = floor((row * BK + k) * 2 / 4) = floor((row * BK + k) / 2).
+For BK=64: word_addr = floor(row*64 + k)/2 = 32*row + floor(k/2).
+Bank = word_addr % 32 = floor(k/2) % 32.
+YES! For BK=64, the bank for reading A[row][k] is independent of the row! Any thread reading the same k but different row accesses the SAME bank. This is the fundamental issue. It&#x27;s not just row differences of 4. ALL rows map to the same bank for the same k.
+
+But if multiple threads read the same address, it&#x27;s broadcast (no conflict). If they read different addresses in the same bank, it&#x27;s a conflict. Since all rows map to the same bank for fixed k, if a warp reads 8 different rows simultaneously, that&#x27;s an 8-way bank conflict! 
+
+However, if we read the same row, it&#x27;s broadcast. In our original mapping, threads with the same base_row read the same 4 rows. For i=0, all threads with base_row=0 read row 0. That&#x27;s broadcast. Then for i=1, all read row 1. Broadcast. But threads with base_row=4 read row 4 at the same time. Row 0 and row 4 are in the same bank but different addresses -&gt; 2-way conflict.
+
+The only way to avoid A bank conflicts with BK=64 is to ensure that all threads in a warp read the SAME row at the same time. That means all threads in a warp must have the same base_row. But each warp has 32 threads. If they all have the same base_row, they handle 4 rows total? Wait, if all 32 threads have base_row = 0, they all handle rows 0..3. Then the warp only computes 4 rows and 64 columns? 4*64 = 256 elements. 256 elements / 32 threads = 8 elements per thread. That&#x27;s okay. Then 64 rows / 4 = 16 such row groups. We&#x27;d need 16 warps (512 threads) or we process multiple row groups per block. But we only have 8 warps.
+
+Alternatively, a warp could handle 8 rows, 64 cols = 512 elements. 512/32 = 16 elements per thread. That&#x27;s perfect. If all threads in the warp have base_row = warp_id * 8, then for i=0 all read row warp_id*8 (broadcast). For i=1 all read row warp_id*8+1 (broadcast). BUT: threads in a warp all read different columns, not different rows for A. For A, each thread needs 4 rows (the same set for all threads in the warp). And all threads read row r simultaneously. Different warps read different rows. Since different warps are not in lockstep (they execute separately or interleaved), there is no intra-warp bank conflict. Wait! Warps are executed independently on the SM. Two different warps in the same block can access shared memory simultaneously, but conflicts are per warp, not per block. Shared memory bank conflicts are only within a warp! 
+
+I completely forgot this! Shared memory bank conflicts only occur when threads WITHIN THE SAME WARP access different addresses in the same bank. Threads in different warps don&#x27;t cause bank conflicts with each other because they are scheduled separately (or at least the bank conflict logic is per-warp instruction).
+
+So the issue is only within a warp. In our original design, warp 0 had half the threads with base_row=0 and half with base_row=4. For i=0, 16 threads read row 0 and 16 read row 4. Both are in the same bank but different addresses = 2-way conflict. 
+BUT if we instead assign a warp so that all 32 threads have the SAME base_row, then there is no conflict within the warp! Because for i=0, all 32 threads read row base_row (same address = broadcast). For i=1, all read row base_row+1 (broadcast). etc.
+
+But wait, if all threads in the warp have the same base_row, they all handle the same 4 rows. Then how do they cover the 64 columns? Thread_n varies 0..15, each handling 4 different columns. So all 32 threads in the warp compute a 4-row x 64-column tile. That&#x27;s only 256 elements per warp. With 8 warps, that&#x27;s 2048 elements. But our block tile is 64x64 = 4096 elements. We&#x27;d need 16 warps. Or we need to have each warp compute 8 rows x 64 cols, with all threads having the same base_row for each sub-iteration.
+
+Actually, we can restructure: a warp computes a 8x64 tile, where all 32 threads work on the same 8 rows at a time. Specifically:
+- A warp handles 8 rows (base_row to base_row+7). 
+- Threads handle columns: thread_n = 0..7 (each handles 8 columns). 8 threads need columns, so we have 4 groups of 8 threads each handling the same rows but different columns. Wait, with 32 threads, if thread_n ranges 0..7, then 4 threads share each thread_n. They could read A together. 
+- Each thread computes 8 rows x 8 cols = 64 elements. 32 threads * 64 = 2048 elements. That&#x27;s a 8x64 tile? Actually 64 rows? No, if each thread computes 8 rows, together they compute 8 rows total (all threads read the same rows). So tile is 8 rows x 256 cols? But we only have 64 cols in the block.
+
+Let&#x27;s think differently. Let a warp compute a M_SUB x N_SUB tile.
+If M_SUB=8, N_SUB=64. Elements = 512. Each thread computes 512/32 = 16 elements. Thread handles 2 rows x 8 cols = 16 elements.
+All 32 threads in the warp:
+- Read A for the same 2 rows (base_row and base_row+1). Thread i reads these 2 rows for all its columns.
+Actually, for A, each thread only needs 2 A values per k (one for each row it handles). If all threads handle different pairs of rows... Let&#x27;s say warp computes 8 rows, 64 cols.
+Thread j (0..31): handles row pair base_row + (j/16)*2 + (j%16&gt;=8?1:0)? This is getting messy.
+
+A cleaner approach: Let each warp compute a 32x16 tile (as I thought earlier), with thread_m = tid / 16, thread_n = tid % 16. But change so that threads within a warp do not have base_rows that conflict.
+
+If we use thread_m = tid / 16, then in a warp (tid 0..31), thread_m = 0..1. Base rows 0 and 4 (since each thread handles 4 rows). That&#x27;s the conflict.
+
+What if each thread handles 1 row and 16 columns? Then thread_m = tid (0..31), but that only covers 32 rows. Warp handles 32 rows x 16 cols = 512 elements. 8 warps could cover 64 rows x 64 cols if arranged 2 warps in row and 4 in col. 
+Wait: 
+- Warp arrangement: 2 warps along M (each 32 rows? No, 1 warp = 32 threads. If each thread handles 1 row, a warp handles 32 rows. 2 warps along M = 64 rows. Good.)
+- 4 warps along N (each handles 16 cols? 32 threads * 16 col/thread = 512 cols. That&#x27;s too many. We only have 64 cols.)
+  
+What if each thread handles 8 cols and 1 row? 32 threads per warp = 32 rows. 64 rows / 32 = 2 warps along M. 64 cols / 8 = 8 column groups. So 8 warps along N. 2*8 = 16 warps needed. But we only have 8 warps total (256 threads).
+
+What if each thread handles 2 rows x 4 cols = 8 elements? 32 threads per warp = 256 elements. Block is 4096 elements. 4096/256 = 16 warps. Still too many.
+
+We need to fit 4096 elements into 8 warps * 32 threads = 256 threads. That&#x27;s 16 elements per thread. 
+With 16 elements per thread, let&#x27;s try 2 rows x 8 cols per thread. Then a warp of 32 threads: if all threads have the same 2 rows, they cover 2 rows x 256 cols. Too many cols (block only has 64). So not all threads can share the same rows if we only have 64 cols.
+
+What if a warp handles 8 rows x 64 cols = 512 elements. 512 / 32 = 16 elements per thread. 
+Threads arranged as 4x8 (4 row groups, 8 col groups). Each thread handles 2 rows x 2 cols = 4 elements? 4*32=128. Not enough.
+Wait, 8 rows * 64 cols = 512. 512 / 32 = 16 elements per thread. 
+We can do: threads in a warp are arranged as 8x4. thread_m = tid / 4 (0..7), thread_n = tid % 4 (0..3).
+Each thread handles 1 row x 16 cols? thread_m identifies a unique row among 8. thread_n identifies a group of 16 cols among 64 (thread_n*16 to thread_n*16+15). That gives 8 rows x 64 cols. 1*16 = 16 elements per thread. Total 512.
+
+Now, within a warp:
+- Threads have unique thread_m (0..7), so they all read DIFFERENT rows of A.
+- For fixed k, all 32 threads read different rows. But if BK=64, all these addresses are in the same bank! 32-way bank conflict! 
+
+However, what if the threads read A sequentially or in groups? The compiler might try to load all at once. We can instead have all threads read the same row of A in a sub-loop.
+
+Example: for i = 0..7:
+  row = base_row + i
+  a_val = smemA[row][k]
+  // all threads read the same row
+  // broadcast, no conflict!
+  for j (each thread&#x27;s columns):
+    acc += a_val * b_vals[j]
+
+But if each thread accumulates for a different row, then we need to iterate over the 8 rows and each thread picks its own. The loop would be:
+
+for i=0..7:
+  half a_shared = smemA[base_row + i][k]; // all threads read different rows: CONFLICT!
+  if (thread_m == i) // impossible in SIMD, all threads execute all iterations
+
+This doesn&#x27;t fix the conflict because all threads participate in every iteration.
+
+What if we have 8 sub-warps? No.
+
+Alternative: make the warp compute a tile where all threads share the same row. This requires the warp tile to have height 1 (or few). But then we need more warps to cover height 64. With 32 threads per warp, each thread handling 16 cols, a warp computes 1 row x 512 cols. Our block is 64x64, so 64 warps needed for rows. Not feasible.
+
+So we MUST accept some bank conflicts for A, OR add padding to smemA to make banks differ by row.
+
+If we add PAD_A=2, BK_eff=66. Then bank depends on row: floor((row*66+k)/2)%32. Consecutive rows differ by 33 words = 1 bank. So 8 different rows map to 8 different banks. For a warp reading 8 different rows simultaneously: no bank conflicts! (assuming no two threads read the exact same bank allocation).
+
+Wait, with 32 threads in a warp reading 8 unique rows, only 8 banks are used (one per row). The other 24 banks are idle. No conflict! Beautiful.
+
+But we had the alignment issue for loading A with float4 when PAD_A=2.
+
+Smaller idea: don&#x27;t load A with float4. Load with half2. 16 halfs per thread = 8 half2 loads. This is more instructions but avoids the alignment issue.
+
+Or, we can use PAD_A=0 but make threads in a warp read a subset of rows that don&#x27;t conflict. For BK=64, rows 0 and 1 conflict (same bank). Rows 0 and 2 also conflict? floor((0*64+k)/2) = floor(k/2). floor((2*64+k)/2) = 64 + floor(k/2). 64 % 32 = 0. Same bank! 
+Row r maps to bank floor((r*64+k)/2)%32 = (r*32 + floor(k/2))%32 = floor(k/2)%32. So ALL rows map to the same bank for A.
+
+With PAD_A=2: bank = floor((r*66+k)/2)%32 = (r*33 + floor(k/2))%32. Consecutive rows differ by 1 bank. Row r and r+32 differ by 32*33 = 1056. 1056%32 = 0. So rows differing by 32 map to the same bank. But we only have 64 rows max. So in a block of 64 rows, rows r and r+32 conflict.
+
+In our 64-row block, warp 0 might read rows 0..7. All different banks (0..7 offset from base). No conflict. Warp reading rows 0..31: uses banks floor(k/2)+0..31 mod 32 = all banks, no conflict! But a warp reading 32 different rows would use all 32 banks, no conflict! 
+
+If a warp handles 32 rows (all different), and assigns each thread to a unique row, then A access is conflict-free! Because each thread touches a different bank.
+
+So the winning strategy:
+- Use smemA with PAD_A=2 (BK=66).
+- In compute phase, ensure threads within a warp read different rows of A (or at least don&#x27;t have two threads reading different addresses in the same bank).
+- Since rows 0..31 use 32 different banks (for fixed k) and rows 32..63 use the same banks as 0..31, we should not have a warp reading from both row &lt;32 and row&gt;=32 simultaneously.
+
+Let&#x27;s use a warp tile of 32 rows x 16 cols.
+- A warp has 32 threads. Each thread handles 1 row x 16 cols? That&#x27;s 16 elements. 32 threads * 16 = 512 elements. Warp tile is 32x16.
+- A block of 64x64 needs: 2 rows of warps (each covers 32 rows) x 4 cols of warps (each covers 16 cols). Total 2*4 = 8 warps. Perfect!
+
+Now:
+- Warp assigned to rows R..R+31, cols C..C+15.
+- Thread j in warp (0..31): handles row R+j, cols C..C+15.
+- Thread computes 16 elements: row fixed, 16 columns.
+
+For A read: thread j reads smemA[R+j][k]. Since R+j are 32 consecutive rows, they map to 32 different banks. Conflict-free! (As long as R &lt; 32, so R+j span 0..31 or 32..63. If they span 0..31, banks are all different. If they span 32..63, banks are also all different, but same set as 0..31.)
+Actually, rows 32..63 map to the same banks as 0..31. But within a warp, only one of these ranges is used, not both. So within the warp, all 32 addresses map to different banks? Let&#x27;s verify:
+Bank(r) = floor((r*66+k)/2) % 32 = (r*33 + floor(k/2)) % 32.
+For r = R, R+1, ..., R+31. The banks are (R*33 + i*33 + floor(k/2)) % 32 for i=0..31.
+The step is 33 % 32 = 1. So as i goes 0..31, banks step through 32 consecutive values mod 32, covering all banks exactly once. Yes! Perfect, no bank conflicts.
+
+For B read: thread reads smemB[k][C..C+15] (16 columns). With BN=64 and no padding (or pad to avoid conflicts in B). Let&#x27;s check B banks:
+Bank for smemB[k][c] (reading 16 cols as 4 float2 or 8 half2): 
+With BN=64, byte_addr = (k*64 + c)*2. Bank = floor((k*64+c)/2) % 32 = (k*32 + floor(c/2)) % 32 = floor(c/2) % 32.
+For a thread reading c=C..C+15, it accesses banks floor(C/2) to floor(C/2)+7. These are 8 consecutive banks.
+For adjacent threads: if threads handle adjacent C values (spaced by 16), thread 0 reads banks floor(C/2)..floor(C/2)+7. Thread 1 reads banks floor(C/2)+8..floor(C/2)+15. No overlap! Great.
+For the whole warp, threads read from 32 column ranges. Since there are only 32 banks total, and ranges don&#x27;t overlap, this is conflict-free.
+
+Wait, what about float2 access? float2 covers 4 halfs = 8 bytes = 2 banks. If thread reads at c=C, it uses banks floor(C/2) and floor(C/2)+1. Next thread reads C+16, banks floor(C/2)+8 and floor(C/2)+9. No overlap. Good.
+
+So B can use PAD_B=0 (BN=64).
+
+For B loading, with BN=64 and no padding, alignment:
+Address = (b * K + k0 + row) * N + (n0 + col).
+N=192. n0 is a multiple of 64. col is multiple of 8.
+For B tile load, we can still use float4 if the address is aligned. Address of B[row][col_global] = ... + col_global. col_global = n0 + col. n0 is multiple of 64. col is multiple of 8. So col_global is multiple of 8. Is it multiple of 16 (for float4)? Not necessarily. n0 could be 0, 64, 128. 64 is multiple of 16. 128 is multiple of 16. So yes, n0+col is multiple of 16. Float4 alignment satisfied.
+And (k0+row)*N: k0 is multiple of 64. N=192=64*3. So k0*row*N is multiple of 64*192, which is huge and definitely multiple of 16. So B loads are aligned.
+
+For A loading with PAD_A=2 in shared memory, we can&#x27;t use float4. But we can use half2. A global address alignment: A[row][col_global] = ... + col_global. col_global = k0 + col. k0 multiple of 64. col multiple of 8. So col_global multiple of 8. half2 alignment (4 bytes) satisfied. Float4 requires 16 bytes, but col_global multiple of 8, not necessarily 16. If k0=0, col=0: col_global=0, aligned. If k0=0, col=8: col_global=8, not divisible by 16. Float4 not aligned. So half2 is the safe choice.
+
+So, to summarize the new design:
+- BM=64, BN=64, BK=64
+- PAD_A = 2 (smemA is 64 x 66)
+- PAD_B = 0 (smemB is 64 x 64)
+- Block: 256 threads = 8 warps
+- Warp arrangement: 2 warps along M (each covers 32 rows), 4 warps along N (each covers 16 cols). 
+  Warp index: warp_m = warp_id / 4 (0 or 1), warp_n = warp_id % 4 (0..3).
+  Warp tile: rows [warp_m*32, warp_m*32+31], cols [warp_n*16, warp_n*16+15].
+- Thread in warp: lane_id = tid % 32.
+  Thread handles 1 row and 16 cols.
+  thread_m = lane_id (0..31) -&gt; row offset within warp tile.
+  thread_n = 0 (only one column group of 16) -&gt; col offset = 0.
+- Each thread computes acc[16] for row = warp_m*32 + lane_id, cols = warp_n*16 + (0..15).
+  16 elements per thread.
+
+For A reads in compute:
+  row = warp_m * 32 + lane_id
+  a_val = smemA[row][k]  // all 32 threads read different rows, 32 different banks. Perfect.
+
+For B reads in compute:
+  base_col = warp_n * 16
+  For each k, thread reads B[k][base_col + j] for j=0..15.
+  This can be done as 4 float2 loads (each 4 halfs) or 8 half2 loads.
+  Address: &amp;smemB[k][base_col]. base_col is multiple of 16. BN=64. Alignment: k*64*2 + base_col*2 = k*128 + base_col*2. base_col=0,16,32,48. base_col*2 = 0,32,64,96. k*128 is multiple of 128. So address is multiple of 32, but is it multiple of 8? Yes, 32 is divisible by 8. Float2 (8 bytes) alignment is satisfied! 
+  Wait, k*128 + base_col*2:
+  For k=0, base_col=0: 0, aligned.
+  For k=0, base_col=16: 32, divisible by 8. Yes.
+  For k=1, base_col=0: 128, divisible by 8. Yes.
+  So float2 alignment is always satisfied. Great!
+  
+  For float4 (16 bytes): address must be divisible by 16. k*128 is always divisible by 16. base_col*2 = 0, 32, 64, 96. All divisible by 16 except 32 and 96! 32 mod 16 = 0? 32/16=2. Yes, 32 is divisible by 16. 96/16=6. Yes! So all base_col*2 values are divisible by 16. So float4 alignment is also satisfied!
+
+Wow. So for B, we can read float4 (8 halfs) in one go. Each thread reads 2 float4 for its 16 cols. Perfect.
+
+For A loading into smemA (64x66):
+Each thread loads elements. Total elements: 64*64 = 4096. 256 threads -&gt; 16 elements per thread.
+But smemA is declared as 64x66, and we only fill the first 64 columns. The padding columns (64, 65) are unused.
+We can load with half2. 16 halfs = 8 half2.
+Each half2 load is 4 bytes. Global alignment: col_global is multiple of 8 (since we load 8 halfs per batch? Let&#x27;s see).
+
+Global A: col_global = k0 + col. col ranges 0..63. Loading 16 halfs per thread with half2: each thread handles col offset. 
+If offset = tid*16 + j*2 for j=0..7. Then col = j*2..j*2+1 within the 16-element segment. But tid*16 ensures the base is multiple of 16? tid*16 is always multiple of 16. Yes. So col_global = k0 + tid*16 + j*2. For j=0: col_global is multiple of 16 (since k0 is multiple of 64 and tid*16 is multiple of 16). Wait, k0 multiple of 64, yes. tid*16 multiple of 16, yes. So col_global multiple of 16. Great for half2 alignment (4 bytes) and even float4 alignment (16 bytes)! 
+Wait, but we said A loading with float4 might not be aligned if col_global=8 for some threads? Let&#x27;s re-examine.
+
+If we assign offset = tid * 16 + l * 8? No, if each thread loads 16 consecutive halfs starting at tid*16, then:
+tid=0: col=0..15
+tid=1: col=16..31
+tid=2: col=32..47
+tid=3: col=48..63
+
+Each 16-element chunk starts at multiple of 16. k0 is multiple of 64. So col_global starts at multiple of 16. Float4 requires 16-byte alignment (8 halfs). 16 halfs = 32 bytes. So loading a 16-half chunk as 2 float4: first float4 at 0, second at 8 halfs. The second one starts at col_global+8. If col_global is multiple of 16, col_global+8 is multiple of 8 halfs. Is it multiple of 16 halfs? No, it&#x27;s multiple of 8 halfs = 16 bytes. Float4 is 16 bytes (8 halfs). So col_global+8 is 8 halfs offset from col_global. If col_global is 0, then +8 is at byte 16 (relative), which is float4 aligned. If col_global is 16, +8 is at 24 halfs, byte 48, which is divisible by 16? 48/16 = 3. Yes. 
+
+So for any thread, the two float4 loads are at offsets tid*16 and tid*16+8 (in halfs). In bytes: tid*32 and tid*32+16. Both are multiples of 16. And the global base is b*M*K + m0*K + k0. k0 is multiple of 64. Is m0*K + k0 always multiple of 16 halfs? m0 is multiple of BM=64. K=384. m0*K is multiple of 64*384 = 24576 halfs = 49152 bytes. Definitely multiple of 16. k0 multiple of 64 halfs = 128 bytes. Multiple of 16. So base address is multiple of 16. 
+
+Therefore, A loading can use float4 as well! Even with smemA having PAD_A=2. Because global loads only depend on global alignment, not shared memory layout. The shared memory store address might be misaligned for odd rows, but stores to shared memory don&#x27;t require the same alignment as global loads? Actually, writing float4 to shared memory does require 16-byte alignment of the shared memory address. If smemA[row][col] is not 16-byte aligned for odd rows, the store will fault or be slow.
+
+So we CANNOT use float4 stores to smemA for odd rows. We must use half2 or individual stores.
+
+For A loading to shared memory, each thread can perform 8 half2 loads and 8 half2 stores to smemA. But that&#x27;s 8 load+store pairs per thread. Alternatively, we can use the `__pipeline_memcpy_async` (cp.async) from global to shared memory, which handles misalignment gracefully? Actually, cp.async has alignment requirements too.
+
+The simplest safe approach: each thread loads 8 half2 from global to register, then writes 8 half2 to smemA. Total 8 + 8 = 16 memory instructions. The compute phase has 64 * (1 load A + 2 float2 loads B + 16 FMAs) = 64 * 19 = 1216 instructions. So 16 extra for loading is fine.
+
+Wait, can we use `*reinterpret_cast&lt;float4*&gt;(smemA[row])` for the whole row when row is even? For row=0, col=0: address=0, aligned. For row=2, address=2*66*2=264. 264/16=16.5. Not aligned. 66 is odd, so even*66 is even, but not necessarily multiple of 8 in halfs. 2*66=132 halfs. 132/8 = 16.5. Not divisible by 8. So float4 fails for row=2 as well.
+
+What if we set PAD_A to make row_stride_in_bytes = (BK + PAD_A) * 2 a multiple of 16? 
+(BK+PAD)*2 divisible by 16 =&gt; BK+PAD divisible by 8.
+BK=64. PAD must be multiple of 8 to make 64+PAD divisible by 8. So PAD=0, 8, etc.
+But PAD=0 causes bank conflicts. PAD=8 makes BK+PAD=72. Then bank separation: 72/2 = 36 words. 36 % 32 = 4. So rows differ by 4 banks. 
+And alignment: row_stride = 72*2 = 144 bytes. 144/16 = 9. So for a float4, any row is aligned! Let&#x27;s check: row*144 must be divisible by 16.
+row=0: 0. row=1: 144/16=9. Yes. row=2: 288/16=18. Yes. Because 144 is divisible by 16.
+So PAD_A=8 works for alignment! And row_stride in words is 72. Bank difference per row = 72/2 = 36 words. 36 % 32 = 4. So consecutive rows differ by 4 banks.
+Since step is 4, a full cycle of 32 banks takes 8 rows. Rows 0..7 use 8 different banks. If a warp reads 32 different rows (e.g., rows 0..31), they use banks: for row r, bank = (r*36 + floor(k/2))%32 = (r*4 + c)%32. For r=0..31, r*4 mod 32 cycles through 0,4,8,12,16,20,24,28 and repeats 4 times. Wait, that&#x27;s not all 32 banks! It&#x27;s only 8 banks, each used by 4 rows.
+Oh no. If step is 4 mod 32, then rows r and r+8: (r+8)*4 = r*4 + 32 = r*4 mod 32. Same bank! So rows 0 and 8, 1 and 9, etc. conflict.
+
+If we need ALL 32 rows in a warp to map to different banks, we need step to be coprime to 32. i.e., odd. Like step=33 (from PAD=2). Step=1, 3, 5, ..., 31. 
+BK=64, PAD=2 =&gt; step=33. Good, but alignment issue. 
+BK=64, PAD=6 =&gt; step=35 = 3 mod 32. Coprime? gcd(35,32)=1. Yes! BK+PAD=70. row_stride_bytes=140. 140/16 = 8.75. Not divisible by 16. Float4 not aligned.
+BK=64, PAD=10 =&gt; step=37 = 5 mod 32. Coprime. BK+PAD=74. row_stride_bytes=148. 148/16=9.25. Not aligned.
+BK=64, PAD=14 =&gt; step=39 = 7 mod 32. Coprime. row_stride_bytes=156. 156/16=9.75. No.
+BK=64, PAD=18 =&gt; step=41 = 9 mod 32. Coprime. row_stride_bytes=164. 164/16=10.25. No.
+BK=64, PAD=30 =&gt; step=47 = 15 mod 32. Coprime. row_stride_bytes=188. 188/16=11.75. No.
+
+What about BK=64, PAD=34 =&gt; step=49 = 17 mod 32. Coprime. row_stride_bytes=196. 196/16=12.25. No.
+It seems any odd PAD makes BK+PAD = 64+odd = odd. Then row_stride_bytes = odd*2. For this to be divisible by 16, we need odd*2 divisible by 16 =&gt; odd divisible by 8. Impossible since odd is not divisible by 8.
+
+So with BK=64, there is no PAD that both makes step coprime to 32 AND makes row_stride divisible by 16. This means float4 stores to shared memory and coprime bank distribution are mutually exclusive for BK=64.
+
+Options:
+1. Don&#x27;t use float4 to smemA. Use half2 or smaller. Then PAD=2 works perfectly.
+2. Use a different BK, like BK=60. Then with PAD=2, BK+PAD=62 (even, not divisible by 4). row_stride_bytes=124. 124/16 not integer. Not aligned.
+   What BK values work? We need BK to be multiple of 8 (for vectorized global loads). And we need BK+PAD such that step=(BK+PAD)/2 is coprime to 32. AND (BK+PAD)*2 divisible by 16.
+   (BK+PAD)*2 divisible by 16 =&gt; BK+PAD divisible by 8.
+   And step=(BK+PAD)/2 must be odd (to be coprime to 32).
+   If BK+PAD is divisible by 8, then (BK+PAD)/2 is divisible by 4. So it cannot be odd. Contradiction!
+   
+   Wait. If BK+PAD is divisible by 8, then step = (BK+PAD)/2 is divisible by 4. gcd(step, 32) &gt;= 4. Not coprime.
+   
+   If BK+PAD is divisible by 8, then step is a multiple of 4. So it can&#x27;t be coprime to 32.
+   If step is coprime to 32, it must be odd. Then BK+PAD = 2*odd. Not divisible by 4. So row_stride_bytes = (BK+PAD)*2 = 4*odd. This is divisible by 4 but not by 8 or 16. Float4 (16 bytes) cannot be aligned for all rows.
+
+So indeed: we cannot simultaneously have float4 alignment for all rows of smemA AND have step coprime to 32. We must choose.
+
+BANK CONFLICTS ARE WORSE than unaligned float4 stores. Actually, unaligned float4 stores to shared memory are ILLEGAL (will fault). So we cannot use float4 for A smem stores unless we only use it on even rows or something. But that&#x27;s complicated.
+
+The easiest solution: don&#x27;t use float4 for A shared memory. Just load half2 from global and store half2 to smemA. Since global is aligned (col_global multiple of 8 halfs, which means half2 aligned; actually multiple of 16 halfs = multiple of 32 bytes, better), half2 loads from global are fast. 8 half2 loads per thread is perfectly fine.
+
+Similarly for B, float4 works because BN=64 makes row_stride_bytes = 128 = 8*16. All rows are aligned. And bank separation for B is fine because we read along columns within a fixed row.
+
+Also, note: we DON&#x27;T need coprime bank distribution for B because all threads in a warp read the same row k but different columns. For fixed k, all addresses are in the same row, so bank depends only on column. With BN=64, bank depends on floor(c/2). So as long as threads read different columns, they read different banks (or adjacent banks without conflict if using 64-bit). BN=64&#x27;s banking scheme is ideal for this: step=32 words = 0 mod 32 for row difference, but since we don&#x27;t read different rows in B during compute (all threads read row k), it&#x27;s fine.
+
+For A, with BK=66 (PAD=2), bank depends on row. Step=33. Ideal for reading different rows.
+
+So the final design is:
+- smemA: [64][66] half
+- smemB: [64][64] half
+- Load A: half2 from global, store half2 to smemA. 8 half2 per thread (16 halfs).
+- Load B: float4 from global, store float4 to smemB. 2 float4 per thread (16 halfs).
+- Compute:
+  - Warp tile: 32 rows x 16 cols.
+  - Thread: 1 row x 16 cols.
+  - A read: 1 half per k, no conflict.
+  - B read: 16 halfs per k as 2 float2 or 4 half2. Since all threads in warp read same row k, B accesses are conflict-free.
+  - FMA: 16 FMAs per k.
+  - Unroll BK=64.
+- Total blocks: 6 (M) * 4 (N, wait N=192, BN=64, so 3) * 96 (batch) = 1728. Wait, 6*3*96 = 1728. Yes.
+
+Wait, N=192, BN=64, so N tiles = 3. M=384, BM=64, so M tiles = 6. Total tiles per batch = 18. Total blocks = 18 * 96 = 1728.
+
+With 8 warps per block. 1728 blocks. 132 SMs. 13 blocks per SM on average. Enough to fill the GPU.
+
+Let me now write the exact kernel with this design.
+
+Thread indexing:
+- tid = threadIdx.x (0..255)
+- warp_id = tid / 32 (0..7)
+- lane_id = tid % 32 (0..31)
+- warp_m = warp_id / 3? Wait, N tiles per batch = 3. We have 4 warps along N? 
+  - Block covers 64 cols (BN=64). The block computes exactly one N tile because BN=64.
+  - N dimension has 3 tiles (0, 1, 2). So blockIdx.x is 0, 1, 2.
+  - Within the block, we cover all 64 cols. So we don&#x27;t need multiple warps along N for the compute tile! Wait, each block computes a full 64x64 tile. But earlier I said a warp computes 32x16, and 8 warps cover 64x64. Let&#x27;s check:
+    - Warp arrangement: 2 along M (32 rows each), 4 along N (16 cols each). 
+    - Total rows: 2 * 32 = 64. Total cols: 4 * 16 = 64. Yes.
+    - Warp IDs: warp_m = warp_id / 4 (0 or 1), warp_n = warp_id % 4 (0,1,2,3).
+    - So within the block, we DO have warps along N.
+
+Wait, but if BN=64, and a block computes exactly 64 cols, then blockIdx.x * 64 gives the n0. The block covers all 64 cols. Within the block, warp_n handles sub-ranges of N. So warp_n=0 handles cols 0..15, warp_n=1 handles cols 16..31, warp_n=2 handles cols 32..47, warp_n=3 handles cols 48..63.
+
+For B loading into shared memory: we load the entire 64x64 B tile. All warps participate. smemB is shared by all warps.
+For B compute reads: each warp reads from smemB[k][warp_n*16 + j]. Since all threads in all warps read row k simultaneously, but different warps read different column ranges. 
+Wait, do threads in warp 0 read smemB[k][0..15]? Threads in warp 1 read smemB[k][16..31] simultaneously.
+Are these accesses conflicting?
+For a fixed k, smemB[k][c] bank depends on floor(c/2).
+Warp 0 accesses c=0..15 -&gt; banks 0..7.
+Warp 1 accesses c=16..31 -&gt; banks 8..15.
+Warp 2 accesses c=32..47 -&gt; banks 16..23.
+Warp 3 accesses c=48..63 -&gt; banks 24..31.
+Since warps execute independently, but shared memory is a single resource. Can multiple warps execute simultaneously? SM executes one warp at a time per scheduler (4 schedulers per SM on H100). So at any given cycle, shared memory might see requests from 4 warps. If warp 0 and warp 1 are both issued, their requests for banks 0..7 and 8..15 do not overlap. No conflict! Even if they overlap, shared memory on H100 handles limited conflicts.
+
+Actually, modern GPUs can handle a certain number of bank conflicts per cycle. But this pattern is ideal. So B reads should be conflict-free across warps as well.
+
+For A reads: all warps read different rows. 
+Warp 0 (warp_m=0): rows 0..31. Banks: row*33 + c. Since rows 0..31 step by 33%32=1, they cover all 32 banks. 
+Warp 1 (warp_m=1): rows 32..63. Banks: 32*33 + r*33 + c = (r+32)*33 + c. Mod 32: r*33 + c mod 32. Since 32*33 = 1056, 1056%32=0. So rows 32..63 use the same banks as rows 0..31. 
+But warp 0 and warp 1 are executing independently. If they happen to execute on different schedulers simultaneously, their row accesses to smemA might target the same banks but with different addresses. This could still be okay because the memory array has multiple banks. Wait, if both warps request bank 0 at different addresses, it&#x27;s a conflict for that bank. However, does H100 shared memory handle multiple requests to the same bank? It serializes them. So if warp 0 and warp 1 both hit bank 0 (which they will, since rows 0 and 32 both map to bank c), then that&#x27;s a conflict.
+
+But wait! In the compute phase, we have:
+for k in 0..63:
+  smemA[...][k]
+  smemB[...][k]
+  
+For warp 0: row r. Bank = (r*33 + floor(k/2)) % 32.
+For warp 1: row r+32. Bank = ((r+32)*33 + floor(k/2)) % 32 = (r*33 + 1056 + floor(k/2)) % 32 = (r*33 + floor(k/2)) % 32. Same bank!
+
+So rows 0 and 32, 1 and 33, etc. are in the same bank. This means when warp 0 (rows 0..31) and warp 1 (rows 32..63) execute simultaneously and access smemA, there could be 2-way bank conflicts for every request pair that hits the same bank.
+
+Can we avoid this? We could rearrange the warp schedule or compute phase. But warps execute asynchronously. However, if the block has enough warps, the SM might schedule them on different cycles. But since the loop body is identical for all warps, they might stay in sync, causing conflicts.
+
+To truly avoid this, we need the bank mapping for rows 32..63 to be different from rows 0..31. With step=33, after 32 rows, the bank repeats. So row r and r+32 always conflict.
+
+This means we should only have at most 32 unique rows accessed simultaneously per block? Or we need a different PAD.
+
+What if we use PAD such that step mod 32 doesn&#x27;t repeat for the full range of 64 rows?
+Bank(r) = (r * step) % 32. We want this to be distinct for r=0..63. But modulo 32, there are only 32 values. By pigeonhole principle, 64 rows must share banks. Any choice of step will repeat after 32 rows.
+
+So having 64 rows in a block inevitably means row r and r+32 share a bank. But do warps reading these rows execute in the same cycle? 
+
+If the compute loop is fully unrolled and each iteration is a few instructions, warps might be out of phase due to different issue times. But if the block starts at the same time, they might be in sync.
+
+We can reduce the block tile height to 32 (BM=32). Then 384/32=12 M tiles. Tiles per batch: 12*3=36. Total blocks: 36*96 = 3456. That&#x27;s more parallelism and no row banking conflicts because each block only has 32 rows.
+But smaller BM means:
+- smemA: 32*66*2 = 4.2KB
+- smemB: 64*64*2 = 8KB
+- Total: 12.3KB. Still small.
+- More blocks = more parallelism. 3456 blocks for 132 SMs = 26 blocks per SM. Good.
+
+But is BM=32 enough for good data reuse? Each block computes 32x64 outputs. Read 32*384 + 64*384 = 36K halfs. Reuse factor: outputs/reads = 2048 / (36K/2 elements?) Wait.
+
+Actually, smaller tiles aren&#x27;t worse for compute-boundness on small problems. Since 3456 blocks give plenty of parallelism and we avoid bank conflicts, BM=32 might be better.
+
+What if BM=32, BN=128? N=192, BN=128 =&gt; 2 tiles. M tiles: 12. Total tiles: 24*96=2304.
+smemB: 64*128*2 = 16KB.
+smemA: 32*66*2 = 4.2KB. Total 20.5KB. Fine.
+Block output: 32*128 = 4096 elements. Same as before.
+Thread per block: 256. Each thread: 4096/256 = 16 elements. 1 row x 16 cols? 32 rows -&gt; 256 threads gives 1 row per 8 threads? Let&#x27;s see.
+Warp tile: if 8 warps. Warp arrangement 1x8? 1 along M (handles all 32 rows), 8 along N (each handles 16 cols). 
+Warp 0: rows 0..31 (32 rows), cols 0..15.
+Warp reads A: rows 0..31. 32 different rows -&gt; 32 different banks (with step=33). Perfect! A is conflict-free.
+Warp reads B: same row k, cols specific to warp. No conflicts.
+
+This is excellent! BM=32, BN=128, BK=64.
+
+Let&#x27;s verify:
+- M=384/32 = 12 tiles.
+- N=192/128 = 2 tiles (last tile has 64 valid columns if BN=128, but 192/128=1.5, so N tiles: 0..127, 128..191. Wait, 128*2=256 &gt; 192. So the second tile would have n0=128, and only columns 0..63 are valid. Our kernel must handle this!
+  Actually, for N=192 and BN=128, tile 0 covers 0..127, tile 1 covers 128..255 but N=192, so only 128..191 are valid. We need boundary checks.
+  
+- If BN=64, N tiles=3. All exact. No boundary issues.
+- If BM=32 and BN=64: M tiles=12, N tiles=3. Total 36 per batch * 96 = 3456 blocks.
+  Output per block: 32*64 = 2048 elements.
+  256 threads -&gt; 8 elements per thread.
+  Warp arrangement: 1 along M? 32 rows / 32 threads = 1 row per thread. Yes! 
+  Warp handles 32 rows x ? cols.
+  We need to cover 64 cols. 8 warps -&gt; 8 cols per warp? 64/8 = 8 cols per warp.
+  Then each thread handles 1 row x (8/1)? Wait, warp handles 32 rows x 8 cols = 256 elements. 32 threads -&gt; 8 elements per thread. 
+  Thread arrangement in warp: 32 threads. thread_m = lane_id (0..31) -&gt; each thread handles 1 unique row. thread_n = 0.. something.
+  Actually, warp covers 32 rows and 8 cols. 32 threads * 8 elements = 256. Perfect.
+  Each thread handles 1 row x 8 cols. 
+  A read: each thread reads its unique row. 32 different rows -&gt; 32 different banks (with step=33). Perfect.
+  B read: thread reads 8 cols. 8 cols = 4 half2 or 2 float2. 
+    Base_col = warp_n * 8. Warp_n = warp_id % 8.
+    All threads in warp read same row k, base_col..base_col+7.
+    Banks for B: base_col/2 to base_col/2+3. 
+    For warp_n=0: banks 0..3. warp_n=1: banks 4..7. etc. No overlap! Perfect.
+  FMA: 8 FMAs per k. 64 iterations -&gt; 512 FMAs per thread. Good.
+
+This is the cleanest design so far:
+- BM = 32, BN = 64, BK = 64
+- PAD_A = 2
+- PAD_B = 0
+- Block: 256 threads, 8 warps
+- Warp arrangement: 1x8 along (M, N). warp_m = 0, warp_n = warp_id (0..7).
+  Wait, only 1 warp along M because BM=32, and each warp handles 32 rows (1 per thread).
+  Warp along N: 8 warps, each handles 8 cols. BN=64, 64/8 = 8 cols per warp.
+- Each thread: 1 row x 8 cols = 8 accumulators.
+
+For A loading:
+- smemA [32][66]
+- 32 rows * 64 cols = 2048 halfs.
+- 256 threads -&gt; each loads 8 halfs = 4 half2.
+- Thread assignment for loading A: each thread can handle 8 elements.
+  offset = tid * 8.
+  row = offset / 64 (0..31)
+  col = offset % 64 (0..63, in steps of 8 per thread)
+  Each thread loads 4 half2 at col, col+2, col+4, col+6. Or 4 half2 at the same position? No, 8 halfs total.
+  Global address: A[b, m0+row, k0+col]. Coalesced? tid 0..31: row 0, cols 0..7? Wait, offset=0..255. tid*8.
+  tid=0: offset 0, row 0, col 0.
+  tid=1: offset 8, row 0, col 8.
+  tid=2: row 0, col 16.
+  ...
+  tid=7: row 0, col 56.
+  tid=8: row 1, col 0.
+  In a warp (32 threads): row 0 cols 0..56 (threads 0..7), row 1 cols 0..56 (8..15), row 2 cols 0..56 (16..23), row 3 cols 0..56 (24..31). Each thread loads 8 contiguous halfs = 4 half2. This is not fully coalesced because thread 0 reads at col 0, thread 1 at col 8, etc. But they are reading from the same row so 8 threads cover a contiguous 64-half segment. Can be merged into a few transactions. Then next 8 threads read next row. Fine.
+
+For B loading:
+- smemB [64][64]
+- 64 rows * 64 cols = 4096 halfs.
+- 256 threads -&gt; each loads 16 halfs = 2 float4.
+- offset = tid * 16.
+  row = offset / 64 (0..63)
+  col = offset % 64 (0, 16, 32, 48 for tid within a row group of 4)
+  Wait, tid*16. tid=0:0, tid=1:16, tid=2:32, tid=3:48, tid=4:64 -&gt; row 1, col 0.
+  In a warp (32 threads): rows 0..7, with 4 threads per row. Each thread loads 16 halfs (2 float4) starting at col = thread_in_row * 16. 
+  So row 0: threads 0..3 load cols 0..15, 16..31, 32..47, 48..63. Perfect coalescing! 4 threads cover the whole row contiguously. The warp handles 8 rows. Very similar to my earlier design.
+
+Now let me write out the kernel carefully with all indices.
+
+```cuda
+#define BM 32
+#define BN 64
+#define BK 64
+#define PAD_A 2
+
+__global__ void __launch_bounds__(256) bmm_perm0213(...)
+{
+    __shared__ half smemA[BM][BK + PAD_A];
+    __shared__ half smemB[BK][BN];
+
+    int b = blockIdx.z;
+    int m0 = blockIdx.y * BM;
+    int n0 = blockIdx.x * BN;
+    int tid = threadIdx.x;
+
+    int warp_id = tid &gt;&gt; 5;
+    int lane_id = tid &amp; 31;
+    int warp_n = warp_id; // 0..7, since BM=32 and each warp handles all 32 rows
+
+    // Warp covers cols [warp_n*8, warp_n*8+7] (8 cols)
+    // Thread covers row lane_id within the warp tile, and all 8 cols of the warp
+    int row = lane_id; // 0..31
+    int base_col = warp_n * 8; // 0,8,16,...,56
+
+    float acc[8];
+    #pragma unroll
+    for (int j = 0; j &lt; 8; ++j) acc[j] = 0.0f;
+
+    for (int k0 = 0; k0 &lt; K; k0 += BK) {
+        // Load A tile: each thread loads 8 halfs = 4 half2
+        int a_offset = tid * 8;
+        #pragma unroll
+        for (int l = 0; l &lt; 4; ++l) {
+            int col = a_offset + l * 2; // half2 elements
+            int a_row = col &gt;&gt; 6; // /64
+            int a_col = col &amp; 63; // %64
+            if (m0 + a_row &lt; M &amp;&amp; k0 + a_col &lt; K) {
+                half2 val = *reinterpret_cast&lt;const half2*&gt;(
+                    A + ((b * M + (m0 + a_row)) * K + (k0 + a_col))
+                );
+                smemA[a_row][a_col] = val.x;
+                smemA[a_row][a_col + 1] = val.y;
+            }
+        }
+
+        // Load B tile: each thread loads 16 halfs = 2 float4
+        int b_offset = tid * 16;
+        #pragma unroll
+        for (int l = 0; l &lt; 2; ++l) {
+            int col = b_offset + l * 8; // float4 = 8 halfs
+            int b_row = col &gt;&gt; 6; // /64
+            int b_col = col &amp; 63; // %64
+            if (k0 + b_row &lt; K &amp;&amp; n0 + b_col &lt; N) {
+                float4 val = *reinterpret_cast&lt;const float4*&gt;(
+                    B + ((b * K + (k0 + b_row)) * N + (n0 + b_col))
+                );
+                *reinterpret_cast&lt;float4*&gt;(&amp;smemB[b_row][b_col]) = val;
+            }
+        }
+
+        __syncthreads();
+
+        // Compute
+        #pragma unroll
+        for (int k = 0; k &lt; BK; ++k) {
+            float a_val = __half2float(smemA[row][k]);
+            // Load 8 halfs of B for this k and thread&#x27;s columns
+            float2 b01 = *reinterpret_cast&lt;float2*&gt;(&amp;smemB[k][base_col]);
+            float2 b23 = *reinterpret_cast&lt;float2*&gt;(&amp;smemB[k][base_col + 4]);
+            const half2* h2_01 = reinterpret_cast&lt;const half2*&gt;(&amp;b01);
+            const half2* h2_23 = reinterpret_cast&lt;const half2*&gt;(&amp;b23);
+            
+            half2 b0 = h2_01[0];
+            half2 b1 = h2_01[1];
+            half2 b2 = h2_23[0];
+            half2 b3 = h2_23[1];
+            
+            float b_vals[8];
+            b_vals[0] = __half2float(__low2half(b0));
+            b_vals[1] = __half2float(__high2half(b0));
+            b_vals[2] = __half2float(__low2half(b1));
+            b_vals[3] = __half2float(__high2half(b1));
+            b_vals[4] = __half2float(__low2half(b2));
+            b_vals[5] = __half2float(__high2half(b2));
+            b_vals[6] = __half2float(__low2half(b3));
+            b_vals[7] = __half2float(__high2half(b3));
+
+            #pragma unroll
+            for (int j = 0; j &lt; 8; ++j) {
+                acc[j] += a_val * b_vals[j];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write output with permute
+    int m_out = m0 + row;
+    if (m_out &gt;= M) return; // all m_out in block are valid if M divisible by BM
+    int n_out_base = n0 + base_col;
+    if (n_out_base &gt;= N) return;
+
+    int b0 = b / D1;
+    int b1 = b % D1;
+
+    int row_stride = D1 * N;
+    int batch_stride = M * row_stride;
+    
+    int idx = b0 * batch_stride + m_out * row_stride + b1 * N + n_out_base;
+    
+    // Write 8 halfs as 4 half2
+    #pragma unroll
+    for (int j = 0; j &lt; 4; ++j) {
+        half2 out = __halves2half2(
+            __float2half(alpha * acc[j*2]),
+            __float2half(alpha * acc[j*2+1])
+        );
+        *reinterpret_cast&lt;half2*&gt;(&amp;D[idx + j*2]) = out;
+    }
+}
+```
+
+Wait, I need to check the A loading loop more carefully.
+
+```cuda
+int a_offset = tid * 8;
+#pragma unroll
+for (int l = 0; l &lt; 4; ++l) {
+    int col = a_offset + l * 2; // l*2 because each half2 covers 2 elements
+```
+
+Wait, no. If a_offset is the number of half elements, and each iteration loads 1 half2 (2 half elements), then l=0: col = a_offset + 0, load half2 at col and col+1. 
+l=1: col = a_offset + 2, load at col+2 and col+3.
+...
+l=3: col = a_offset + 6, load at col+6 and col+7.
+Total 8 half elements. Correct.
+
+a_row = col / 64. But col increases by 2 each time. col ranges from a_offset to a_offset+6. 
+If a_offset is not a multiple of 64, a_row might stay the same for all 4 loads, which is correct.
+
+Let&#x27;s trace tid=0: a_offset=0. l=0: col=0, row=0, col=0. l=1: col=2, row=0, col=2. l=2: col=4, row=0, col=4. l=3: col=6, row=0, col=6.
+Wait, tid=0 loads 8 halfs: positions 0,1,2,3,4,5,6,7. That&#x27;s correct via 4 half2 loads at 0,2,4,6.
+tid=1: a_offset=8. l=0: col=8, row=0, col=8. l=1: col=10, row=0, col=10. etc.
+tid=7: a_offset=56. l=3: col=62, row=0, col=62.
+tid=8: a_offset=64. l=0: col=64, row=1, col=0.
+This is correct. Each row has 64 halfs, loaded by 8 threads (8*8=64). Each thread loads 4 half2 from the same row, spaced by 2.
+
+Is this coalesced for global memory? Tid 0..7 all read from row 0, columns 0..7, 8..15, etc. Thread 0: addr 0 and 2 (in halfs -&gt; bytes 0 and 4). Thread 1: addr 8 and 10 (bytes 16 and 20). These are interleaved. Actually, thread t within a row loads at bytes t*16 + l*4. So for a warp:
+Threads 0..7 (row 0): bytes 0,4,8,12,16,20,...,60. Then threads 8..15 (row 1): bytes 128,132,136,...,188. 
+Within 8 threads in a warp, they access bytes 0..60. That&#x27;s not perfectly merged into a single 128-byte transaction because each thread issues 4 separate 4-byte loads. But the hardware can merge the half2 loads. 8 threads accessing 32 half2 addresses that are 4 bytes apart and interleaved... This should be coalesced into 2 or 4 transactions per row. Not optimal like float4, but acceptable.
+
+Actually, can we load A with float2 (4 halfs = 8 bytes) for each thread? Global alignment requires 8 bytes. col_global is a_offset + l*4 (if float2 steps by 4 halfs).
+tid=0: l=0: col=0, l=1: col=4.
+tid=1: l=0: col=8, l=1: col=12.
+In warp, threads 0..7: cols 0..3, 8..11, 16..19, ..., 56..59.
+Each thread loads 2 float2. Row 0: 8 threads load 16 float2. Total 64 halfs. 
+Addresses: 0, 8, 16, 24, ..., 56 (in bytes, for first float2). Second: 8, 16, 24, ..., 64? 
+Wait, float2 = 8 bytes = 4 halfs. Thread 0 first float2: bytes 0..7 (halfs 0..3). Second: bytes 8..15 (halfs 4..7). Thread 1 first: bytes 16..23 (halfs 8..11).
+So in a warp: thread 0 loads 0..7 and 8..15. Thread 1 loads 16..23 and 24..31...
+These are perfectly contiguous! And 8-byte aligned: addresses 0, 8, 16, 24, ..., 56. All multiples of 8. Good. For the second float2: 8, 16, 24, ..., 64. But 64 is byte 64 for thread 7 second float2. Byte 64 is the start of row 1. So thread 7 second float2 straddles row boundary (halfs 56..59 and then 60..63 are in row 0... wait no, row 0 has halfs 0..63. Byte 64 is half 32. Float2 is 4 halfs. So thread 7 second float2 at col=56: halfs 56,57,58,59. Bytes 112..119. That&#x27;s fine. 
+Hmm, I think float2 is better than half2 for A loading because each thread issues fewer instructions: 2 loads instead of 4.
+
+Is float2 (4 halfs = 8 bytes) safe for A global loads? col_global = k0 + a_offset + l*4. k0 multiple of 64. a_offset = tid*8. For warp, tid 0..31, a_offset 0,8,16,...,248. l=0: col_global = multiple of 8 (k0 and a_offset multiples of 8? k0=0,64,128... and tid*8 is multiple of 8. So col_global is multiple of 8. But float2 needs 8-byte alignment. Is the global base address + col_global*2 divisible by 8? 
+base_byte = b*M*K*2 + m0*K*2 + k0*2.
+m0 is multiple of 32. K=384. m0*K*2 = multiple of 32*384*2 = 24576. Divisible by 8.
+k0*2 = multiple of 128. Divisible by 8.
+col_global*2: col_global is multiple of 8. times 2 = multiple of 16. Divisible by 8.
+So yes, 8-byte aligned for float2. Not necessarily 16-byte aligned for float4 because col_global may be multiple of 8 but not 16 (e.g., tid=1, col_global=8, 8*2=16 which IS divisible by 16! Actually tid=1 -&gt; 8. 8*2=16, yes divisible by 16. tid=2 -&gt; 16. 16*2=32, yes. All tid*8*2 = tid*16. Always divisible by 16. So float4 is 16-byte aligned too!)
+
+Wait, tid*8 halfs = tid*16 bytes. This is always divisible by 16. k0*2 = multiple of 128. Also divisible by 16. So A global loads can use float4! Let&#x27;s check the second float4 of a thread (l=1):
+col_global_offset = tid*8 + 4. In bytes: (tid*8 + 4)*2 = tid*16 + 8. For tid=0: 8. Not divisible by 16! So the second float4 is at offset 8, which is only 8-byte aligned, not 16-byte. So we cannot use float4 for the second load.
+
+But we can restructure: each thread loads two float4 but at offsets that are 16-byte aligned. If we load 16 halfs per thread, the natural breaks are 0..7 and 8..15. The first is 16-byte aligned, the second is 8-byte aligned. That&#x27;s why float4 doesn&#x27;t work for the second half.
+
+However, we can load A with 4 float2 instead. Each float2 is 8 bytes. Offsets: 0, 8, 16, 24 (in bytes, relative to thread start). All 8-byte aligned. Good.
+
+So for A, let&#x27;s use 4 float2 loads per thread (8 halfs total = 16 bytes).
+
+```cuda
+#pragma unroll
+for (int l = 0; l &lt; 4; ++l) {
+    int col = a_offset + l * 2; // in halfs; step by 2 halfs = 1 half2 = 4 bytes
+    // Actually if float2 covers 4 halfs = 8 bytes, step is 4 halfs.
+    int col = a_offset + l * 4;
+    int a_row = col &gt;&gt; 6; // /64
+    int a_col = col &amp; 63; // %64
+    // Wait, a_offset = tid*8. l*4. col = tid*8 + l*4.
+    // For tid=0: l=0: 0, l=1: 4, l=2: 8, l=3: 12.
+    // These are quarter-row chunks of 4 halfs each.
+    // Global: load float2 at a_col.
+}
+```
+
+Wait, tid=0: cols 0, 4, 8, 12. That&#x27;s 16 halfs. Good. Tid=1: cols 8, 12, 16, 20. Wait, tid*8 = 8. l=0: col=8, l=1: col=12, l=2: col=16, l=3: col=20.
+But tid=0 already loaded cols 0..3 and 4..7 and 8..11 and 12..15. Tid=1 loaded 8..11, 12..15, 16..19, 20..23.
+So threads 0 and 1 overlap on cols 8..11 and 12..15! That&#x27;s wrong!
+
+I see: a_offset should be tid * 16 if each thread loads 16 halfs. Then tid=0: 0..15. tid=1: 16..31.
+Then a_row = (a_offset + l*4) / 64.
+tid=0: l=0: col=0; l=1: col=4; l=2: col=8; l=3: col=12. All in row 0.
+tid=1: a_offset=16. l=0: col=16, row=0. l=1: col=20. l=2: col=24. l=3: col=28. Row 0.
+tid=3: a_offset=48. l=3: col=60. Row 0.
+tid=4: a_offset=64. l=0: col=64, row=1.
+Perfect. No overlap. Each thread loads 16 halfs in 4 float2 chunks of 4 halfs each.
+
+Global address alignment: col_global = k0 + col. col is multiple of 4. So col_global multiple of 4. In bytes: col_global*2 is multiple of 8. Float2 alignment (8 bytes) satisfied.
+
+Coalescing: tid 0..3: row 0, cols 0..3, 16..19, 32..35, 48..51.
+Hmm, tid=0: cols 0..3. tid=1: cols 16..19. tid=2: cols 32..35. tid=3: cols 48..51. 
+These are 16 bytes apart. In a warp, 8 threads (tid 0..3 and maybe more) might not be contiguous.
+Actually, in a warp of 32 threads, tid 0..3 handle row 0 at cols 0..3, 16..19, 32..35, 48..51. Tid 4..7 handle row 1 similarly. 
+The addresses are: for row r: base_r + 0, 32, 64, 96 bytes (for the 4 chunks per thread). Thread 0: base + 0. Thread 1: base + 32. Thread 2: base + 64. Thread 3: base + 96. Thread 4: base_r+1 + 0...
+These are interleaved but within 128-byte segments. The hardware should handle this fairly well, though not perfectly coalesced. But since A is 30MB total and K is small, L2 cache helps.
+
+Alternatively, we can load A by assigning threads to adjacent chunks:
+tid 0: cols 0..15. tid 1: cols 16..31. etc. as float4? No, float4 alignment of second chunk failed.
+Or assign 4 adjacent threads to load the whole row as float4:
+Threads 0..3: load row 0, cols 0..63 as 4 float4.
+Thread 0: cols 0..15? No, float4 is 8 halfs. 8 float4 per row (64/8=8). 256 threads / 8 = 32 rows. Wait, 32 rows * 8 float4 per row = 256 float4 loads. 256 threads, so 1 float4 per thread. That covers 32 rows (BM=32). Perfect!
+
+Better A loading:
+- Each thread loads 1 float4 = 8 halfs = 16 bytes.
+- 256 threads -&gt; 256 float4 = 2048 halfs. But A tile is 32*64 = 2048 halfs. Exactly.
+- Thread assignment: 
+  tid 0..255
+  a_row = tid / 8;   // 0..31 (32 rows)
+  a_chunk = tid % 8; // 0..7 (8 chunks per row)
+  a_col = a_chunk * 8; // 0, 8, 16, ..., 56
+  Load float4 at A[b, m0+a_row, k0+a_col].
+  
+Check alignment: a_col is multiple of 8. col_global = k0 + a_col. k0 multiple of 64. col_global multiple of 8. col_global*2 = multiple of 16. Float4 aligned! 
+And 8 float4 per row, loaded by 8 consecutive threads. In a warp (32 threads):
+- tid 0..7: row 0, cols 0..7, 8..15, ..., 56..63. Consecutive threads load consecutive 16-byte segments. This is perfectly coalesced!
+- tid 8..15: row 1. Next.
+- tid 16..23: row 2.
+- tid 24..31: row 3.
+Perfect float4 coalescing: 4 rows per warp, 8 transactions of 128 bytes? Actually, threads 0..7 load from row 0 contiguously. That&#x27;s 128 bytes (8 float4). It can be merged into one or two 128-byte transactions. Excellent.
+
+For storing to smemA: address = &amp;smemA[a_row][a_col]. a_row 0..31, a_col multiple of 8. 
+row_stride_in_bytes = 66 * 2 = 132 bytes.
+Address = a_row * 132 + a_col * 2.
+a_row * 132: for a_row=0: 0. a_row=1: 132. a_row=2: 264.
+Is this divisible by 16 (for float4 store)? 
+0: yes. 132: no (132/16=8.25). 264: no (16.5). 
+So float4 stores to smemA are unaligned for a_row&gt;=1. We cannot use float4 stores to smemA!
+
+We must use half2 or float2 stores.
+half2 = 4 bytes. Address must be 4-byte aligned.
+a_row * 132 + a_col * 2. a_col multiple of 8. So a_col*2 multiple of 16. a_row*132: 132 is divisible by 4? 132/4=33. Yes. So address is always divisible by 4. half2 aligned.
+float2 = 8 bytes. Need address divisible by 8.
+a_row*132: divisible by 4, but is it divisible by 8? 132 = 4 * 33, which is 4*odd. So a_row*132 is divisible by 8 only if a_row is even.
+For odd a_row, a_row*132 = 4*odd*33. 33 is odd. So 4*odd*odd = 4*odd. Not divisible by 8. 
+So float2 is only aligned for even rows.
+
+So we can use float2 for even rows and half2 for odd rows? Or just use half2 for all. 8 half2 stores per thread (16 halfs). That&#x27;s acceptable.
+
+Wait, we could transpose A in shared memory: smemA[k][m]. Then when storing, we write to column m (which is fixed per thread during load). Each thread loads one float4 from global (8 halfs along K for one row). Then stores them to smemA[k][a_row] for k=a_col..a_col+7. Since a_row is fixed per thread, and smemA is [BK][BM+PAD], the store addresses are:
+&amp;k = k * (BM+PAD) * 2 + a_row * 2.
+If BM+PAD=34 (32+2), stride=68 bytes. Address = k*68 + a_row*2.
+For k multiple of 2: k*68 is multiple of 136, which is divisible by 8 (136/8=17). For k odd: k*68 mod 8 = 4. So alignment for float2/half2 at consecutive k values alternates.
+For a float4 store (8 bytes), we need address divisible by 8. For k even: yes if a_row*2 is divisible by 8, i.e., a_row multiple of 4. Not always.
+
+Transposing A in shared memory doesn&#x27;t solve alignment either without careful choice of BM+PAD.
+
+Given the complexity, let me just use half2 for loading A into smemA. 8 half2 stores per thread. 256 threads * 8 = 2048 half2 stores. At shared memory bandwidth, this is fine.
+
+Actually, I can load float4 from global to register, then split into 4 half2 and write to smemA. The register gets full float4 bandwidth, and we write to shared memory with more instructions but still fast.
+
+```cuda
+// Load A with float4 from global
+for (int l = 0; l &lt; 2; ++l) {
+    int col = a_offset + l * 8; // 0, 8
+    int a_row = col &gt;&gt; 6; // /64
+    int a_col = col &amp; 63; // %64
+    if (...) {
+        float4 val = *reinterpret_cast&lt;const float4*&gt;(...);
+        // write 4 half2 to smemA
+        const half2* h2 = reinterpret_cast&lt;const half2*&gt;(&amp;val);
+        smemA[a_row][a_col] = h2[0].x; // wrong syntax
+    }
+}
+```
+
+Better:
+```cuda
+half2 h2_0, h2_1, h2_2, h2_3;
+*reinterpret_cast&lt;float4*&gt;(&amp;h2_0) = val;
+```
+
+No. Let&#x27;s just load half2 directly from global. Simpler and safe.
+
+```cuda
+#pragma unroll
+for (int l = 0; l &lt; 8; ++l) {
+    int global_col = a_offset + l * 2; // 2 halfs per half2
+    int a_row = global_col &gt;&gt; 6; // /64
+    int a_col = global_col &amp; 63; // %64
+    if (m0 + a_row &lt; M &amp;&amp; k0 + a_col &lt; K) {
+        half2 val = *reinterpret_cast&lt;const half2*&gt;(
+            A + ((b * M + (m0 + a_row)) * K + (k0 + a_col))
+        );
+        smemA[a_row][a_col]     = __low2half(val); // Actually half2 has .x and .y?
+        smemA[a_row][a_col + 1] = __high2half(val);
+    }
+}
+```
+
+Wait, `half2` in CUDA has fields `.x` and `.y`. But we can also just store the half2 to smemA using reinterpretation if aligned. `a_col` is multiple of 2, and address is 4-byte aligned for even rows, but for odd rows? `a_row*132 + a_col*2`. For a_col even, a_col*2 is multiple of 4. a_row*132 is multiple of 4 (132=4*33). So address is multiple of 4. half2 aligned.
+
+```cuda
+*reinterpret_cast&lt;half2*&gt;(&amp;smemA[a_row][a_col]) = val;
+```
+
+This is cleaner. And it&#x27;s safe because we proved 4-byte alignment for half2.
+
+Now, let&#x27;s finalize the kernel.
+
+One more thing: in the compute loop, I want to make sure the compiler generates good code. The inner loop is 64 iterations. We can fully unroll it for maximum performance if register pressure allows. With BM=32, we have 8 accumulators per thread (float), plus a_val (float), b_vals[8] (float). That&#x27;s 17 floats = 68 bytes. Plus indexing. Total registers maybe ~30-40. Safe. We can fully unroll for K tile.
+
+I will add `#pragma unroll` for the k loop. The compiler will decide whether to fully unroll. Given BK=64, full unroll might be large. But H100 has good instruction cache. `#pragma unroll` without a number should unroll small loops. For 64, it might be large. I can use `#pragma unroll 8` or `#pragma unroll 16`.
+
+Actually, let&#x27;s not force full unroll. The compiler knows best. I&#x27;ll use `#pragma unroll`.
+
+Wait, for the loading loops (8 iterations for A, 2 for B), `#pragma unroll` is safe.
+
+Now let me compile and test this. I need to write the full code for `ModelNew`.
+
+I realize that the initial code I wrote was wrong (used BM=64 and had boundary issues for N=192). I need to write the corrected version.
+
+Wait, the user already showed me my previous submission attempt. Actually no, I haven&#x27;t submitted. The first response was my initial attempt at the kernel. I need to compile it, test it, iterate. Let me write a new kernel with the BM=32, BN=64 design.
+
+Also, I realize that the previousModelNew used `BMM_PERM0213_KERNEL` with TILE_M=8, TILE_N=64, etc. That was completely different and wrong because I didn&#x27;t properly think about the thread mapping. Let me start fresh with a well-designed kernel.
+
+Actually, before writing code, let me think if there&#x27;s a much simpler approach that would still be fast: use `cutlass` in inline? Probably not available. Use `mma` with wmma? Could be simpler.
+
+WMMA design:
+- Use `nvcuda::wmma` for 16x16x16 fragments.
+- Block size: 256 threads = 8 warps.
+- Each warp computes one 16x16 tile using mma.
+- 8 warps per block compute 8 tiles.
+- To cover 32x64 block: 2x4 tiles = 8 tiles. Each tile 16x16. Perfect.
+- WMMA loads A frag: 16x16 tile. B frag: 16x16 tile. Accumulate in FP32.
+- smemA: 32x64 (with pad). smemB: 64x64.
+- This is much cleaner and uses Tensor Cores directly.
+
+WMMA details:
+- `wmma::fragment&lt;wmma::matrix_a, 16, 16, 16, half, wmma::row_major&gt; a_frag;`
+- `wmma::fragment&lt;wmma::matrix_b, 16, 16, 16, half, wmma::row_major&gt; b_frag;`
+- `wmma::fragment&lt;wmma::accumulator, 16, 16, 16, float&gt; acc_frag;`
+
+Each warp loads one A frag (16x16) and one B frag (16x16). The M dimension of the block is 32, so 2 warps along M. N dimension is 64, so 4 warps along N. Total 2*4=8 warps.
+
+For the compute phase:
+- For k_tile = 0..BK-1 in steps of 16 (because wmma k-dim is 16):
+  - Load A frag from smemA for warp&#x27;s M slice and current K slice.
+  - Load B frag from smemB for current K slice and warp&#x27;s N slice.
+  - mma_sync.
+
+BK=64. K=384. K tile iterations: 384/64 = 6 outer, 64/16 = 4 inner per BK tile. Total 24 mma instructions per warp per output tile.
+
+This is much cleaner to write and should perform very well because it uses Tensor Cores directly. H100 has very fast WMMA throughput (though direct mma.sync is slightly faster, wmma is still good and much simpler).
+
+Let me write the WMMA kernel.
+
+Block tile: BM=32, BN=64, BK=64.
+Warps: 8 warps arranged as 2x4.
+warp_m = warp_id / 4 (0..1)
+warp_n = warp_id % 4 (0..3)
+
+Each warp computes a 16x16 tile at:
+m_base = warp_m * 16
+n_base = warp_n * 16
+
+smemA: [BM][BK+PAD_A] = [32][66]. Stores A block.
+smemB: [BK][BN+PAD_B] = [64][64]. Stores B block. BN=64 is divisible by 16. Good.
+
+Loading shared memory:
+A: 32*64 = 2048 halfs. 256 threads * 8 halfs = 2048. Use float2 or half2.
+B: 64*64 = 4096 halfs. 256 threads * 16 halfs = 4096. Use float4.
+
+For WMMA, we load fragments from shared memory.
+`wmma::load_matrix_sync(a_frag, smemA[warp_m*16] + k_inner, BK+PAD_A);`
+Wait, the stride for A frag is the leading dimension of smemA. Since smemA is row-major with columns K+PAD, the stride for load_matrix_sync is BK+PAD_A.
+Similarly for B: `wmma::load_matrix_sync(b_frag, smemB[k_inner] + warp_n*16, BN+PAD_B);`
+smemB stride is BN+PAD_B.
+
+WMMA fragment for A (16x16 row major) loads from address with given leading dimension. The address is the start of the 16x16 tile. For A, tile starts at smemA[warp_m*16][k_inner]. In pointer arithmetic: `&amp;smemA[warp_m*16][k_inner]`. The leading dimension is `BK+PAD_A`. Each row of the 16x16 tile is read from consecutive columns k_inner..k_inner+15. The stride to next row is `BK+PAD_A` halfs. For this to be valid, `BK+PAD_A` must be a multiple of some alignment. WMMA loads require 16-byte alignment for the start address and the stride should be a multiple of 16 bytes? Let me check.
+
+wmma::load_matrix_sync for shared memory requires the pointer to be aligned to 16 bytes for half precision? I think the start address must be 16-byte aligned, and the stride must be such that each row start is also aligned? Actually, for row-major half fragments, the leading dimension (ldm) in elements must be a multiple of... The documentation says for `load_matrix_sync`, the matrix pointer must be 256-bit (32-byte) aligned for `a` and `b` fragments? Actually, for shared memory, it might be 16 bytes. Let me check.
+
+From CUDA C++ Programming Guide: For `load_matrix_sync` with shared memory, the pointer must be aligned to 16 bytes for `matrix_a` and `matrix_b` fragments of type `half`. And the leading dimension must be a multiple of the number of elements per 16 bytes? Actually, I think the stride in bytes must be a multiple of 16.
+
+For smemA: leading dimension = BK+PAD_A = 66 halfs = 132 bytes. Is 132 a multiple of 16? 132/16 = 8.25. No! So we cannot use wmma load with smemA if the row stride is 132 bytes. The leading dimension in elements for row-major A is the number of columns. wmma takes `ldm` in elements. For `half`, 16 bytes = 8 halfs. So ldm must be a multiple of 8. 66 is not a multiple of 8.
+
+To fix this, we need `BK+PAD_A` to be a multiple of 8. If BK=64, PAD_A could be 0 or 8 or 16... 
+But if PAD_A=0, ldm=64, which is a multiple of 8. Good for WMMA alignment. But then bank conflicts!?
+Wait, for WMMA, we don&#x27;t read smemA row-by-row from different rows simultaneously by threads in a warp; the hardware loads the fragment in a specific pattern using `ldmatrix`. The bank conflict situation is different. WMMA handles shared memory access internally, and it might not have the same bank conflict issues as manual loads if the layout is correct.
+
+For WMMA on Ampere/Hopper, the shared memory layout for A should be row-major with no padding, or use swizzling. However, since we aren&#x27;t using the async copy pipeline with Swizzle, simple row-major with ldm=64 should work. Bank conflicts during `wmma::load_matrix_sync` are handled by the hardware.
+
+But wait, does `wmma::load_matrix_sync` from shared memory suffer from bank conflicts? The hardware uses special load instructions that might be conflict-free for standard layouts. Let&#x27;s not overthink it and use ldm=64.
+
+For smemB: ldm = BN+PAD_B. BN=64. 64 is a multiple of 8. So B frag load is aligned.
+
+But what about bank conflicts for smemB? With BN=64 and no padding, row stride = 64 halfs = 128 bytes = 8 * 16 bytes. Since WMMA loads 16 bytes per thread? The ldmatrix instruction loads 16 bytes per thread, 4 threads per row. With row stride 128 bytes, consecutive rows are 128 bytes apart, which is a multiple of 32 banks * 4 bytes = 128 bytes. So each row starts at the same bank. For ldmatrix, which loads a 16x16 fragment from shared memory, this causes severe bank conflicts because all 8 rows (or however many) start at the same bank offset.
+
+Actually, CUTLASS and other libraries use shared memory swizzling to avoid bank conflicts for WMMA. bank conflicts for ldmatrix are a real issue. To avoid them, the matrix rows must be offset in banks. This is exactly why swizzling and padding are used.
+
+For Ampere/Hopper, `cp.async` with `cute::Swizzle` is used. But doing that manually is complex.
+
+Given that implementing swizzling manually for WMMA is error-prone, maybe the manual FMA approach is simpler and might actually be faster if the WMMA loads are bank-conflicted. For a 32x64x64 tile with FMAs, we estimated ~512 FMAs per thread * 6 outer iterations = 3072 FMAs per thread. On H100, peak FMA throughput is ~989 TFLOPS for the whole GPU. FMA is 2 FLOPs. So 512 FMAs * 6 = 3072 FMAs/thread * 256 threads/block * 1728 blocks... Let me compute total FMAs: 96*384*192*384*2 = 5.1e9 FMAs.
+At 989e12 FLOPS / 2 = 494.5e12 FMAs/s. Time = 5.1e9 / 494.5e12 = 10 microseconds. Wait, that&#x27;s the FMA-only time. Shared memory loads will add overhead. 10 microseconds is the absolute minimum. A CuBLAS kernel for this problem might take ~30-50 microseconds.
+
+For our custom kernel, if we can get near CuBLAS performance, that should be enough to beat the reference (which is CUTLASS, probably similar to CuBLAS).
+
+Given the time I&#x27;ve spent analyzing, let me just go with the manual FMA approach that I&#x27;ve thoroughly analyzed. It avoids WMMA alignment and swizzling complexities.
+
+Final design:
+- BM=32, BN=64, BK=64
+- smemA: [32][66] (padded by 2 to avoid bank conflicts)
+- smemB: [64][64] (no padding needed, row stride=128 bytes=32 banks, perfect for column reads since all threads read from same row k but different columns)
+- 256 threads
+- 8 warps arranged 1x8 (all warps cover full 32 rows, each handles 8 columns)
+- Thread in warp: lane_id=0..31 -&gt; row = lane_id (0..31). base_col = warp_id * 8 (0..56).
+- Each thread computes 1 row x 8 cols = 8 outputs.
+- Load A: 256 threads cover 32*64=2048 halfs. Each thread loads 8 halfs.
+  Use half2 loads from global (4 per thread). Coalesced because threads in a warp load from the same 4 rows (actually 1 row per thread... wait, tid=0..31 cover rows 0..3? Let&#x27;s recalculate.)
+  
+Actually, loading A: if tid handles 8 halfs, and we need each row loaded by 8 threads (since 64 cols / 8 halfs per thread = 8 threads per row).
+tid 0..7: row 0, cols 0..7, 8..15, ..., 56..63. But each thread should load 8 contiguous halfs. 
+So tid=0: row 0, cols 0..7. tid=1: row 0, cols 8..15. ... tid=7: row 0, cols 56..63.
+tid=8: row 1, cols 0..7.
+In a warp (32 threads): rows 0..3, each with 8 threads loading 8-half chunks. This is perfectly coalesced: 32 threads load 256 halfs = 512 bytes. They come from 4 rows, each row having 8 threads loading 64 contiguous halfs. Each row load can be merged into 1 or 2 transactions. Very efficient.
+
+For smemA store: tid=0 writes to row 0, cols 0..7. Use 4 half2 stores (since float2 not aligned for odd rows, but we can use half2). `&amp;smemA[row][col]` is 4-byte aligned. half2 store is fine.
+
+For B loading: same as before. 256 threads load 4096 halfs = 16 per thread. 2 float4 per thread. Each row loaded by 4 threads. Perfectly coalesced.
+
+For compute:
+- Each thread computes row = lane_id, base_col = warp_id * 8.
+- Loop k=0..63:
+  - a_val = smemA[row][k] (1 half load). With 32 threads in warp reading rows 0..31. Since smemA has ldm=66, row difference 1 gives bank difference 33%32=1. So 32 threads read 32 different banks. CONFLICT-FREE.
+  - b_vals = smemB[k][base_col..base_col+7]. 2 float2 loads (or 4 half2). All threads in warp read from same row k. Different warps read different base_col. Bank for smemB[k][c] depends on c. base_col differs by 8. So warp 0 reads banks 0..3 (float2 spans 2 banks). warp 1 reads banks 4..7. When warps execute simultaneously, they might hit different banks. If they hit the same bank, conflict. But because the ranges are disjoint (0..3 vs 4..7 etc.), no conflict even across warps! Great.
+  - 8 FMAs.
+
+This is the most optimal design. I will write this kernel.
+
+Wait, one more thing: for B compute reads, I said 2 float2 loads. But float2 requires 8-byte alignment. Let&#x27;s verify smemB alignment for base_col=8, 16, ..., 56.
+Address = k * 64 * 2 + base_col * 2 = k * 128 + base_col * 2.
+k*128 is multiple of 128. base_col*2: for base_col=8 -&gt; 16, multiple of 16, good for float4 even. For base_col=16 -&gt; 32, multiple of 32. So float4 is aligned for all base_col values that are multiples of 8.
+Wait, let&#x27;s check base_col=8: address = k*128 + 16. k*128 is mod 16 = 0. +16 = mod 16 = 0. So divisible by 16. Yes! base_col=0 -&gt; 0. base_col=8 -&gt; 16. base_col=16 -&gt; 32. All multiples of 16.
+So actually we can load B as 1 float4 for the 8 halfs! Address = &amp;smemB[k][base_col]. base_col is multiple of 8. We proved alignment is multiple of 16. So float4 is aligned! One load instead of 2.
+
+Wait, float4 is 16 bytes = 8 halfs. We need 8 halfs. Yes! So `*reinterpret_cast&lt;float4*&gt;(&amp;smemB[k][base_col])` loads all 8 halfs in one instruction. Perfect!
+
+Similarly for B stores during loading: we store float4 to smemB. Already works.
+
+For A compute reads: we only need 1 half, not vectorized. That&#x27;s fine.
+
+Total compute instructions per k iteration per thread:
+1 smemA load (half -&gt; float)
+1 smemB load (float4 -&gt; 8 floats via unpacking)
+8 FMAs
+Total ~12 instructions. 64 iterations = ~768 instructions. 
+
+For 1728 blocks * 256 threads = 442K threads. Total dynamic instructions ~338M. At H100 instruction throughput, very manageable.
+
+Unpacking the float4:
+```cuda
+float4 b4 = *reinterpret_cast&lt;float4*&gt;(&amp;smemB[k][base_col]);
+half2* b4_h2 = reinterpret_cast&lt;half2*&gt;(&amp;b4);
+float b_vals[8];
+b_vals[0] = __half2float(b4_h2[0].x); // wait, half2 doesn&#x27;t have .x and .y directly in the struct? 
+// Actually half2 is a typedef for __half2, and we use __low2half and __high2half intrinsic.
+```
+
+Correct unpacking:
+```cuda
+float4 b4 = *reinterpret_cast&lt;float4*&gt;(&amp;smemB[k][base_col]);
+half2 b01 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[0];
+half2 b23 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[1];
+half2 b45 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[2];
+half2 b67 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[3];
+float b0 = __half2float(__low2half(b01));
+float b1 = __half2float(__high2half(b01));
+...
+```
+
+Actually, `__low2half` and `__high2half` are for `half2` and return `half`. Alternatively, `__half2float` takes `__half` directly, but `__low2half` returns `__half`. So:
+`b_vals[0] = __half2float(__low2half(b01));`
+This is correct.
+
+But there&#x27;s a simpler way: reinterpret the float4 as an array of 8 `__half`? No, `half` is 16-bit. float4 is 128 bits = 8 halfs. We can do:
+```cuda
+half* b_halfs = reinterpret_cast&lt;half*&gt;(&amp;b4);
+b_vals[0] = __half2float(b_halfs[0]);
+...
+```
+This is simple and likely efficient because the compiler knows the memory is local. But it might generate more instructions than necessary. `__half2float` on individual halfs might be slower than unpacking half2 and converting. Actually, `__half2float` is just a move+conversion instruction. On H100, this is very fast. And doing 8 of them sequentially... maybe okay. The compiler might vectorize.
+
+Alternatively, unpack as:
+```cuda
+uint4 u4 = *reinterpret_cast&lt;uint4*&gt;(&amp;smemB[k][base_col]);
+uint16_t b_raw[8];
+// ...
+```
+No, that gets ugly.
+
+I&#x27;ll just use the half2 intrinsics. It should compile to efficient code.
+
+Now, one last check: the constant parameters. M=384, N=192, K=384. All divide evenly by our tiles (32, 64, 64). 
+M/32 = 12. N/64 = 3. K/64 = 6.
+Output shape: [batch/D1, M, D1, N] = [8, 384, 12, 192].
+The model should return this shape.
+
+In the PyTorch module:
+```python
+def forward(self, A):
+    D = bmm_perm0213_cuda(A, self.B, self.d1, self.alpha)
+    return D
+```
+Where `bmm_perm0213_cuda` dispatches the kernel and returns the tensor of shape `[batch//D1, M, D1, N]`. Since B is shape [batch, K, N].
+
+Wait, what about beta? Since beta=0, we don&#x27;t need to load/add C. The kernel just computes alpha * A * B.
+
+Let me finally write the complete kernel code.
+
+Actually, I need to ensure the thread block grid correctly handles the case where dimensions aren&#x27;t divisible. I&#x27;ll write the code with proper bounds checks.
+
+Kernel signature and grid:
+```cuda
+dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, batch);
+dim3 block(256);
+```
+
+Inside kernel:
+```cuda
+int b = blockIdx.z;
+int m0 = blockIdx.y * BM;
+int n0 = blockIdx.x * BN;
+```
+Check if b &gt;= batch: return.
+Check if m0 &gt;= M or n0 &gt;= N: return.
+
+During loading, check against M, N, K.
+During compute, no need for bounds because smem is loaded with zeros/valid data. But for correct boundary handling in the last tiles, we should zero-pad smem or skip invalid accumulations. Simplest: when loading, if out of bounds, write 0 to smem. Then compute normally.
+
+For A load:
+```cuda
+if (m0 + a_row &lt; M &amp;&amp; k0 + a_col &lt; K) {
+    // load
+} else {
+    // maybe write 0 to smem
+}
+```
+Actually, for A, if m0+a_row &gt;= M, that row isn&#x27;t used. But a_row is computed from tid. If M is not divisible by BM, some threads might try to load from rows &gt;= M. For those, we should write 0 to smemA. Similarly for B.
+
+Initialize smemA and smemB to 0 before loading? That&#x27;s extra writes. Better: just write 0 in the else branch. But since multiple threads might write to the same smem location? No, each thread&#x27;s loading pattern is unique and covers the tile. So in else, we can write 0 to the specific elements.
+
+However, for our problem, all dimensions divide evenly. So we might skip this for simplicity, but I&#x27;ll keep it for generality.
+
+Wait, for B: if K is not divisible by BK, the last k0 loop will have k0+row &gt;= K. We should guard.
+For A: if K not divisible by BK, same.
+
+Let me write it cleanly.
+
+Also, I should think about whether we need to use `__launch_bounds__(256)` to tell the compiler there are 256 threads.
+
+Another potential optimization: use `__restrict__` on all pointers.
+
+Okay, time to write the code. I&#x27;ll use `torch.utils.cpp_extension.load_inline`. The CUDA source will have the kernel and a C++ wrapper function that creates the output tensor and launches the kernel.
+
+One important thing: in PyTorch, `at::Half` is used for `torch.float16`. The kernel should accept `const at::Half*` or `const half*`. I&#x27;ll cast to `half*`.
+
+Here&#x27;s the plan:
+1. Write CUDA source with kernel + wrapper `bmm_perm0213_cuda(...) -&gt; torch::Tensor`
+2. `ModelNew.__init__` registers buffer B of shape [batch, k, n].
+3. `ModelNew.forward` calls `bmm_perm0213_cuda(A, self.B, self.d1, self.alpha)`.
+4. Return D.
+
+Let me check: B in __init__ is initialized with `torch.randn(batch, k, n, dtype=torch.float16, device=&#x27;cuda&#x27;)`. But in the forward, the reference might have B as [batch, K, N] and not transpose it. In the CUTLASS testbed, B is row-major [K, N] per batch. That&#x27;s exactly how PyTorch stores [batch, K, N]. So no transpose needed.
+
+Also, I need to make sure B doesn&#x27;t require grad. Since it&#x27;s a buffer, it shouldn&#x27;t.
+
+Now, I want to compile and run correctness. Let me write the code.
+
+I realize I need to handle the output shape. The kernel writes to a flat buffer. I will use `torch::empty({batch / d1, M, d1, N}, A.options())`. Then pass the data pointer. Wait, PyTorch doesn&#x27;t know the shape [batch/d1, M, d1, N] is the correct output shape? We explicitly create the tensor with that shape. Good.
+
+Actually, is `batch` always divisible by `d1`? In our problem, 96/12=8. Yes. The test also checks `options.batch_count % Info::kBatchFactor == 0` where kBatchFactor is D1=12. So yes.
+
+Now, writing the code:
+
+```python
+CUDA_SOURCE = r&#x27;&#x27;&#x27;
+#include &lt;cuda_fp16.h&gt;
+#include &lt;torch/extension.h&gt;
+
+#define BM 32
+#define BN 64
+#define BK 64
+#define PAD_A 2
+
+__global__ void __launch_bounds__(256)
+bmm_perm0213_kernel(
+    const at::Half* __restrict__ A_ptr,
+    const at::Half* __restrict__ B_ptr,
+    at::Half* __restrict__ D_ptr,
+    int batch, int M, int N, int K, int D1, float alpha
+) {
+    using half = __half;
+    const half* __restrict__ A = reinterpret_cast&lt;const half*&gt;(A_ptr);
+    const half* __restrict__ B = reinterpret_cast&lt;const half*&gt;(B_ptr);
+    half* __restrict__ D = reinterpret_cast&lt;half*&gt;(D_ptr);
+
+    int b = blockIdx.z;
+    int m0 = blockIdx.y * BM;
+    int n0 = blockIdx.x * BN;
+    int tid = threadIdx.x;
+
+    if (b &gt;= batch || m0 &gt;= M || n0 &gt;= N) return;
+
+    __shared__ __align__(16) half smemA[BM][BK + PAD_A];
+    __shared__ __align__(16) half smemB[BK][BN];
+
+    int warp_id = tid &gt;&gt; 5;
+    int lane_id = tid &amp; 31;
+    int row = lane_id;          // 0..31 within block tile
+    int base_col = warp_id * 8; // 0,8,16,...,56
+
+    // Initialize accumulators
+    float acc[8];
+    #pragma unroll
+    for (int j = 0; j &lt; 8; ++j) acc[j] = 0.0f;
+
+    // Main loop over K
+    for (int k0 = 0; k0 &lt; K; k0 += BK) {
+        // Load A tile: each thread loads 8 halfs (4 half2) into smemA
+        #pragma unroll
+        for (int l = 0; l &lt; 4; ++l) {
+            int local_tid = tid * 8 + l * 2;  // half2 index within tile (2 halfs)
+            int a_row = local_tid &gt;&gt; 6;       // /64
+            int a_col = local_tid &amp; 63;       // %64
+            if (m0 + a_row &lt; M &amp;&amp; k0 + a_col &lt; K) {
+                half2 val = *reinterpret_cast&lt;const half2*&gt;(
+                    A + ((b * M + (m0 + a_row)) * K + (k0 + a_col))
+                );
+                *reinterpret_cast&lt;half2*&gt;(&amp;smemA[a_row][a_col]) = val;
+            } else {
+                smemA[a_row][a_col] = half();
+                smemA[a_row][a_col + 1] = half();
+            }
+        }
+
+        // Load B tile: each thread loads 16 halfs (2 float4) into smemB
+        #pragma unroll
+        for (int l = 0; l &lt; 2; ++l) {
+            int local_tid = tid * 16 + l * 8;  // 8 halfs per float4
+            int b_row = local_tid &gt;&gt; 6;        // /64
+            int b_col = local_tid &amp; 63;        // %64
+            if (k0 + b_row &lt; K &amp;&amp; n0 + b_col &lt; N) {
+                float4 val = *reinterpret_cast&lt;const float4*&gt;(
+                    B + ((b * K + (k0 + b_row)) * N + (n0 + b_col))
+                );
+                *reinterpret_cast&lt;float4*&gt;(&amp;smemB[b_row][b_col]) = val;
+            } else {
+                // zero out shared memory
+                *reinterpret_cast&lt;float4*&gt;(&amp;smemB[b_row][b_col]) = make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+        }
+
+        __syncthreads();
+
+        // Compute 32x64 tile
+        #pragma unroll
+        for (int k = 0; k &lt; BK; ++k) {
+            float a_val = __half2float(smemA[row][k]);
+
+            float4 b4 = *reinterpret_cast&lt;float4*&gt;(&amp;smemB[k][base_col]);
+            half2 b01 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[0];
+            half2 b23 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[1];
+            half2 b45 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[2];
+            half2 b67 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[3];
+
+            float b_vals[8];
+            b_vals[0] = __half2float(__low2half(b01));
+            b_vals[1] = __half2float(__high2half(b01));
+            b_vals[2] = __half2float(__low2half(b23));
+            b_vals[3] = __half2float(__high2half(b23));
+            b_vals[4] = __half2float(__low2half(b45));
+            b_vals[5] = __half2float(__high2half(b45));
+            b_vals[6] = __half2float(__low2half(b67));
+            b_vals[7] = __half2float(__high2half(b67));
+
+            #pragma unroll
+            for (int j = 0; j &lt; 8; ++j) {
+                acc[j] += a_val * b_vals[j];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write output with permute [batch/D1, M, D1, N]
+    int m_out = m0 + row;
+    if (m_out &gt;= M) return;
+    int n_out_base = n0 + base_col;
+    if (n_out_base &gt;= N) return;
+
+    int b0 = b / D1;
+    int b1 = b % D1;
+
+    int64_t idx_base = (int64_t)b0 * M * D1 * N + (int64_t)m_out * D1 * N + (int64_t)b1 * N + n_out_base;
+
+    // Store 8 halfs (4 half2)
+    #pragma unroll
+    for (int j = 0; j &lt; 4; ++j) {
+        half2 out = __halves2half2(
+            __float2half(alpha * acc[j * 2]),
+            __float2half(alpha * acc[j * 2 + 1])
+        );
+        int64_t idx = idx_base + j * 2;
+        if (n_out_base + j * 2 + 1 &lt; N) {
+            *reinterpret_cast&lt;half2*&gt;(&amp;D[idx]) = out;
+        } else if (n_out_base + j * 2 &lt; N) {
+            D[idx] = __float2half(alpha * acc[j * 2]);
+        }
+    }
+}
+
+torch::Tensor bmm_perm0213_cuda(torch::Tensor A, torch::Tensor B, int D1, float alpha) {
+    int batch = A.size(0);
+    int M = A.size(1);
+    int K = A.size(2);
+    int N = B.size(2);
+
+    auto D = torch::empty({batch / D1, M, D1, N}, A.options());
+
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, batch);
+    dim3 block(256);
+
+    bmm_perm0213_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(
+        A.data_ptr&lt;at::Half&gt;(),
+        B.data_ptr&lt;at::Half&gt;(),
+        D.data_ptr&lt;at::Half&gt;(),
+        batch, M, N, K, D1, alpha
+    );
+
+    return D;
+}
+&#x27;&#x27;&#x27;
+```
+
+Wait, I need to include a check that batch is divisible by D1. The kernel assumes b0 = b/D1 is valid. And `torch::empty({batch/D1, ...})` requires batch/D1 to be integer division. In C++ with integer division it truncates. But in our case it divides evenly.
+
+One issue: the model&#x27;s `forward` signature takes A, and B is self.B. The reference might expect `__init__(self, batch, k, n, d1, alpha, beta)` and B built there. Yes.
+
+Wait, looking at the I/O contract again:
+```python
+def get_inputs():
+    return [torch.randn(BATCH, M, K, dtype=torch.float16).cuda()]
+def get_init_inputs():
+    return [BATCH, K, N, D1, ALPHA, BETA]
+```
+
+So `ModelNew.__init__` gets (batch, k, n, d1, alpha, beta). In our code:
+```python
+def __init__(self, batch, k, n, d1, alpha, beta):
+    super().__init__()
+    self.d1 = d1
+    self.alpha = alpha
+    self.beta = beta  # ignored since beta=0
+    self.register_buffer(&#x27;B&#x27;, torch.randn(batch, k, n, dtype=torch.float16, device=&#x27;cuda&#x27;))
+```
+
+In `forward(self, A)`:
+```python
+def forward(self, A):
+    return bmm_perm0213_cuda(A, self.B, self.d1, self.alpha)
+```
+
+This should be correct.
+
+But wait - `torch.randn` initializes B. The reference likely uses a specific initialization or random seed? In the testbed, B is initialized with `BlockFillRandomUniform` with seed based on `seed * 2022`. The actual values matter for correctness. But since correctness check compares numerical outputs given inputs, and the inputs include the initialized B (buffer), we just need to match the reference&#x27;s computation, not the initialization. The evaluation framework constructs ModelNew, calls forward with the given inputs, and compares against the reference&#x27;s forward on the same inputs. Since both use torch.randn for B initialization, they will be different unless the reference is also PyTorch! 
+
+Wait, actually the hidden reference might use torch operations for the whole thing. If it&#x27;s a PyTorch reference model, then torch.randn would be the initialization. The I/O contract says &quot;ModelNew must define __init__(*get_init_inputs()) and forward(*get_inputs()) so outputs match the hidden reference&quot;. The hidden reference likely also does `self.B = torch.randn(batch, k, n, dtype=torch.float16, device=&#x27;cuda&#x27;)` or similar. Since PyTorch default rng is the same, it should match. Or the reference might use `torch.empty` and fill manually. But we can&#x27;t know. We just implement as specified.
+
+Actually, looking at the testbed code, the reference CUTLASS implementation uses a specific seed initialization. But the &quot;hidden evaluation reference&quot; might be a simpler PyTorch reference that the evaluation uses to compute correctness. The prompt says &quot;match the hidden evaluation reference on the tensor I/O contract below (same numerical outputs for the same inputs).&quot; So we just need to be mathematically correct.
+
+One subtle point: the reference testbed does `initialize_tensor_` with `cutlass::Distribution::Uniform` and a seed. But the hidden reference might just do standard PyTorch operations. We&#x27;ll see.
+
+Let me now compile the kernel. But first, I need to write the complete Python code.
+
+One concern: does `torch.utils.cpp_extension.load_inline` support `torch::Tensor` inputs/outputs? Yes, but we need to include `&lt;torch/extension.h&gt;`. And the function should be exposed.
+
+Also, for H100, we want to compile with sm_90 architecture. I&#x27;ll add `-gencode arch=compute_90,code=sm_90` to the nvcc flags.
+
+Let me write the complete module and test it via compile_kernel.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nCUDA_SOURCE = r&#x27;&#x27;&#x27;\n#include &lt;cuda_fp16.h&gt;\n#include &lt;torch/extension.h&gt;\n\n#define BM 32\n#define BN 64\n#define BK 64\n#define PAD_A 2\n\n__global__ void __launch_bounds__(256)\nbmm_perm0213_kernel(\n    const at::Half* __restrict__ A_ptr,\n    const at::Half* __restrict__ B_ptr,\n    at::Half* __restrict__ D_ptr,\n    int batch, int M, int N, int K, int D1, float alpha\n) {\n    using half = __half;\n    const half* __restrict__ A = reinterpret_cast&lt;const half*&gt;(A_ptr);\n    const half* __restrict__ B = reinterpret_cast&lt;const half*&gt;(B_ptr);\n    half* __restrict__ D = reinterpret_cast&lt;half*&gt;(D_ptr);\n\n    int b = blockIdx.z;\n    int m0 = blockIdx.y * BM;\n    int n0 = blockIdx.x * BN;\n    int tid = threadIdx.x;\n\n    if (b &gt;= batch || m0 &gt;= M || n0 &gt;= N) return;\n\n    __shared__ __align__(16) half smemA[BM][BK + PAD_A];\n    __shared__ __align__(16) half smemB[BK][BN];\n\n    int warp_id = tid &gt;&gt; 5;\n    int lane_id = tid &amp; 31;\n    int row = lane_id;          // 0..31 within block tile\n    int base_col = warp_id * 8; // 0,8,16,...,56\n\n    // Initialize accumulators\n    float acc[8];\n    #pragma unroll\n    for (int j = 0; j &lt; 8; ++j) acc[j] = 0.0f;\n\n    // Main loop over K\n    for (int k0 = 0; k0 &lt; K; k0 += BK) {\n        // Load A tile: each thread loads 8 halfs (4 half2) into smemA\n        #pragma unroll\n        for (int l = 0; l &lt; 4; ++l) {\n            int local_tid = tid * 8 + l * 2;  // half2 index within tile (2 halfs)\n            int a_row = local_tid &gt;&gt; 6;       // /64\n            int a_col = local_tid &amp; 63;       // %64\n            if (m0 + a_row &lt; M &amp;&amp; k0 + a_col &lt; K) {\n                half2 val = *reinterpret_cast&lt;const half2*&gt;(\n                    A + ((b * M + (m0 + a_row)) * K + (k0 + a_col))\n                );\n                *reinterpret_cast&lt;half2*&gt;(&amp;smemA[a_row][a_col]) = val;\n            } else {\n                smemA[a_row][a_col] = half();\n                smemA[a_row][a_col + 1] = half();\n            }\n        }\n\n        // Load B tile: each thread loads 16 halfs (2 float4) into smemB\n        #pragma unroll\n        for (int l = 0; l &lt; 2; ++l) {\n            int local_tid = tid * 16 + l * 8;  // 8 halfs per float4\n            int b_row = local_tid &gt;&gt; 6;        // /64\n            int b_col = local_tid &amp; 63;        // %64\n            if (k0 + b_row &lt; K &amp;&amp; n0 + b_col &lt; N) {\n                float4 val = *reinterpret_cast&lt;const float4*&gt;(\n                    B + ((b * K + (k0 + b_row)) * N + (n0 + b_col))\n                );\n                *reinterpret_cast&lt;float4*&gt;(&amp;smemB[b_row][b_col]) = val;\n            } else {\n                *reinterpret_cast&lt;float4*&gt;(&amp;smemB[b_row][b_col]) = make_float4(0.f, 0.f, 0.f, 0.f);\n            }\n        }\n\n        __syncthreads();\n\n        // Compute 32x64 tile\n        #pragma unroll\n        for (int k = 0; k &lt; BK; ++k) {\n            float a_val = __half2float(smemA[row][k]);\n\n            float4 b4 = *reinterpret_cast&lt;float4*&gt;(&amp;smemB[k][base_col]);\n            half2 b01 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[0];\n            half2 b23 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[1];\n            half2 b45 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[2];\n            half2 b67 = reinterpret_cast&lt;half2*&gt;(&amp;b4)[3];\n\n            float b_vals[8];\n            b_vals[0] = __half2float(__low2half(b01));\n            b_vals[1] = __half2float(__high2half(b01));\n            b_vals[2] = __half2float(__low2half(b23));\n            b_vals[3] = __half2float(__high2half(b23));\n            b_vals[4] = __half2float(__low2half(b45));\n            b_vals[5] = __half2float(__high2half(b45));\n            b_vals[6] = __half2float(__low2half(b67));\n            b_vals[7] = __half2float(__high2half(b67));\n\n            #pragma unroll\n            for (int j = 0; j &lt; 8; ++j) {\n                acc[j] += a_val * b_vals[j];\n            }\n        }\n\n        __syncthreads();\n    }\n\n    // Write output with permute [batch/D1, M, D1, N]\n    int m_out = m0 + row;\n    if (m_out &gt;= M) return;\n    int n_out_base = n0 + base_col;\n    if (n_out_base &gt;= N) return;\n\n    int b0 = b / D1;\n    int b1 = b % D1;\n\n    int64_t idx_base = (int64_t)b0 * M * D1 * N + (int64_t)m_out * D1 * N + (int64_t)b1 * N + n_out_base;\n\n    #pragma unroll\n    for (int j = 0; j &lt; 4; ++j) {\n        half2 out = __halves2half2(\n            __float2half(alpha * acc[j * 2]),\n            __float2half(alpha * acc[j * 2 + 1])\n        );\n        int64_t idx = idx_base + j * 2;\n        if (n_out_base + j * 2 + 1 &lt; N) {\n            *reinterpret_cast&lt;half2*&gt;(&amp;D[idx]) = out;\n        } else if (n_out_base + j * 2 &lt; N) {\n            D[idx] = __float2half(alpha * acc[j * 2]);\n        }\n    }\n}\n\ntorch::Tensor bmm_perm0213_cuda(torch::Tensor A, torch::Tensor B, int D1, float alpha) {\n    int batch = A.size(0);\n    int M = A.size(1);\n    int K = A.size(2);\n    int N = B.size(2);\n\n    auto D = torch::empty({batch / D1, M, D1, N}, A.options());\n\n    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, batch);\n    dim3 block(256);\n\n    bmm_perm0213_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(\n        A.data_ptr&lt;at::Half&gt;(),\n        B.data_ptr&lt;at::Half&gt;(),\n        D.data_ptr&lt;at::Half&gt;(),\n        batch, M, N, K, D1, alpha\n    );\n\n    return D;\n}\n&#x27;&#x27;&#x27;\n\n_module = load_inline(\n    name=&#x27;bmm_perm0213_h100&#x27;,\n    cpp_sources=&#x27;&#x27;,\n    cuda_sources=CUDA_SOURCE,\n    functions=[&#x27;bmm_perm0213_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;, &#x27;-gencode&#x27;, &#x27;arch=compute_90,code=sm_90&#x27;],\n    extra_cflags=[&#x27;-O3&#x27;],\n    verbose=False,\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self, batch, k, n, d1, alpha, beta):\n        super().__init__()\n        self.d1 = d1\n        self.alpha = alpha\n        self.beta = beta\n        self.register_buffer(\n            &#x27;B&#x27;, torch.randn(batch, k, n, dtype=torch.float16, device=&#x27;cuda&#x27;)\n        )\n\n    def forward(self, A):\n        D = _module.bmm_perm0213_cuda(A, self.B, self.d1, self.alpha)\n        return D\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;bmm_perm0213_h100&#x27;: [1/3] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=bmm_perm0213_h100 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -O3 -c /scratch/abaner/KernelBench/runs/l5_hw_translation_default_full_20260510/hardware_translation_stub/Kimi-K2.6/level_5_problem_26_cache/k_8fa7eb4e5bfd/bmm_perm0213_h100/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=bmm_perm0213_h100 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -O3 -c /scratch/abaner/KernelBench/runs/l5_hw_translation_default_full_20260510/hardware_translation_stub/Kimi-K2.6/level_5_problem_26_cache/k_8fa7eb4e5bfd/bmm_perm0213_h100/main.cpp -o main.o 
+/scratch/abaner/KernelBench/runs/l5_hw_translation_default_full_20260510/hardware_translation_stub/Kimi-K2.6/level_5_problem_26_cache/k_8fa7eb4e5bfd/bmm_perm0213_h100/main.cpp: In function &#x27;void pybind11_init_bmm_perm0213_h100(pybind11::module_&amp;)&#x27;:
+/scratch/abaner/KernelBench/runs/l5_hw_translation_default_full_20260510/hardware_translation_stub/Kimi-K2.6/level_5_problem_26_cache/k_8fa7eb4e5bfd/bmm_perm0213_h100/main.cpp:4:56: error: &#x27;bmm_perm0213_cuda&#x27; was not declared in this scope
+    4 | m.def(&quot;bmm_perm0213_cuda&quot;, torch::wrap_pybind_function(bmm_perm0213_cuda), &quot;bmm_perm0213_cuda&quot;);
+      |                                                        ^~~~~~~~~~~~~~~~~
+[2/3] /usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=bmm_perm0213_h100 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options &#x27;-fPIC&#x27; -O3 --use_fast_math -gencode arch=compute_90,code=sm_90 -std=c++17 -c /scratch/abaner/KernelBench/runs/l5_hw_translation_default_full_20260510/hardware_translation_stub/Kimi-K2.6/level_5_problem_26_cache/k_8fa7eb4e5bfd/bmm_perm0213_h100/cuda.cu -o cuda.cuda.o 
+nvcc warning : incompatible redefinition for option &#x27;compiler-bindir&#x27;, the last value of this option was used
+ninja: build stopped: subcommand failed.
+</div></details></div></details></div>
 </body></html>
