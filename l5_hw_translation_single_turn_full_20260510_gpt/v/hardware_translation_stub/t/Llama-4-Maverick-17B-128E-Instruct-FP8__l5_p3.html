@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L5 P3 · hardware_translation_stub</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 3</a></div><div class="site-subtitle">Llama-4-Maverick-17B-128E-Instruct-FP8 · hardware_translation_stub · l5_hw_translation_single_turn_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">← Llama-4-Maverick-17B-128E-Instruct-FP8</a><span class="meta">generated 2026-05-10 09:28:21 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html" class=current>Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-error">error</span>
+  <span style="font-size:13px;">03_fused_rmsnorm.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">Llama-4-Maverick-17B-128E-Instruct-FP8</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 1</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp16</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">hardware_translation_stub</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-10T09:27:49Z</div></div>
+</div>
+
+
+
+</div><details class="turn-collapse"><summary><b>turn 0</b> · 0 tool call(s) · 21.3s · 7,320 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 21.3s</span></div><div class="block assistant"><span class="role-tag">assistant</span>```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_fp16.h&gt;
+
+__device__ float warp_reduce_sum(float val) {
+    #if defined(__CUDA_ARCH__) &amp;&amp; __CUDA_ARCH__ &gt;= 800
+        val += __shfl_down_sync(0xFFFFFFFF, val, 16);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 8);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 4);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 2);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 1);
+    #else
+        for (int offset = warpSize / 2; offset &gt; 0; offset /= 2)
+            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    #endif
+    return val;
+}
+
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+__global__ void rms_norm_kernel(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const float epsilon,
+    const int num_tokens,
+    const int hidden_size) {
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    const int idx = blockIdx.x * hidden_size + tid * VEC_SIZE;
+
+    __shared__ float s_variance;
+    float variance = 0.0f;
+
+    if (idx + VEC_SIZE &lt;= hidden_size) {
+        float4 vec = *reinterpret_cast&lt;const float4*&gt;(input + blockIdx.x * hidden_size + tid * VEC_SIZE);
+        float x1 = __float2float_rn(__low2half(vec.x));
+        float x2 = __float2float_rn(__high2half(vec.x));
+        float x3 = __float2float_rn(__low2half(vec.y));
+        float x4 = __float2float_rn(__high2half(vec.y));
+        variance += x1 * x1 + x2 * x2 + x3 * x3 + x4 * x4;
+    }
+
+    for (int offset = block_size / 2; offset &gt;= 32; offset /= 2) {
+        variance += __shfl_down_sync(0xFFFFFFFF, variance, offset);
+    }
+
+    if (tid &lt; 32) {
+        variance = warp_reduce_sum(variance);
+    }
+
+    if (tid == 0) {
+        s_variance = rsqrtf(variance / hidden_size + epsilon);
+    }
+    __syncthreads();
+
+    if (idx + VEC_SIZE &lt;= hidden_size) {
+        float4 vec_in = *reinterpret_cast&lt;const float4*&gt;(input + blockIdx.x * hidden_size + tid * VEC_SIZE);
+        float4 vec_w = *reinterpret_cast&lt;const float4*&gt;(weight + tid * VEC_SIZE);
+
+        float x1 = __float2float_rn(__low2half(vec_in.x));
+        float x2 = __float2float_rn(__high2half(vec_in.x));
+        float x3 = __float2float_rn(__low2half(vec_in.y));
+        float x4 = __float2float_rn(__high2half(vec_in.y));
+
+        float w1 = __float2float_rn(__low2half(vec_w.x));
+        float w2 = __float2float_rn(__high2half(vec_w.x));
+        float w3 = __float2float_rn(__low2half(vec_w.y));
+        float w4 = __float2float_rn(__high2half(vec_w.y));
+
+        half2 out_h1 = __floats2half2_rn(x1 * s_variance * w1, x2 * s_variance * w2);
+        half2 out_h2 = __floats2half2_rn(x3 * s_variance * w3, x4 * s_variance * w4);
+
+        float2 out_f = __half22float2(out_h1);
+        vec_in.x = out_f.x;
+        vec_in.y = __half22float2(out_h2).x;
+        out_f = __half22float2(out_h2);
+        vec_in.z = out_f.y;
+
+        *reinterpret_cast&lt;float4*&gt;(out + blockIdx.x * hidden_size + tid * VEC_SIZE) = vec_in;
+    }
+}
+
+template &lt;typename scalar_t, int width&gt;
+__global__ void fused_add_rms_norm_kernel(
+    scalar_t* __restrict__ input,
+    scalar_t* __restrict__ residual,
+    const scalar_t* __restrict__ weight,
+    const float epsilon,
+    const int num_tokens,
+    const int hidden_size) {
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    const int idx = blockIdx.x * hidden_size + tid * width;
+
+    __shared__ float s_variance;
+    float variance = 0.0f;
+
+    #pragma unroll
+    for (int i = 0; i &lt; width; i += 2) {
+        half2 res_val = *reinterpret_cast&lt;const half2*&gt;(residual + idx + i);
+        half2 inp_val = *reinterpret_cast&lt;const half2*&gt;(input + blockIdx.x * hidden_size + idx + i);
+        res_val = __hadd2(res_val, inp_val);
+        *reinterpret_cast&lt;half2*&gt;(residual + idx + i) = res_val;
+        variance += __float2float_rn(__low2half(res_val)) * __float2float_rn(__low2half(res_val)) + 
+                    __float2float_rn(__high2half(res_val)) * __float2float_rn(__high2half(res_val));
+    }
+
+    for (int offset = block_size / 2; offset &gt;= 32; offset /= 2) {
+        variance += __shfl_down_sync(0xFFFFFFFF, variance, offset);
+    }
+
+    if (tid &lt; 32) {
+        variance = warp_reduce_sum(variance);
+    }
+
+    if (tid == 0) {
+        s_variance = rsqrtf(variance / hidden_size + epsilon);
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int i = 0; i &lt; width; i += 2) {
+        half2 res_val = *reinterpret_cast&lt;const half2*&gt;(residual + idx + i);
+        half2 w_val = *reinterpret_cast&lt;const half2*&gt;(weight + idx + i);
+
+        float r1 = __float2float_rn(__low2half(res_val));
+        float r2 = __float2float_rn(__high2half(res_val));
+        float w1 = __float2float_rn(__low2half(w_val));
+        float w2 = __float2float_rn(__high2half(w_val));
+
+        half2 out_h = __floats2half2_rn(r1 * s_variance * w1, r2 * s_variance * w2);
+        *reinterpret_cast&lt;half2*&gt;(input + blockIdx.x * hidden_size + idx + i) = out_h;
+    }
+}
+
+void rms_norm(torch::Tensor&amp; out, torch::Tensor&amp; input, torch::Tensor&amp; weight, double epsilon) {
+    const int num_tokens = input.size(0);
+    const int hidden_size = input.size(1);
+
+    const int block_size = 256;
+    const int vec_size = 8;
+    dim3 grid(num_tokens);
+    dim3 block(block_size);
+
+    rms_norm_kernel&lt;__half, vec_size&gt;&lt;&lt;&lt;grid, block&gt;&gt;&gt;(
+        out.data_ptr&lt;__half&gt;(),
+        input.data_ptr&lt;__half&gt;(),
+        weight.data_ptr&lt;__half&gt;(),
+        epsilon,
+        num_tokens,
+        hidden_size);
+}
+
+void fused_add_rms_norm(torch::Tensor&amp; input, torch::Tensor&amp; residual, torch::Tensor&amp; weight, double epsilon) {
+    const int num_tokens = input.size(0);
+    const int hidden_size = input.size(1);
+
+    const int block_size = 256;
+    const int width = 8;
+    dim3 grid(num_tokens);
+    dim3 block(block_size);
+
+    fused_add_rms_norm_kernel&lt;__half, width&gt;&lt;&lt;&lt;grid, block&gt;&gt;&gt;(
+        input.data_ptr&lt;__half&gt;(),
+        residual.data_ptr&lt;__half&gt;(),
+        weight.data_ptr&lt;__half&gt;(),
+        epsilon,
+        num_tokens,
+        hidden_size);
+}
+&quot;&quot;&quot;
+
+class ModelNew(nn.Module):
+    def __init__(self, hidden_size, eps):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x):
+        y = torch.empty_like(x)
+        rms_norm(y, x, self.weight, self.eps)
+        return y
+
+    def fused_add_rms_norm_forward(self, input, residual):
+        fused_add_rms_norm(input, residual, self.weight, self.eps)
+        return input
+
+load_inline(
+    name=&quot;custom_cuda&quot;,
+    cpp_sources=&quot;&quot;,
+    cuda_sources=cuda_source,
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;-arch=sm_90&quot;],
+    with_cuda=True,
+    is_python_module=False,
+    verbose=True
+)
+
+globals().update(torch.ops.custom_cuda)
+```
+</div></div></details></div>
+</body></html>

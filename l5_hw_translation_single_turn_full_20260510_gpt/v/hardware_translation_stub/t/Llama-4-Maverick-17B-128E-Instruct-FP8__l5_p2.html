@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L5 P2 · hardware_translation_stub</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 2</a></div><div class="site-subtitle">Llama-4-Maverick-17B-128E-Instruct-FP8 · hardware_translation_stub · l5_hw_translation_single_turn_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">← Llama-4-Maverick-17B-128E-Instruct-FP8</a><span class="meta">generated 2026-05-10 09:28:21 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html" class=current>Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-error">error</span>
+  <span style="font-size:13px;">02_paged_attention_v2.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">Llama-4-Maverick-17B-128E-Instruct-FP8</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 1</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp16</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">hardware_translation_stub</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-10T09:27:50Z</div></div>
+</div>
+
+
+
+</div><details class="turn-collapse"><summary><b>turn 0</b> · 0 tool call(s) · 17.1s · 6,883 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 17.1s</span></div><div class="block assistant"><span class="role-tag">assistant</span>```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_fp16.h&gt;
+
+#define WARP_SIZE 32
+#define NUM_THREADS 128
+#define PARTITION_SIZE 512
+#define BLOCK_SIZE 16
+#define HEAD_SIZE 128
+
+__device__ __inline__ float max(float a, float b) { return a &gt; b ? a : b; }
+__device__ __inline__ float min(float a, float b) { return a &lt; b ? a : b; }
+
+template &lt;typename T&gt;
+__global__ void paged_attention_v2_kernel(T* out, float* exp_sums, float* max_logits, T* query, T* key_cache, T* value_cache, int num_kv_heads, float scale, int* block_tables, int* seq_lens, int max_num_blocks_per_seq, float* alibi_slopes, int q_stride, int kv_block_stride, int kv_head_stride) {
+    int head = blockIdx.x;
+    int seq = blockIdx.y;
+    int partition = blockIdx.z;
+
+    __shared__ float logits[PARTITION_SIZE];
+
+    int tx = threadIdx.x;
+    int warp_id = tx / WARP_SIZE;
+    int lane_id = tx % WARP_SIZE;
+
+    float max_logit = -INFINITY;
+    float sum_exp = 0.0f;
+
+    // Load query
+    T query_reg[HEAD_SIZE / NUM_THREADS];
+    for (int i = tx; i &lt; HEAD_SIZE; i += NUM_THREADS) {
+        query_reg[i] = query[seq * q_stride + head * HEAD_SIZE + i];
+    }
+
+    // Compute attention
+    for (int block = 0; block &lt; max_num_blocks_per_seq; block++) {
+        int block_id = block_tables[seq * max_num_blocks_per_seq + block];
+        if (block_id == -1) break;
+
+        // Load key and value
+        T key_reg[HEAD_SIZE / NUM_THREADS];
+        T value_reg[HEAD_SIZE / NUM_THREADS];
+        for (int i = tx; i &lt; HEAD_SIZE; i += NUM_THREADS) {
+            key_reg[i] = key_cache[block_id * kv_block_stride + (head % num_kv_heads) * kv_head_stride + i];
+            value_reg[i] = value_cache[block_id * kv_block_stride + (head % num_kv_heads) * kv_head_stride + i];
+        }
+
+        // Compute QK^T
+        float logit = 0.0f;
+        for (int i = 0; i &lt; HEAD_SIZE; i++) {
+            logit += __hmul(query_reg[i], key_reg[i]) * scale;
+        }
+
+        // Store logit in shared memory
+        logits[tx] = logit;
+        __syncthreads();
+
+        // Reduce logits
+        for (int i = WARP_SIZE; i &lt; PARTITION_SIZE; i += WARP_SIZE) {
+            if (tx &lt; i) {
+                logits[tx] = max(logits[tx], logits[tx + i]);
+            }
+            __syncthreads();
+        }
+
+        max_logit = max(max_logit, logits[0]);
+    }
+
+    // Store max logit and sum exp
+    if (tx == 0) {
+        exp_sums[seq * gridDim.x * gridDim.z + head * gridDim.z + partition] = sum_exp;
+        max_logits[seq * gridDim.x * gridDim.z + head * gridDim.z + partition] = max_logit;
+    }
+
+    // Store output
+    for (int i = tx; i &lt; HEAD_SIZE; i += NUM_THREADS) {
+        out[seq * gridDim.x * HEAD_SIZE + head * HEAD_SIZE + i] = query_reg[i] * sum_exp;
+    }
+}
+
+template &lt;typename T&gt;
+__global__ void paged_attention_v2_reduce_kernel(T* out, float* exp_sums, float* max_logits, T* tmp_out, int* seq_lens, int max_num_partitions) {
+    int head = blockIdx.x;
+    int seq = blockIdx.y;
+
+    float sum_exp = 0.0f;
+    float max_logit = -INFINITY;
+
+    for (int partition = 0; partition &lt; max_num_partitions; partition++) {
+        float local_sum_exp = exp_sums[seq * gridDim.x * max_num_partitions + head * max_num_partitions + partition];
+        float local_max_logit = max_logits[seq * gridDim.x * max_num_partitions + head * max_num_partitions + partition];
+
+        if (local_max_logit &gt; max_logit) {
+            sum_exp = local_sum_exp + expf(max_logit - local_max_logit);
+            max_logit = local_max_logit;
+        } else {
+            sum_exp += local_sum_exp * expf(local_max_logit - max_logit);
+        }
+    }
+
+    for (int i = threadIdx.x; i &lt; HEAD_SIZE; i += blockDim.x) {
+        out[seq * gridDim.x * HEAD_SIZE + head * HEAD_SIZE + i] = tmp_out[seq * gridDim.x * max_num_partitions * HEAD_SIZE + head * max_num_partitions * HEAD_SIZE + i] / sum_exp;
+    }
+}
+
+void paged_attention_v2_launcher(torch::Tensor&amp; out, torch::Tensor&amp; exp_sums, torch::Tensor&amp; max_logits, torch::Tensor&amp; tmp_out, torch::Tensor&amp; query, torch::Tensor&amp; key_cache, torch::Tensor&amp; value_cache, int num_kv_heads, float scale, torch::Tensor&amp; block_tables, torch::Tensor&amp; seq_lens, int max_num_blocks_per_seq) {
+    int num_seqs = query.size(0);
+    int num_heads = query.size(1);
+    int head_size = query.size(2);
+
+    dim3 grid(num_heads, num_seqs, PARTITION_SIZE);
+    dim3 block(NUM_THREADS);
+
+    paged_attention_v2_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(
+        out.data_ptr&lt;at::Half&gt;(),
+        exp_sums.data_ptr&lt;float&gt;(),
+        max_logits.data_ptr&lt;float&gt;(),
+        query.data_ptr&lt;at::Half&gt;(),
+        key_cache.data_ptr&lt;at::Half&gt;(),
+        value_cache.data_ptr&lt;at::Half&gt;(),
+        num_kv_heads,
+        scale,
+        block_tables.data_ptr&lt;int&gt;(),
+        seq_lens.data_ptr&lt;int&gt;(),
+        max_num_blocks_per_seq,
+        nullptr,
+        query.stride(0),
+        key_cache.stride(0),
+        key_cache.stride(1)
+    );
+
+    dim3 reduce_grid(num_heads, num_seqs);
+    paged_attention_v2_reduce_kernel&lt;&lt;&lt;reduce_grid, block&gt;&gt;&gt;(
+        out.data_ptr&lt;at::Half&gt;(),
+        exp_sums.data_ptr&lt;float&gt;(),
+        max_logits.data_ptr&lt;float&gt;(),
+        tmp_out.data_ptr&lt;at::Half&gt;(),
+        seq_lens.data_ptr&lt;int&gt;(),
+        PARTITION_SIZE
+    );
+}
+&quot;&quot;&quot;
+
+module = load_inline(
+    name=&#x27;paged_attention_v2&#x27;,
+    cuda_sources=[cuda_source],
+    functions=[&#x27;paged_attention_v2_launcher&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],
+    with_cuda=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_heads, num_kv_heads, head_size):
+        super(ModelNew, self).__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+
+    def forward(self, q, k, v):
+        out = torch.empty_like(q)
+        exp_sums = torch.empty(q.size(0), q.size(1), 512, dtype=torch.float32, device=q.device)
+        max_logits = torch.empty_like(exp_sums)
+        tmp_out = torch.empty(q.size(0), q.size(1), 512, q.size(2), dtype=q.dtype, device=q.device)
+
+        block_tables = torch.randint(0, 100, (q.size(0), 100), dtype=torch.int32, device=q.device)
+        seq_lens = torch.randint(0, 100, (q.size(0),), dtype=torch.int32, device=q.device)
+
+        module.paged_attention_v2_launcher(
+            out, exp_sums, max_logits, tmp_out, q, k, v,
+            self.num_kv_heads, 1.0, block_tables, seq_lens, 100
+        )
+
+        return out
+```
+</div></div></details></div>
+</body></html>
