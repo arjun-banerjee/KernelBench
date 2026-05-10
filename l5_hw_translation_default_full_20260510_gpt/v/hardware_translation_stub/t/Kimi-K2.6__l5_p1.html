@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 1</a></div><div class="site-subtitle">Kimi-K2.6 · hardware_translation_stub · l5_hw_translation_default_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-10 10:49:27 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 1</a></div><div class="site-subtitle">Kimi-K2.6 · hardware_translation_stub · l5_hw_translation_default_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-10 10:54:41 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">01_paged_attention_v1.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">6 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">5</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">7 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">6</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp16</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">hardware_translation_stub</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -3764,5 +3764,2552 @@ compile_kernel PASSED: kernel compiled without errors.</div></details></div></de
 run_correctness FAILED: (0 / 5) trials did not all match.
 correctness_issue: Output mismatch
 max_difference: [&#x27;3.499389&#x27;, &#x27;3.740770&#x27;, &#x27;3.707628&#x27;, &#x27;3.882529&#x27;, &#x27;3.791111&#x27;]
-avg_difference: [&#x27;0.104525&#x27;, &#x27;0.104699&#x27;, &#x27;0.105206&#x27;, &#x27;0.104637&#x27;, &#x27;0.104320&#x27;]</div></details></div></details></div>
+avg_difference: [&#x27;0.104525&#x27;, &#x27;0.104699&#x27;, &#x27;0.105206&#x27;, &#x27;0.104637&#x27;, &#x27;0.104320&#x27;]</div></details></div></details><details class="turn-collapse"><summary><b>turn 6</b> · 1 tool call(s) · 337.6s · 129,239 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 6</span><span>llm latency: 337.6s</span></div><details open><summary>reasoning</summary><div class="block reasoning">The issue is that each warp processes a subset of KV positions independently, but their max values differ. When I try to reduce across warps, the reduction order matters for numerical stability. Let me think about what I did wrong.
+
+The issue is:
+1. Each warp computes a partial softmax over its subset of keys
+2. But those partial max values are different
+3. When I combine them, I need to do the block-level reduction more carefully
+
+Actually, looking again at the original kernel structure, it seems like I should be implementing a single-query GQA kernel. But the batched shape [B, NUM_HEADS, SEQ_LEN, HEAD_SIZE] means we can process each (batch, head, seq_position) independently.
+
+Actually wait - the test shape is:
+- q: [BATCH=4, NUM_HEADS=32, SEQ_LEN=512, HEAD_SIZE=128]
+- k: [BATCH=4, NUM_KV_HEADS=8, SEQ_LEN=512, HEAD_SIZE=128]
+- v: [BATCH=4, NUM_KV_HEADS=8, SEQ_LEN=512, HEAD_SIZE=128]
+
+This is standard GQA where Q has 32 heads and K/V have 8 heads. So each KV head is shared by 4 query heads.
+
+The reference PyTorch likely uses standard attention operation. Let me write the simplest correct version first using direct algorithm, then optimize.
+
+For correctness, the essential issue is: I need proper parallel softmax across the entire sequence dimension. Let me use a block-level online softmax where the sequence is divided among warps/threads, then reduce.
+
+Actually, a simpler approach: launch one thread block per (batch, head, seq_position). Within the block, each thread processes some KV positions. At the end, reduce across threads.
+
+The online softmax requires iterative updates.
+For thread t computing max m_t and sum l_t over its subset:
+- After all processing: we need global max M = max_t(m_t)
+- Then adjust: l_t_adj = l_t * exp(m_t - M)
+- Global L = sum_t l_t_adj
+- Output = thread_acc * exp(m_t - M) / L
+
+My issue was probably in how V accumulator is handled. Let me fix the kernel:
+
+After computing q * v for each position and updating acc, the acc is:
+acc += exp(qk - m_new) * V
+
+So after we know final M = max over all threads, we need:
+acc *= exp(old_local_m - M)
+
+But that&#x27;s not correct either... for online softmax the formula works iteratively. Let me think:
+
+Initialize: m = -inf, l = 0, acc = 0
+For each element x:
+  m_new = max(m, x)
+  scale_factor = exp(m - m_new)
+  acc = acc * scale_factor + V * exp(x - m_new)
+  l = l * scale_factor + exp(x - m_new)
+  m = m_new
+
+After processing all elements in subset:
+  (m_local, l_local, acc_local)
+
+After getting global M:
+  acc_adj = acc_local * exp(m_local - M)
+  l_adj = l_local * exp(m_local - M)
+
+Then acc_final = sum(acc_adj) / sum(l_adj)
+
+My previous code only scaled acc once but I think it&#x27;s correct? Let me double check my implementation...
+
+Actually the issue is:
+```
+float exp_adj = __expf(thread_max - block_max);
+thread_sum *= exp_adj;
+for i: thread_acc[i] *= exp_adj;
+```
+Then thread_sum is written to shared mem and summed, then divided.
+
+That&#x27;s correct! Each thread has:
+- thread_max: local max
+- thread_sum: local sum
+- thread_acc: local weighted sum
+
+After global max is found:
+- thread_sum&#x27; = thread_sum * exp(thread_max - global_max)  
+- thread_acc&#x27; = thread_acc * exp(thread_max - global_max)
+- global_sum = sum(thread_sum&#x27;)
+- output = thread_acc&#x27; / global_sum
+
+This is exactly what I wrote. So why is there a mismatch?
+
+The issue might be: my block launches are for each KV head, but each query head needs separate output. Let me trace through again...
+
+Wait, I think the problem could be seq_len vs actual processing. My grid is batch x num_kv_heads x seq_len. For each (b, kv_head, q_pos), the block computes the output for all G query heads corresponding to that kv_head. But I loop over g=0..G-1. 
+
+For each g:
+1. Load Q at (b, q_head=kv_head*G+g, q_pos)
+2. Process all KV positions
+3. Write output at (b, q_head, q_pos)
+
+This seems correct. What&#x27;s the reference model doing?
+
+Let me think: The I/O contract says 
+```
+def get_inputs():
+    q = torch.randn(BATCH, NUM_HEADS, SEQ_LEN, HEAD_SIZE, dtype=torch.float16).cuda()
+    k = torch.randn(BATCH, NUM_KV_HEADS, SEQ_LEN, HEAD_SIZE, dtype=torch.float16).cuda()
+    v = torch.randn(BATCH, NUM_KV_HEADS, SEQ_LEN, HEAD_SIZE, dtype=torch.float16).cuda()
+    return [q, k, v]
+```
+
+This is standard attention: for each batch, for each query head, for each query position in seq_len, compute attention over all key/value positions.
+
+Wait, but the standard attention computation for each query position q_pos computes attention over ALL key positions, not just one. So the output at o[b, h, q_pos, :] depends on q[b, h, q_pos, :] (as query) and k[b, kv_head, :, :] and v[b, kv_head, :, :] for all positions.
+
+My grid is (batch, kv_head, q_pos) - each block computes output for all G query heads. That seems right...
+
+Could the mismatch be caused by floating point accumulation order? When I split the sequence across warps and reduce, it&#x27;s numerically different from processing in order.
+
+Wait, actually I just realized! In my parallel online softmax reduction:
+
+Step 1: Each warp computes partial softmax with its own max
+Step 2: Global max found
+Step 3: Each warp adjusts its accumulators and sum
+
+But for V accumulation: when we process elements in our subset, we accumulate V weighted by exp(qk - local_max). Then at the end we scale all accumulator elements by exp(local_max - global_max).
+
+This is mathematically correct if we compute:
+acc_local = sum_{i in subset} v_i * exp(qk_i - local_max)
+Then acc_adj = acc_local * exp(local_max - global_max)
+            = sum_i v_i * exp(qk_i - local_max) * exp(local_max - global_max)
+            = sum_i v_i * exp(qk_i - global_max)
+
+And l_adj = sum_i exp(qk_i - local_max) * exp(local_max - global_max)
+          = sum_i exp(qk_i - global_max)
+
+So acc_final = sum_adj_acc / l_adj 
+            = sum_i v_i * exp(qk_i - global_max) / sum_j exp(qk_j - global_max)
+
+This is precisely the correct softmax output!
+
+But the issue might be in my warp data partition. I divide keys by warp:
+```
+const int kv_per_warp = (seq_len + num_warps - 1) / num_warps;
+const int kv_start = warp_id * kv_per_warp;
+const int kv_end = min(seq_len, kv_start + kv_per_warp);
+```
+
+Then each thread in the warp iterates:
+```
+for (int kv_pos = kv_start + lane; kv_pos &lt; kv_end; kv_pos += WARP_SIZE)
+```
+
+Wait, the problem is: I&#x27;m doing lane striping but lane striping might skip elements! If kv_start=0, lane=0..31, kv_pos=0,32,64... but kv_end might be, say, 64. So lanes 0 and 1 process positions 0, 32 and 1, 33, etc. up to 63. That&#x27;s correct!
+
+Actually wait, if kv_end - kv_start &lt; WARP_SIZE, some lanes won&#x27;t process anything. That&#x27;s fine, qk will be 0.0 and won&#x27;t affect max (since we only update when... but actually the loop just doesn&#x27;t run for those lanes).
+
+Hmm, but the empty lanes have thread_max=-1e30f. When reducing for block_max, lanes that don&#x27;t process anything will have thread_max=-1e30f which won&#x27;t affect the global max. 
+
+But what if ALL keys are processed by some warps, while others have nothing? The empty warps will have thread_max=-1e30f and thread_sum=0. Their acc is 0 too. After adjustment (exp(-1e30f - block_max) ≈ 0), they scale to 0 and don&#x27;t affect anything. Good.
+
+Actually, I think the problem might be that I should be comparing with a simpler torch implementation to understand what the reference does. The reference might be something like:
+
+```
+def forward(q, k, v):
+    # q: [B, H, S, D]
+    # k: [B, H_kv, S, D]
+    scores = torch.matmul(q, k.transpose(-2, -1)) / sqrt(D)
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v)
+    return out
+```
+
+In GQA, each query head attends to the corresponding KV head. q[b, h_q] attends to k[b, h_q // G].
+
+But wait, looking at my code: the grid uses num_kv_heads, not num_heads. And I loop over G query heads inside the kernel. Is that correct?
+
+Actually, I think the simpler implementation would be to just launch a block per (batch, head, q_pos) where head goes from 0 to num_heads-1, and inside the kernel, figure out which kv_head to use. Let me try that approach.
+
+Or better yet, let me look at the problem more carefully. The mismatch could be due to:
+1. The head grouping is wrong
+2. The sequence iteration is wrong
+3. The softmax reduction is wrong
+
+Let me look at whether the test might be expecting the standard causal mask attention. Wait, the prompt shows a paged attention v1 kernel - but the I/O contract for the test is standard GQA with full sequence length. So maybe the hidden reference is just using standard PyTorch attention ops.
+
+Let me first write a simple cleaned up version and debug the numerical precision.
+
+Actually, I think the first thing to check: does each lane within warp process a contiguous set of keys or strided?
+
+In my code:
+`for (int kv_pos = kv_start + lane; kv_pos &lt; kv_end; kv_pos += WARP_SIZE)`
+
+This makes lane 0 process positions kv_start, kv_start+32, kv_start+64...
+Lane 1 process kv_start+1, kv_start+33...
+
+This is strided access. For L2/DRAM efficiency on H100, contiguous access is better (coalesced within warp). But for correctness it should still be the same. 
+
+Actually, the main thing: let me check if there might be an issue with how I&#x27;m computing the qk dot product. Each loop iteration computes:
+```
+qk += __half2float(q_vec[d / WARP_SIZE]) * __half2float(k_val);
+```
+where k_val = k[kv_offset + d + lane]. But d goes from 0 to HEAD_SIZE stepping by WARP_SIZE. So for lane=0, d=0: k_val = k[kv_offset + 0 + 0] = k[kv_offset + 0]. 
+For d=32: k_val = k[kv_offset + 32 + 0] = k[kv_offset + 32]. 
+But q_vec[0] corresponds to d=0, q_vec[1] corresponds to d=32, etc. 
+
+This looks correct. Each lane computes its partial dot product using the elements it loaded, then warp shuffle sum gives the full dot product.
+
+Wait, there&#x27;s a critical bug! In the dot product:
+q_vec has elements [q0, q32, q64, q96] for lane 0 (since HEAD_SIZE=128, WARP_SIZE=32, D_PER_LANE=4)
+And k_val at d=0 is k[kv_offset + 0 + lane] = k[kv_offset + lane]
+At d=32, k_val = k[kv_offset + 32 + lane]
+
+So lane 0 multiplies q0*k0 + q32*k32 + q64*k64 + q96*k96, which is part of the dot product. Then warp shuffle sum across lanes combines all parts. This is correct!
+
+Wait, but the first angle: q_vec[d / WARP_SIZE]. When d=0, d/WARP_SIZE=0. d=32, d/WARP_SIZE=1. That&#x27;s correct.
+
+Hmm, maybe the issue is in the shared memory reduction. Let me trace this more carefully.
+
+Actually, another thought: I&#x27;m storing smem_max and smem_sum with THREADS_PER_BLOCK=256 elements, but the grid is only using the actual thread positions. For example, if seq_len &lt; something... no, grid.z = seq_len so there should be exactly seq_len z-blocks.
+
+Let me think about the difference differently. Maybe my approach of striping the sequence dimension across warps is wrong because some warps might get different numbers of elements.
+
+For example, if seq_len=512 and num_warps=8 (THREADS=256), then kv_per_warp = 64.
+Warp 0: positions 0..63
+Warp 1: positions 64..127
+...
+Warp 7: positions 448..511
+
+Then within each warp, lanes are striped:
+Lane 0: 0, 8, 16, ..., 56, 64, 72, ..., 120... wait no!
+```
+for (int kv_pos = kv_start + lane; kv_pos &lt; kv_end; kv_pos += WARP_SIZE)
+```
+Warp 0, lane 0: kv_pos = 0 + 0 = 0, then 32, then 64... but 64 &gt;= kv_end (64)? So only 0, 32. Wait, kv_end = min(512, 0+64) = 64. So kv_pos = 0, 32, then next is 64 which is not &lt; 64. So lane 0 processes positions 0 and 32.
+
+Lane 1: 1, 33
+...
+Lane 31: 31, 63
+
+So each lane processes exactly 2 positions. That&#x27;s correct.
+
+But warp 1: kv_start=64, kv_end=128
+Lane 0: 64, 96
+Lane 1: 65, 97
+...
+Lane 31: 95, 127
+
+All correct.
+
+After processing, each warp has its own (m_local, l_local, acc_local).
+Block reduction:
+1. Find global max M across all threads
+2. Each thread scales: l *= exp(m - M), acc *= exp(m - M)
+3. Sum of l across all threads = L
+4. Output = acc / L
+
+Wait! I think I see the issue. In step 3, I&#x27;m summing thread_sum which is already scaled. But I&#x27;m not doing the sum correctly. Let me look:
+
+```cpp
+smem_sum[tid] = thread_sum;
+__syncthreads();
+
+if (tid == 0) {
+    float block_sum = 0.0f;
+    for (int i = 0; i &lt; THREADS_PER_BLOCK; ++i) {
+        block_sum += smem_sum[i];
+    }
+    for (int i = 0; i &lt; THREADS_PER_BLOCK; ++i) {
+        smem_sum[i] = block_sum;
+    }
+}
+__syncthreads();
+
+float block_sum = smem_sum[0];
+float inv_sum = 1.0f / block_sum;
+```
+
+This should be correct. But what about the case where block_sum is very small or 0? If no keys exist in a warp? That wouldn&#x27;t happen because seq_len &gt;= 1.
+
+Actually wait, I just realized: when seq_len &lt; WARP_SIZE, some threads will have thread_max = -1e30f and thread_sum = 0. When scaled by exp(-1e30f - M), that&#x27;s essentially 0. But the M that we compute might be -1e30f if ALL threads have nothing! Actually if seq_len = 0, but that shouldn&#x27;t happen. If seq_len &gt;= 1, at least one thread processes a valid key and has a real max.
+
+Hmm, let me try a different strategy. Instead of the complex warp-striping for sequence, let me use a simpler approach where each block handles one query head and all threads participate in the sequence reduction cooperatively. Since H100 has large shared memory (228KB), I can load full head vectors into shared memory for KV. But with 128 head size, that&#x27;s tiny.
+
+Actually, let me think about something else: is the precision issue because threads within a warp process out-of-order elements? With online softmax, different ordering can give slightly different results due to floating point. But PyTorch also uses online softmax typically, and the difference should be small... but the tolerance is 1e-2 so small differences should pass. The fact that we&#x27;re getting ~3.5 max difference means there&#x27;s likely a real bug.
+
+Actually, I notice the average difference is around 0.1 and max is ~3.5. This seems large for just precision issues. Let me check the code again very carefully.
+
+Wait, I see it now! I&#x27;m launching grid as:
+```
+dim3 grid(batch_size, num_kv_heads, seq_len);
+```
+
+And inside my kernel, for each (b, kv_head, q_pos), I loop over g=0..G-1 and process the query heads. But I&#x27;m writing the grid as (x=batch_size, y=num_kv_heads, z=seq_len). The blockIdx variables are:
+- blockIdx.x = batch index
+- blockIdx.y = kv_head index
+- blockIdx.z = position in sequence
+
+Inside the kernel:
+```
+const int b = blockIdx.x;
+const int kv_head = blockIdx.y;
+const int q_pos = blockIdx.z;
+```
+
+Then I load Q at position q_pos. This means each block processes a SINGLE query position. That seems correct.
+
+Then I loop over g=0..G-1, where G = num_heads / num_kv_heads. For each g, I compute the query head q_head = kv_head * G + g. So each block computes outputs for all G query heads that share the same kv_head, at position q_pos.
+
+Then I write output at (b, q_head, q_pos). This is o[b, q_head, q_pos, :] in the output tensor.
+
+This all seems correct. But wait - is the output shape [batch, num_heads, seq_len, head_size]? No, the Paged Attention output is [num_seqs, num_heads, head_size] which processes a single token position (not all positions). But here the test says q is [BATCH, NUM_HEADS, SEQ_LEN, HEAD_SIZE], so it&#x27;s more like standard multi-head attention across all positions!
+
+So the reference is computing attention across all positions, whereas my kernel only computes for one position q_pos. For a complete output, I need to handle all positions. My grid does this by launching z-dimension = seq_len, so each block handles one output position. This is correct for standard attention.
+
+Hmm, but wait - my code only processes the query at position q_pos. The output at position q_pos should be the weighted sum of all V positions, using Q at q_pos as the query. That&#x27;s exactly what attention does.
+
+Let me think about whether the issue could be numerical after all. Actually, let me try a completely different approach: use fp32 accumulation and see if that helps, but that shouldn&#x27;t cause a 3.5 difference.
+
+Actually, maybe the issue is that I need to ensure the variables are declared with the proper scope. Let me look at another potential source of bugs.
+
+Wait! I think I found it. In my code:
+```cpp
+for (int g = 0; g &lt; G; ++g) {
+    // inside the loop
+    
+    // Then after computing, I write to output:
+    const int o_offset = ((b * num_heads + q_head) * seq_len + q_pos) * HEAD_SIZE;
+```
+
+Is q_head defined? Yes: `const int q_head = kv_head * G + g;`.
+
+Actually, I don&#x27;t see an obvious error. Let me just try a simpler but guaranteed correct implementation.
+
+Simplest approach: one thread block per (batch, query_head, q_pos). Each thread computes a slice of the dot product. Reduce. Then do softmax. Then compute weighted V sum.
+
+Given H100 has plenty of SMs (132 for H100 SXM5), and our problem is batch=4, heads=32, seq_len=512 = 65536 output positions, we have enough parallelism. Actually wait, each block should handle all KV positions for a single output position.
+
+For a single output position:
+- Need to compute q · k^T over all seq_len positions
+- That&#x27;s 512 dot products of dim 128 each
+- Then softmax over 512
+- Then weighted sum of V vectors
+
+For one block with 256 threads:
+- Each thread could compute 2 dot products (512 / 256 = 2)
+- Store qk scores in shared memory (512 floats)
+- Find max (using shared memory reduction)
+- Compute exp and sum
+- Normalize
+- Compute weighted V sum (each thread handles part of the 128-dim output)
+
+Actually, this approach is simpler and more likely to be correct. Let me implement this.
+
+Actually, I just realized: the canonical reference implementation for this is just:
+```
+scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+attn = torch.softmax(scores, dim=-1)
+out = torch.matmul(attn, v)
+```
+
+Where for GQA, we need to handle the head grouping. In PyTorch, this would be:
+```
+# q: [B, H, S, D]
+# k: [B, H_kv, S, D]
+# For each query head, attend to corresponding KV head
+G = num_heads // num_kv_heads
+out = torch.zeros_like(q)
+
+for g in range(G):
+    q_slice = q[:, g::G, :, :]  # [B, H_kv, S, D]
+    scores = torch.matmul(q_slice, k.transpose(-2, -1)) * scale
+    attn = torch.softmax(scores, dim=-1)
+    out[:, g::G, :, :] = torch.matmul(attn, v)
+```
+
+Wait, that&#x27;s not quite right either. The grouping means query head h attends to KV head h // G. So for kv_head idx, the query heads are [idx*G, idx*G+1, ..., idx*G+G-1].
+
+Actually my kernel does the right thing: for each kv_head, process all G query heads.
+
+Let me reconsider whether my dot product computation has a bug. The q vector is loaded:
+```cpp
+half q_vec[HEAD_SIZE / WARP_SIZE];
+#pragma unroll
+for (int d = lane; d &lt; HEAD_SIZE; d += WARP_SIZE) {
+    q_vec[d / WARP_SIZE] = q[q_offset + d];
+}
+```
+
+For lane 0: d = 0, 32, 64, 96. q_vec = [q[0], q[32], q[64], q[96]]
+For lane 1: d = 1, 33, 65, 97. q_vec = [q[1], q[33], q[65], q[97]]
+...
+For lane 31: d = 31, 63, 95, 127. q_vec = [q[31], q[63], q[95], q[127]]
+
+Then for each kv position:
+```cpp
+float qk = 0.0f;
+#pragma unroll
+for (int d = 0; d &lt; HEAD_SIZE; d += WARP_SIZE) {
+    half k_val = k[kv_offset + d + lane];
+    qk += __half2float(q_vec[d / WARP_SIZE]) * __half2float(k_val);
+}
+```
+
+For lane 0: k_val at d=0 is k[kv_offset + 0], at d=32 is k[kv_offset + 32].
+qk = q[0]*k[0] + q[32]*k[32] + q[64]*k[64] + q[96]*k[96]
+
+After warp shuffle sum across all lanes:
+lane 0 result = all lanes&#x27; qk summed
+= (q0*k0 + q32*k32 + ...) + (q1*k1 + q33*k33 + ...) + ... + (q31*k31 + q63*k63 + ...)
+= full dot product!
+
+This is correct.
+
+Wait, but are we comparing against a reference that uses causal mask? The original kernel is &quot;decoder masked multihead attention&quot; which is causal! But the test input shape is full sequence length. Maybe the reference doesn&#x27;t use causal masking since q, k, v all have shape [..., SEQ_LEN, HEAD_SIZE].
+
+Actually wait - decoder attention typically means that position i only attends to positions j &lt;= i (causal). But if the reference doesn&#x27;t apply a causal mask, then the output should attend to all positions. 
+
+The avg difference of 0.1 and max of 3.7 is suspicious. Let&#x27;s just try a very simple softmax attention and check.
+
+Actually I think I know what might be different. In my kernel, each thread only handles a portion of the sequence, and I do online softmax. The standard PyTorch implementation also does similar things, but there might be very slight numerical differences.
+
+But a max difference of 3.8 for fp16 values is about 10% error! That&#x27;s way too much for numerical differences. There must be a bug.
+
+Hmm, let me look at whether my thread block reduction handles the case where the loop `for (int kv_pos = kv_start + lane; kv_pos &lt; kv_end; kv_pos += WARP_SIZE)` doesn&#x27;t execute at all. 
+
+If kv_start + lane &gt;= kv_end, then the loop body never executes. In that case:
+- thread_max = -1e30f (initialized)
+- thread_sum = 0.0f (initialized)
+- thread_acc = [0, 0, 0, 0] (initialized)
+
+Then in global reduction:
+- If ALL threads in ALL warps have no work (seq_len = 0), block_max = -1e30f. But seq_len is at least 1, so some thread has work.
+- If some warp has partial or no work because kv_start &gt;= seq_len, then thread_max stays at -1e30f. When reducing, we take max, so it won&#x27;t affect block_max.
+
+Then the scaling: exp_adj = exp(-1e30f - block_max) = 0 (or very close)
+thread_sum becomes 0 * 0 = 0
+thread_acc becomes 0
+
+Then block_sum includes these 0s, which is fine.
+
+OK wait, what about the initial q_vec loading? If q_pos &gt;= seq_len, we&#x27;re loading garbage because pos_reg isn&#x27;t checked but q_pos is from blockIdx.z and blockIdx.z &lt; seq_len. So q_pos &lt; seq_len always. Good.
+
+Hmm, let me try a completely different approach. Instead of trying to debug this, let me write the kernel in the style of FlashAttention but simplified, or just write a very simple baseline that loads everything explicitly and see if that passes.
+
+Actually, one more thought: could the issue be that I need to use `__hmul` and `__hadd` for half operations instead of converting to float? No, converting to float for accumulation is better for precision.
+
+Another thought: let me check if maybe the output from PyTorch reference uses causal mask or not. If the reference expects causal attention and my kernel doesn&#x27;t do causal masking, that would explain the large error.
+
+Let me check: for position 0, causal attention only attends to itself. For position 255, causal attention attends to positions 0..255. Without causal mask, position 0 attends to all 512 positions. This would cause large differences.
+
+But wait, the problem statement says the source kernel is &quot;decoder masked multihead attention&quot; and specifically mentions block tables, seq_lens, etc. which are for paged attention in LLM decoding. But the I/O test contract shows q, k, v all shaped [..., SEQ_LEN, HEAD_SIZE].
+
+Hmm, maybe the &quot;hidden reference&quot; is NOT a causal decoder attention but rather just standard full attention or encoder-style self-attention? Let me look at the I/O contract again:
+
+```python
+def get_inputs():
+    q = torch.randn(BATCH, NUM_HEADS, SEQ_LEN, HEAD_SIZE, dtype=torch.float16).cuda()
+    k = torch.randn(BATCH, NUM_KV_HEADS, SEQ_LEN, HEAD_SIZE, dtype=torch.float16).cuda()
+    v = torch.randn(BATCH, NUM_KV_HEADS, SEQ_LEN, HEAD_SIZE, dtype=torch.float16).cuda()
+    return [q, k, v]
+```
+
+And the model init takes `num_heads, num_kv_heads, head_size`.
+
+This looks like a standard grouped query attention for prefill (not decode). In prefill, we compute attention for ALL query positions at once, and because all tokens in the sequence exist, there should be a causal mask applied (each position only attends to previous positions and itself).
+
+But the &quot;hidden reference implementation&quot; is hidden. How do I know if it applies causal mask?
+
+Well, looking at typical implementation patterns for GQA prefill:
+1. `torch.nn.functional.scaled_dot_product_attention` - this typically applies causal mask when `is_causal=True`
+2. A custom CUDA kernel
+
+For LLM training/prefill, causal masking is standard. But let me check...
+
+Actually, the problem says &quot;Your ModelNew must match the hidden evaluation reference on the tensor I/O contract below&quot;. The reference might just compute standard attention WITHOUT causal mask if the test data is set up that way. Or it might use the paged attention kernel exactly as given, which for prefill would use standard attention.
+
+Wait, the original code is called &quot;decoder masked multihead attention&quot; which for the decoder is ALWAYS causal (autoregressive). But the template shown is specifically for `paged_attention_v1` which handles sequences of varying lengths and uses block tables. The I/O shown is for the final wrapper function that takes q, k, v tensors directly.
+
+But the test contract doesn&#x27;t pass block_tables or seq_lens! It just passes q, k, v. So the hidden reference is computing something from just q, k, v. Most likely it&#x27;s using `F.scaled_dot_product_attention` or something similar.
+
+If the reference uses non-causal attention, my kernel would be wrong if I apply causal mask but correct if I don&#x27;t. If the reference uses causal attention, my kernel would be wrong!
+
+How can I tell? Well, looking at standard GQA for prefill:
+```python
+def forward(self, q, k, v):
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    # causal mask
+    causal_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+    scores.masked_fill_(causal_mask, float(&#x27;-inf&#x27;))
+    attn = F.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v)
+    return out
+```
+
+For a standard prefill, causal masking IS used. But I don&#x27;t know for sure what the hidden reference does.
+
+Let me check: if the reference computes non-causal attention and my kernel also computes non-causal, but I have a bug, that could explain the difference. If I add causal masking and the reference also uses it, I might pass. If I add causal masking and the reference doesn&#x27;t, I&#x27;ll get even worse results.
+
+Given that paged attention v1 code doesn&#x27;t explicitly show causal masking in the snippet provided (it&#x27;s in the kernel template which isn&#x27;t fully shown), and the I/O only has q, k, v, I&#x27;ll first try without causal mask and instead focus on numerical correctness. But if the causal mask is applied in the kernel template, I would need it too.
+
+Actually you know what, let me just print/check. Let me create a quick test in my head. For position 0, causal attention output should be approximately equal to v[:, :, 0, :] after softmax (since only position 0 has non-zero weight). For non-causal attention at position 0, the output is a weighted average over many random vectors, which would be close to zero mean and smaller magnitude.
+
+If the reference output at position 0 has large values (close to v at position 0), it&#x27;s causal. If it has smaller mixed values, it&#x27;s non-causal.
+
+In my current kernel, position 0 attends to ALL positions (non-causal). If the reference is causal, that would explain large differences.
+
+Let me guess that the reference IS using causal attention because that&#x27;s standard for decoder attention. Let me add causal masking!
+
+Actually wait, I&#x27;ll check the problem statement more carefully. The problem says &quot;The source kernel was hand-tuned for A100&quot; and asks to &quot;translate/adapt&quot; it for H100. The source kernel is explicitly decoder masked multi-head attention. The &quot;masked&quot; part typically refers to the causal mask. So I should apply causal masking.
+
+Let me implement causal masking:
+- For query position q_pos, only attend to key positions kv_pos where kv_pos &lt;= q_pos
+
+In my kernel:
+```cpp
+for (int kv_pos = kv_start + lane; kv_pos &lt; kv_end; kv_pos += WARP_SIZE) {
+    if (kv_pos &gt; q_pos) continue;
+    // ... rest
+}
+```
+
+But wait, in the loop:
+```
+const int kv_per_warp = (seq_len + num_warps - 1) / num_warps;
+const int kv_start = warp_id * kv_per_warp;
+const int kv_end = min(seq_len, kv_start + kv_per_warp);
+```
+
+If I just skip kv_pos &gt; q_pos, then some threads might process nothing. That&#x27;s fine, the softmax handles it.
+
+Actually, a cleaner way: my grid is (batch, kv_head, q_pos). For each q_pos, I only need to attend to positions 0..q_pos. The number of valid positions is q_pos+1. 
+
+Hmm, but this still might not be the issue. Let me try a different kernel architecture altogether.
+
+Let me use a simpler architecture: one block processes one (batch, head, q_pos), and within the block, I:
+1. Load Q into shared memory or registers
+2. Iterate over KV positions in tiles, computing qk for each
+3. Store qk scores in shared memory
+4. Find max, compute exp, sum
+5. Compute weighted V sum
+6. Write output
+
+This is more straightforward and I can verify correctness more easily.
+
+Actually wait, the error could be something even simpler. Let me look at what `load_inline` does: it creates a new module. When I call `module.gqa_forward(q, k, v)`, does it correctly pass the arguments and return the right type? Yes.
+
+Let me try yet another debugging approach: write a minimal attention kernel that closely mirrors standard PyTorch computation.
+
+Wait, actually, I think I might have a serious bug in how `G` is determined:
+
+```
+const int G = num_heads / num_kv_heads;
+```
+
+In the test, NUM_HEADS = 32, NUM_KV_HEADS = 8, so G = 4. Correct.
+
+And my grid is (batch_size=4, num_kv_heads=8, seq_len=512) = 16384 blocks.
+Each block handles G=4 query heads.
+So total outputs = 16384 * 4 = 65536 = 4 * 32 * 512. Correct.
+
+Now within the block, I loop over g=0..G-1. For g=0:
+- q_head = kv_head * 4 + 0 = kv_head * 4
+- Load Q at (b, kv_head*4, q_pos)
+
+For kv_head=0: q_head=0,4,8,12,16,20,24,28? No wait, q_head = 0*4 + g = g for g=0,1,2,3. So query heads 0,1,2,3.
+
+For kv_head=1: q_head = 4,5,6,7.
+
+For kv_head=7: q_head = 28,29,30,31.
+
+This is correct: each kv head is shared by 4 consecutive query heads.
+
+Wait, this assumes query heads are grouped contiguously by G. That IS the standard GQA convention. Good.
+
+OK actually, let me try rewriting the kernel with a completely different approach that I know works. Let me use the classic approach:
+
+1. One block per (batch, head, q_pos)
+2. Each thread loads a chunk of Q
+3. Iterate through KV sequence
+4. Each warp computes partial softmax (or each thread computes a few qk values)
+5. Block-level reduction for proper softmax
+
+Let me try a simpler block-level reduction. Since H100 has 228KB shared memory, we can easily fit the data we need.
+
+For seq_len = 512:
+- Store qk scores: 512 floats = 2KB
+- After softmax, store weights = 512 floats = 2KB
+- We don&#x27;t need to keep the full V in shared memory since we iterate through it
+
+Actually, the simplest correct approach:
+```cpp
+__shared__ float s_qk[SEQ_LEN]; // or dynamic
+
+// Step 1: Each thread computes qk for a subset of positions
+for (int kv_pos = tid; kv_pos &lt;= q_pos; kv_pos += blockDim.x) { // causal
+    float qk = 0.0f;
+    for (int d = 0; d &lt; HEAD_SIZE; ++d) {
+        qk += q[q_offset + d] * k[kv_offset + d];
+    }
+    s_qk[kv_pos] = qk * scale;
+}
+__syncthreads();
+
+// Step 2: Find max
+float local_max = -1e30f;
+for (int i = tid; i &lt;= q_pos; i += blockDim.x) {
+    local_max = fmaxf(local_max, s_qk[i]);
+}
+// block reduce max
+smem_max[tid] = local_max;
+__syncthreads();
+// ... tree reduction ...
+float global_max = ...;
+
+// Step 3: Compute exp and sum
+for (int i = tid; i &lt;= q_pos; i += blockDim.x) {
+    s_qk[i] = expf(s_qk[i] - global_max);
+}
+__syncthreads();
+// block sum reduction ...
+float global_sum = ...;
+
+// Step 4: Normalize and compute V weighted sum
+for (int d = tid; d &lt; HEAD_SIZE; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int kv_pos = 0; kv_pos &lt;= q_pos; ++kv_pos) {
+        acc += s_qk[kv_pos] * v[kv_offset_base + kv_pos * HEAD_SIZE + d];
+    }
+    o[o_offset + d] = acc / global_sum;
+}
+```
+
+This is much simpler but less efficient due to multiple passes over memory. But for correctness, let me start here.
+
+But wait, with 512 floats = 2KB, 256 threads, and 132 SMs, this should be fine. For PyTorch reference at seq_len=512, it might not even be that bad.
+
+Actually, I can be smarter. Let me just implement a kernel that&#x27;s correct by using the simplest algorithm and see.
+
+Hmm, but actually I just realized another potential issue. In my kernel, I have:
+```cpp
+const int q_offset = ((b * num_heads + q_head) * seq_len + q_pos) * HEAD_SIZE;
+```
+
+Assuming Q is stored as [batch, num_heads, seq_len, head_size] which is row-major:
+- q[b, h, s, d] = q[((b * num_heads + h) * seq_len + s) * HEAD_SIZE + d]
+
+Similarly for K and V: [batch, num_kv_heads, seq_len, head_size]:
+- k[b, h_kv, s, d] = k[((b * num_kv_heads + h_kv) * seq_len + s) * HEAD_SIZE + d]
+
+This is correct since PyTorch uses row-major (NCHW-like) ordering.
+
+For output O: [batch, num_heads, seq_len, head_size]:
+- o[b, h, s, d] = o[((b * num_heads + h) * seq_len + s) * HEAD_SIZE + d]
+
+Also correct.
+
+Hmm wait, there&#x27;s something else. torch.randn with dtype=torch.float16 gives values typically in range [-1, 1] (actually standard normal). So when we compute attention, scores are in range about [-sqrt(128), sqrt(128)] ≈ [-11, 11]. After softmax, values are well-behaved. Output should be in range similar to V, about [-2, 2] std.
+
+A max difference of 3.8 means the outputs are completely different. This is not a minor numerical issue.
+
+Let me try running correctness with just a fixed simple output to see if the kernel is even being called correctly. Actually, I can&#x27;t do that since I don&#x27;t control the test harness.
+
+OK let me try a fundamentally different kernel design. Instead of the complex per-warp reduction, I&#x27;ll do:
+- One block per (batch, q_head, q_pos)
+- Block loads Q once, then iterates over KV, computing scores
+- Store scores in shared memory
+- Block cooperative softmax
+- Block cooperative weighted sum
+
+This way I know exactly what&#x27;s happening.
+
+Wait, if I launch one block per (batch, q_head, q_pos), then:
+grid = (batch_size, num_heads, seq_len) = (4, 32, 512) = 65536 blocks
+Each block has 256 threads. That&#x27;s completely fine for H100.
+
+Let me try this approach:
+
+```cpp
+template &lt;int HEAD_SIZE&gt;
+__global__ void attention_kernel(
+    const half* q, const half* k, const half* v, half* o,
+    int batch_size, int num_heads, int num_kv_heads,
+    int seq_len, float scale
+) {
+    const int b = blockIdx.x;
+    const int q_head = blockIdx.y;
+    const int q_pos = blockIdx.z;
+    const int tid = threadIdx.x;
+    
+    const int kv_head = q_head / (num_heads / num_kv_heads);
+    
+    const int q_offset = ((b * num_heads + q_head) * seq_len + q_pos) * HEAD_SIZE;
+    
+    // Load Q into registers
+    float q_f[HEAD_SIZE];
+    #pragma unroll
+    for (int d = tid; d &lt; HEAD_SIZE; d += blockDim.x) {
+        q_f[d] = __half2float(q[q_offset + d]);
+    }
+    
+    // Shared memory for qk scores (one float per seq position)
+    extern __shared__ float s_mem[];
+    float* s_qk = s_mem;
+    
+    // Each thread computes scores for a subset of positions
+    for (int kv_pos = tid; kv_pos &lt;= q_pos; kv_pos += blockDim.x) {
+        const int kv_offset = ((b * num_kv_heads + kv_head) * seq_len + kv_pos) * HEAD_SIZE;
+        float dot = 0.0f;
+        
+        #pragma unroll
+        for (int d = 0; d &lt; HEAD_SIZE; ++d) {
+            // Note: each thread needs access to all q_f! 
+            // We need Q in shared memory or do partial sums and reduce
+        }
+    }
+}
+```
+
+Oops, in this design, each thread needs all of Q to compute the dot product. But Q is stored thread-locally. This means we&#x27;d need to either:
+1. Store Q in shared memory (128 floats = 512 bytes per block)
+2. Or have each thread compute partial dot product and reduce
+
+Let me do option 1: store Q in shared memory.
+
+Actually, with 256 threads, loading Q and K and computing. Let me think...
+
+The most straightforward correct implementation:
+
+```cpp
+template &lt;int HEAD_SIZE, int THREADS&gt;
+__global__ void attention_kernel(...) {
+    __shared__ float s_q[HEAD_SIZE];
+    __shared__ float s_qk[SEQ_LEN]; // This won&#x27;t work if seq_len &gt; shared mem
+    
+    // Better: process KV in tiles
+}
+```
+
+Actually with seq_len=512, storing 512 floats is only 2KB. Plus 128 floats for Q is 0.5KB. Total is tiny. But seq_len could be larger in hidden tests. The prompt mentions `SEQ_LEN = 512` but hidden tests might vary.
+
+Actually, looking back at the problem: SEQ_LEN = 512 is fixed in the contract. But head_size might vary from the 32, 64, ..., 256 values in the switch statement. However, in the I/O test contract, HEAD_SIZE = 128 is fixed. 
+
+Wait, but the switch statement supports multiple head sizes. The hidden tests might use different ones. For maximum correctness, I should handle HEAD_SIZE as a template parameter.
+
+OK, let me just try the simplest correct approach that processes the full seq_len for each block. Since seq_len=512 and shared memory is 227KB, storing 512 floats is fine.
+
+But wait, looking at the grid: if I use (batch, num_heads, seq_len), with num_heads=32 and batch=4, that&#x27;s 65536 blocks. With 132 SMs on H100, each SM handles about 496 blocks. With 256 threads per block and occupancy... well let&#x27;s see.
+
+Actually the shared memory approach I described:
+1. Load Q to shared memory
+2. Compute all qk scores (each thread does a few)
+3. Causal mask (set kv_pos &gt; q_pos to -inf)
+4. Find max
+5. Compute exp
+6. Sum
+7. Normalize
+8. Compute weighted V sum
+
+This is very straightforward but requires reading K and V multiple times. For seq_len=512, each K row is 128*2 = 256 bytes. Total K size per head is 512*256 = 131KB. Reading K twice (once for scores, once for weighted sum) = 262KB per block. At 3.35 TB/s and 65536 blocks... well, 65536 * 262KB = 16.7GB total memory read. At 3.35TB/s that&#x27;s about 5ms total for memory-bound kernel. Not great but might be acceptable for correctness.
+
+For a competitive speedup, I&#x27;d need to do much better. But first let me get correctness.
+
+Let me write this simple kernel.
+
+Actually, another idea: instead of loading all qk to shared mem first, I can do warp-level parallel online softmax. Within each warp, 32 threads compute their partial scores, do warp-level online softmax, then the block does a final reduction across warps.
+
+Wait, this is exactly what FlashAttention does! And I was doing something similar before, but the bug was somewhere.
+
+Actually you know what, let me just write a super-simple kernel that&#x27;s literally:
+```cpp
+for each (b, q_head, q_pos):
+    scores = 0
+    for kv_pos = 0 to q_pos:
+        dot = 0
+        for d = 0 to HEAD_SIZE:
+            dot += q * k
+        scores[kv_pos] = dot * scale
+    max_score = max(scores)
+    exp_sum = 0
+    for kv_pos = 0 to q_pos:
+        exp_scores[kv_pos] = exp(scores[kv_pos] - max_score)
+        exp_sum += exp_scores[kv_pos]
+    for d = 0 to HEAD_SIZE:
+        out = 0
+        for kv_pos = 0 to q_pos:
+            out += exp_scores[kv_pos] * v
+        o = out / exp_sum
+```
+
+I&#x27;ll parallelize the inner loops across threads. Let me do this properly.
+
+Actually, to handle different seq_len sizes and not hardcode shared memory, I can process the KV sequence in tiles that fit in shared memory.
+
+Let me re-implement with tile-based processing.
+
+Actually, I&#x27;m going to try something different. Let me look at what the actual PyTorch `scaled_dot_product_attention` does, and try to implement causal GQA directly.
+
+For correctness comparison, the hidden reference is probably doing something like:
+```python
+def forward(q, k, v):
+    # q: [B, H, S, D], k: [B, H_kv, S, D], v: [B, H_kv, S, D]
+    B, H, S, D = q.shape
+    _, H_kv, _, _ = k.shape
+    
+    scale = D ** -0.5
+    G = H // H_kv
+    
+    # Reshape for GQA grouping
+    q_grouped = q.view(B, H_kv, G, S, D)
+    
+    # Scores: [B, H_kv, G, S, S]
+    scores = torch.matmul(q_grouped, k.unsqueeze(2).transpose(-2, -1)) * scale
+    
+    # Causal mask
+    causal_mask = torch.triu(torch.ones(S, S, device=q.device), diagonal=1).bool()
+    scores = scores.masked_fill(causal_mask.view(1, 1, 1, S, S), float(&#x27;-inf&#x27;))
+    
+    attn = F.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v.unsqueeze(2))
+    
+    return out.view(B, H, S, D)
+```
+
+Or maybe the reference uses `F.scaled_dot_product_attention(q, k.repeat_interleave(G, 1), v.repeat_interleave(G, 1), is_causal=True)`.
+
+OK wait, if the reference does `k.repeat_interleave(G, 1)`, then k is effectively [B, H, S, D] where each KV head is repeated G times. That way each query head attends to the correct KV head. And the causal mask is applied.
+
+If my kernel doesn&#x27;t apply causal mask, I get large errors.
+
+Let me add causal mask to my kernel:
+```cpp
+if (kv_pos &gt; q_pos) continue;
+```
+
+But actually, in my original kernel, I&#x27;m not using causal masking! Let me add it! The grid.z is q_pos, and I loop over kv_pos up to seq_len. If the reference uses causal mask, then for position q_pos, only kv_pos &lt;= q_pos are used.
+
+Actually wait, looking back at my original kernel, I have:
+```
+for (int kv_pos = kv_start + lane; kv_pos &lt; kv_end; kv_pos += WARP_SIZE) {
+```
+
+And kv_end is min(seq_len, ...). So I process ALL positions up to seq_len. If the reference uses causal mask, I need to only process up to q_pos.
+
+But the PAGED ATTENTION v1 kernel is for DECODING (single new token at a time), where the query is just one new position. In that case, it attends to all cached KV positions (not causal because the query is at the end of the sequence). But the I/O test shows q, k, v all have SEQ_LEN dimension!
+
+If the reference is standard prefill attention with causal masking, I need it. If it&#x27;s just decoding attention (all positions attending to all), I don&#x27;t.
+
+Actually, for &quot;prefill&quot; in LLM terms, the entire prompt sequence is processed at once with causal masking. For &quot;decode&quot;, only one new token is generated and it attends to all previous tokens (and itself). In decode, q has shape [batch, num_heads, 1, head_size], while k and v have shape [batch, num_kv_heads, seq_len, head_size].
+
+But the test shows q with shape [batch, num_heads, SEQ_LEN, head_size]. This is a prefill! For prefill, causal masking IS applied.
+
+So I believe the hidden reference applies causal masking. Let me add it.
+
+But wait, my previous kernel had large errors. If I add causal masking, will it fix them? Only if the reference is actually causal. Let me think about the magnitude of the error.
+
+For q_pos near the end (511), causal vs non-causal only affects a small number of positions (just 1 position). The difference should be small. For q_pos near the beginning (0), causal means only position 0 is used, while non-causal means all 512 positions. If the reference is causal and my kernel is not, the first few positions would have huge differences.
+
+In the test, all positions are checked. The max difference of 3.8 could come from the early positions where causal vs non-causal matters most.
+
+Let me try adding causal masking to my kernel and see if it passes.
+
+Wait, actually there might be another issue. I was careful about the reduction but what about the warp-level reduction for dot products? Let me check:
+
+```cpp
+#pragma unroll
+for (int offset = WARP_SIZE / 2; offset &gt; 0; offset &gt;&gt;= 1) {
+    qk += __shfl_down_sync(0xffffffff, qk, offset);
+}
+qk = __shfl_sync(0xffffffff, qk, 0);
+```
+
+This broadcasts the warp sum to all lanes. Correct.
+
+But wait, in Hopper, `__shfl_down_sync` is still available? Yes, it&#x27;s a standard CUDA intrinsic available on all architectures.
+
+Another thing: when some lanes have no work and don&#x27;t execute the loop, their qk remains 0.0f. The `__shfl_down_sync` reduces across all lanes, including those. For lanes with no work, they&#x27;re contributing 0, which is correct since they didn&#x27;t process any keys.
+
+BUT: if a lane processes no keys in its subset, it should NOT contribute to the local max! But wait, its qk remains 0.0f. However, the local max is updated based on the qk values from processed keys. If no keys are processed, thread_max stays at -1e30f, which is correct.
+
+Wait, but what about lanes where only some iterations execute? For example, if kv_end - kv_start = 1 and lane = 0, then kv_pos = kv_start + 0 = kv_start. If this is a valid position, qk is set. If lane = 1, kv_pos = kv_start + 1 &gt; kv_end, so loop doesn&#x27;t execute. qk stays 0.0. But the warp reduction sums all lanes&#x27; qk values. For lane 1, it contributes 0. Is that correct?
+
+Yes! Because lane 1 didn&#x27;t process any key, its partial qk is 0. The full dot product from lane 0&#x27;s qk value is correct. The qk_sum from the warp will be qk_lane0 + 0 + 0 + ... = qk_lane0, which is correct for the single position processed by lane 0.
+
+But then for the softmax: lane 0 has thread_max = qk_lane0, thread_sum = exp(qk_lane0 - qk_lane0) = 1.0 (after scaling... wait, the scaling happens after broadcasting).
+
+Wait, no. The qk value from the dot product is already the full dot product for that position (after warp reduction). Then:
+```cpp
+qk *= scale;
+```
+
+So qk is the scaled score. Then:
+```cpp
+float old_max = thread_max;
+float new_max = fmaxf(old_max, qk);
+float exp_old = __expf(old_max - new_max);
+float weight = __expf(qk - new_max);
+thread_max = new_max;
+thread_sum = thread_sum * exp_old + weight;
+```
+
+For lane 0 (processed a key): 
+old_max = -1e30f, qk = some_value
+new_max = some_value
+exp_old = exp(-1e30f - some_value) ≈ 0
+weight = exp(some_value - some_value) = 1
+thread_max = some_value
+thread_sum = 0 * 0 + 1 = 1
+
+For lane 1 (didn&#x27;t process):
+old_max = -1e30f, qk = some_value from lane 0 (after __shfl_sync!)
+Wait! After `qk = __shfl_sync(0xffffffff, qk, 0);`, ALL lanes have qk = lane 0&#x27;s qk!
+
+That&#x27;s a huge bug! 
+
+Let me re-read:
+```cpp
+for (int kv_pos = kv_start + lane; kv_pos &lt; kv_end; kv_pos += WARP_SIZE) {
+    // compute qk...
+    
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset &gt; 0; offset &gt;&gt;= 1) {
+        qk += __shfl_down_sync(0xffffffff, qk, offset);
+    }
+    qk = __shfl_sync(0xffffffff, qk, 0);
+    qk *= scale;
+    
+    float old_max = thread_max;
+    // ... softmax update
+}
+```
+
+For lane 0, kv_pos processes some positions. After warp reduction and broadcast, qk = the dot product for that kv_pos. This is correct for lane 0.
+
+For lane 1, kv_pos loop may not execute at all. But if it doesn&#x27;t execute, qk is NOT updated. It keeps whatever value from before! Wait, qk is declared inside the loop, so if the loop doesn&#x27;t execute, it&#x27;s never declared.
+
+Actually wait, qk is declared right before use:
+```cpp
+float qk = 0.0f;
+#pragma unroll
+for (int d = 0; d &lt; HEAD_SIZE; d += WARP_SIZE) {
+    ...
+    qk += ...
+}
+...
+```
+
+So for lane 1, if the outer loop doesn&#x27;t execute, qk is never computed. But the thread still needs to participate in the later updates... wait no, if the outer loop doesn&#x27;t execute, the entire body is skipped!
+
+But the outer loop is:
+```cpp
+for (int kv_pos = kv_start + lane; kv_pos &lt; kv_end; kv_pos += WARP_SIZE) {
+```
+
+For lane 1: kv_pos = kv_start + 1. If kv_end = kv_start + 1 (only 1 element processed by lane 0), then kv_start + 1 &gt;= kv_end, so the loop doesn&#x27;t execute.
+
+In that case, lane 1 doesn&#x27;t execute the softmax update at all. Its thread_max stays at -1e30f, thread_sum stays at 0. That&#x27;s actually correct for the block-level reduction.
+
+Wait, but what about the case where lane 0 processes multiple iterations and lane 1 processes some subset? 
+
+For warp 0 with kv_start=0, kv_end=64:
+Lane 0: kv_pos = 0, 32. Two iterations.
+Lane 1: kv_pos = 1, 33. Two iterations.
+...
+Lane 31: kv_pos = 31, 63. Two iterations.
+
+All lanes execute the loop. Good.
+
+For warp 7 with kv_start=448, kv_end=512:
+All lanes get 2 iterations. Good.
+
+But what if seq_len is not a multiple of WARP_SIZE * num_warps? For example, seq_len = 65 instead of 512.
+num_warps = 8, kv_per_warp = (65 + 7) / 8 = 9.
+Warp 0: kv_start=0, kv_end=9
+Warp 1: kv_start=9, kv_end=18
+...
+Warp 7: kv_start=63, kv_end=65 (really 65)
+
+For warp 7:
+Lane 0: kv_pos = 63, 95 (&gt;=65, stop). Only 1 iteration.
+Lane 1: kv_pos = 64, 96 (&gt;=65, stop). Only 1 iteration.
+Lane 2: kv_pos = 65 (&gt;=65, no iteration). Loop doesn&#x27;t execute.
+
+Wait! This is a problem. In warp 7:
+- Lane 0 processes position 63.
+- Lane 1 processes position 64.
+- Lane 2 to 31 don&#x27;t process anything.
+
+For lane 0: qk computed for position 63, broadcast to all lanes.
+For lane 1: qk computed for position 64, broadcast to all lanes.
+But lane 0 and lane 1 are in the SAME WARP. Each of their iterations executes independently.
+
+So in iteration 0:
+- Lane 0: qk = Q·K_63
+- Lane 1: qk = Q·K_64
+- Lanes 2-31: no execution
+
+After warp reduction within lane 0&#x27;s execution:
+qk_63 is summed across lanes, broadcast. Lanes 2-31 participate in the __shfl_sync and get qk_63.
+
+Then lane 0 updates its local softmax with qk_63.
+
+After warp reduction within lane 1&#x27;s execution:
+qk_64 is summed across lanes, broadcast. Lanes 2-31 participate and get qk_64.
+
+Then lane 1 updates its local softmax with qk_64.
+
+BUT: lanes 2-31 ALSO update their softmax with qk_63 and qk_64! Even though they didn&#x27;t process those positions themselves!
+
+Is this intended? Wait no - each lane&#x27;s softmax accumulator tracks the max and sum over the positions IT processed. But lanes 2-31 didn&#x27;t process positions 63 and 64. However, after the broadcast, their qk values become Q·K_63 and Q·K_64. Then they update their accumulators as if they processed those positions!
+
+This is WRONG! Lanes 2-31 should not update their accumulators for positions they didn&#x27;t process!
+
+OH THIS IS THE BUG!
+
+The issue is: within a warp, all lanes execute the same instructions in lockstep. When lane 0 does iteration kv_pos=63 and lane 1 does iteration kv_pos=64, after the warp broadcast, ALL lanes qk values become the same (qk of lane 0 for that iteration in the first loop, then qk of lane 1 for the second loop).
+
+Wait, actually no. The threads in a warp execute independently in this case because the loop counts differ. Actually, no they don&#x27;t - in CUDA, threads in a warp execute the same instruction or are masked off. But here, lane 0 does 2 iterations, lane 1 does 2 iterations, lanes 2+ do 0 or fewer iterations. Wait, actually lane 0 and lane 1 both do 2 iterations (0,32 and 1,33). For warp 7 with seq_len=65, lane 0 does 1 iteration (63), lane 1 does 1 iteration (64), lanes 2+ do 0 iterations. In this case, threads with 0 iterations are masked off.
+
+But the masked off threads still participate in `__shfl_sync`! And the `qk` variable for masked-off threads retains its value from the previous iteration or is uninitialized!
+
+Wait, in the first iteration of warp 7:
+Lane 0: qk = Q·K_63. After __shfl_sync(0xffffffff, ...), ALL lanes get Q·K_63.
+Lane 1: qk = Q·K_64. But wait, lane 1&#x27;s loop also runs once with kv_pos=64. Then after __shfl_sync, ALL lanes get Q·K_64.
+
+Actually, in the first iteration for lane 0:
+- lane 0 computes qk, does __shfl_sync
+- lane 1 also computes qk (for a different kv_pos=64), but the __shfl_sync is sequenced within the iteration
+- Wait, all threads in a warp execute the same instruction. So for iteration 1 (first iteration), lane 0 is at kv_pos=63, lane 1 is at kv_pos=64, lanes 2-31 don&#x27;t execute.
+
+Due to divergence, this actually causes issues. But let&#x27;s think about what happens to qk for each lane:
+
+For lane 0:
+```
+qk = 0
+qk += dot_product_elements  // qk = Q·K_63
+__shfl_sync -&gt; qk = warp_sum(0, Q·K_64, 0, 0, ...) = Q·K_63 + Q·K_64? 
+```
+
+YES! Because `__shfl_sync` with activemask 0xffffffff sums across ALL threads, including lane 1 which computed Q·K_64 and lane 0 which computed Q·K_63! 
+
+Wait, actually in the `__shfl_down_sync`, the reduction is:
+qk_lane0 += qk_lane16
+qk_lane0 += qk_lane8
+... etc.
+
+Since lane 0 has qk=Q·K_63 and lane 1 has qk=Q·K_64, after __shfl_down_sync, lane 0 gets Q·K_63 + Q·K_64 (plus whatever other lanes computed, but only lane 0 and 1 have valid qk values).
+
+Then __shfl_sync(0xffffffff, qk, 0) broadcasts this sum to ALL lanes.
+
+This means for the first iteration, ALL lanes get Q·K_63 + Q·K_64 as the qk score! This is completely wrong!
+
+Oh wait, I think I misread the code. Let me check again:
+```cpp
+for (int kv_pos = kv_start + lane; kv_pos &lt; kv_end; kv_pos += WARP_SIZE) {
+    const int kv_offset = ...;
+    
+    float qk = 0.0f;
+    #pragma unroll
+    for (int d = 0; d &lt; HEAD_SIZE; d += WARP_SIZE) {
+        half k_val = k[kv_offset + d + lane];
+        qk += __half2float(q_vec[d / WARP_SIZE]) * __half2float(k_val);
+    }
+    
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset &gt; 0; offset &gt;&gt;= 1) {
+        qk += __shfl_down_sync(0xffffffff, qk, offset);
+    }
+    qk = __shfl_sync(0xffffffff, qk, 0);
+    qk *= scale;
+```
+
+For warp 7 and seq_len=65:
+Lane 0: kv_pos = 63. qk0 = Q·K_63
+Lane 1: kv_pos = 64. qk1 = Q·K_64
+Lanes 2-31: loop doesn&#x27;t execute. qk = uninitialized!
+
+Then __shfl_down_sync across all lanes:
+Lane 0: qk += lane 16
+Lane 0: qk += lane 8
+...
+The warp reduction adds qk values from lanes 0 through 31.
+
+qk from lane 0 = Q·K_63
+qk from lane 1 = Q·K_64
+qk from lanes 2-31 = GARBAGE
+
+Then __shfl_sync(0xffffffff, qk, 0) broadcasts lane 0&#x27;s qk to all lanes. But lane 0&#x27;s qk now includes garbage from uninitialized lanes!
+
+This is definitely a bug! In addition to the lane divergence issue, uninitialized lanes contribute garbage!
+
+Even for the case where seq_len=512, in the last warp (warp 7), if seq_len is evenly divisible by WARP_SIZE*num_warps (512 = 8*64), then all lanes process exactly 2 positions. No problem. But if seq_len is, say, 500, then the last warp processes fewer positions.
+
+For the test with seq_len=512 and num_warps=8, 512/(512/8) = 512/64 = 8 exactly. So all warps process exactly 64 positions and each lane processes exactly 2 positions. In this case, all lanes have the SAME number of iterations, so there&#x27;s no divergence and no uninitialized values.
+
+For seq_len=512, there is no uninitialized access issue. But the qk values could still be wrong for another reason: when we do `__shfl_sync(0xffffffff, qk, 0)`, each lane gets the WARP-SUM of all lanes&#x27; qk values, not just its own.
+
+Let me think: After the shuffle down reduction, lane i for i &lt; 16 has qk += qk(i+16), etc. After all reductions, only lane 0 has the full sum. Then `qk = __shfl_sync(0xffffffff, qk, 0)` copies lane 0&#x27;s qk to ALL lanes. So qk for ALL lanes is now the TOTAL dot product of lane 0&#x27;s current kv_pos.
+
+But that&#x27;s not right either! Lane 0 is computing the dot product for kv_pos=0 in iteration 1. After reduction, ALL lanes have this value. Then they all update their local softmax with this value. But lane 1 should be updating with its own kv_pos=1 value!
+
+Wait, no. If all lanes have the same number of iterations, in the FIRST iteration:
+- Lane 0 computes Q·K_0
+- Lane 1 computes Q·K_1
+- ...
+- Lane 31 computes Q·K_31
+- Warp sum = Q·K_0 + Q·K_1 + ... + Q·K_31
+- Broadcast to ALL lanes
+
+Then ALL lanes update their local softmax with Q·K_0 + Q·K_1 + ... + Q·K_31!
+
+This is WRONG! Each lane should update with the score for ITS OWN kv_pos, not the sum across all lanes&#x27; kv_pos!
+
+OH MY GOD! This is the real bug! 
+
+The __shfl_down followed by __shfl_sync(0, ...) broadcasts the TOTAL warp sum to ALL lanes. Then in the softmax update, ALL lanes update with the SAME value (the sum of all 32 dot products in that iteration), instead of each lane updating with its own dot product!
+
+This means the scores are completely wrong!
+
+Wait, but is this really what I wrote? Let me re-read:
+
+```cpp
+#pragma unroll
+for (int offset = WARP_SIZE / 2; offset &gt; 0; offset &gt;&gt;= 1) {
+    qk += __shfl_down_sync(0xffffffff, qk, offset);
+}
+qk = __shfl_sync(0xffffffff, qk, 0);
+qk *= scale;
+
+const float old_m = m_reg[qi];
+const float new_m = fmaxf(old_m, qk);
+...
+```
+
+Yes! After __shfl_down, lane i has the sum of qk[i] through qk[i+offset]. Eventually lane 0 has the sum of ALL lanes. Then __shfl_sync(0, ...) copies lane 0&#x27;s value to ALL lanes. So every lane gets sum(qk[0..31]).
+
+Then each lane&#x27;s softmax is updated with this SUM, not its individual qk!
+
+For the softmax to be correct, each lane needs to update with its OWN qk value. So I should NOT broadcast the sum to all lanes! I should only reduce (using __shfl_down) and then each lane uses the total sum for the single kv_pos that it processed.
+
+Actually wait, the purpose of __shfl_down is to compute the full dot product for a single kv_pos. Each lane computed a PARTIAL dot product. After __shfl_down, lane 0 has the FULL dot product for kv_pos=0. But I need the full dot product for kv_pos=1 to be available to lane 1!
+
+The way warp reductions work:
+- After `__shfl_down`, lane i has the sum of lanes i through i+15 (for offset=16), etc.
+- For a standard warp sum, we only care about lane 0&#x27;s result.
+- But what we ACTUALLY need is for each lane to get its OWN kv_pos&#x27;s full dot product.
+
+The issue is: lane i computed the partial dot product for kv_pos `kv_start + i` (in the first iteration). To get the full dot product, we need to sum across all lanes. But the sum should ONLY include contributions to THAT kv_pos, not other kv_pos&#x27;s.
+
+BUT: each lane computed partial dot products for DIFFERENT kv_pos values! So summing across lanes gives us:
+lane 0 partial(qk for pos 0) + lane 1 partial(qk for pos 1) + ...
+
+This is a meaningless sum! It&#x27;s the sum of partial dot products for DIFFERENT positions!
+
+Wait, no! Let me re-read the qk computation:
+```cpp
+for (int d = 0; d &lt; HEAD_SIZE; d += WARP_SIZE) {
+    half k_val = k[kv_offset + d + lane];
+    qk += __half2float(q_vec[d / WARP_SIZE]) * __half2float(k_val);
+}
+```
+
+For lane 0, kv_offset is for position `kv_pos = kv_start + 0`.
+For lane 1, kv_offset is for position `kv_pos = kv_start + 1`.
+
+kv_offset is COMPUTED INSIDE THE OUTER LOOP based on kv_pos! So each lane is reading k for a DIFFERENT position!
+
+So each lane computes: partial_dot_product(Q, K_{kv_pos_lane}), where kv_pos_lane differs per lane.
+
+Then the warp reduction sums: partial_dot(Q, K_0) + partial_dot(Q, K_1) + ... 
+
+This gives:
+dot(Q[0:31], K_0[0:31]) + dot(Q[32:63], K_0[32:63]) + ... + dot(Q[0:31], K_1[0:31]) + dot(Q[32:63], K_1[32:63]) + ...
+
+This is NOT dot(Q, K_0) or dot(Q, K_1). It&#x27;s a MIXTURE! 
+
+OH MY GOD! That&#x27;s completely wrong!
+
+The fundamental issue is that I confused &quot;parallel dot product reduction&quot; with &quot;parallel score computation&quot;. For a single dot product across HEAD_SIZE dimensions, I need all lanes to work on the SAME kv_pos. But in my code, lanes are processing DIFFERENT kv_pos values!
+
+Wait, let me re-examine the q_vec loading:
+```cpp
+half q_vec[HEAD_SIZE / WARP_SIZE];
+#pragma unroll
+for (int d = lane; d &lt; HEAD_SIZE; d += WARP_SIZE) {
+    q_vec[d / WARP_SIZE] = q[q_offset + d];
+}
+```
+
+For lane 0: q_vec = [Q[0], Q[32], Q[64], Q[96]]
+For lane 1: q_vec = [Q[1], Q[33], Q[65], Q[97]]
+...
+
+Then for K:
+```cpp
+for (int d = 0; d &lt; HEAD_SIZE; d += WARP_SIZE) {
+    half k_val = k[kv_offset + d + lane];
+    qk += __half2float(q_vec[d / WARP_SIZE]) * __half2float(k_val);
+}
+```
+
+For lane 0 and kv_pos=0: kv_offset = 0. 
+- d=0: k_val = K_0[0+0] = K_0[0]. q_vec[0] = Q[0]. Contribution: Q[0]*K_0[0]
+- d=32: k_val = K_0[32+0] = K_0[32]. q_vec[1] = Q[32]. Contribution: Q[32]*K_0[32]
+- etc.
+
+For lane 1 and kv_pos=1: kv_offset = HEAD_SIZE.
+- d=0: k_val = K_1[0+1] = K_1[1]. q_vec[0] = Q[1]. Contribution: Q[1]*K_1[1]
+- d=32: k_val = K_1[32+1] = K_1[33]. q_vec[1] = Q[33]. Contribution: Q[33]*K_1[33]
+- etc.
+
+After __shfl_down reduction:
+qk_lane0_sum = Q[0]*K_0[0] + Q[32]*K_0[32] + Q[64]*K_0[64] + Q[96]*K_0[96] 
+             + Q[1]*K_1[1] + Q[33]*K_1[33] + ...
+
+This is NOT dot(Q, K_0) and NOT dot(Q, K_1). It&#x27;s a weird combination!
+
+I completely misunderstood how to parallelize this! The warp sum should only combine partial dot products FOR THE SAME KV POSITION. 
+
+To compute dot(Q, K_0), I need ALL lanes to load K_0 elements! Then each lane computes partial contribution, then warp reduce to get full dot(Q, K_0). 
+
+But if I want to compute multiple dot products in parallel, I should assign different WARPS (not lanes) to different positions.
+
+So the correct approach is:
+1. Load Q into registers (each thread has its subset)
+2. For each kv_pos, ALL threads load K for that same kv_pos
+3. Each thread computes partial dot product
+4. Warp reduce to get full dot product
+5. Update softmax
+
+But this means only one score is computed at a time (or one per warp if using warp-level parallelism differently).
+
+Actually, a better approach: 
+- If we want to process multiple kv_pos simultaneously, we need each WARP to handle one kv_pos, with all lanes in the warp computing the dot product for that SAME kv_pos.
+- Or each thread block can loop over kv_pos, with all threads cooperating on one pos at a time.
+
+Let me redesign the kernel properly.
+
+For H100, with good shared memory bandwidth, the best approach might be:
+
+1. Load Q to shared memory (or registers distributed carefully)
+2. Iterate over KV positions (each position handled by one warp, or in tiles)
+3. Each warp loads K for ONE kv_pos, all lanes compute partial dot product, warp reduce
+4. Update softmax
+5. Load V for the same position, update accumulator
+
+But wait, if one warp handles one kv_pos, then with 8 warps per block, we process 8 kv_pos simultaneously. Each warp does its own dot product and softmax update. At the end, reduce across warps.
+
+Actually, the issue with online softmax across warps after the fact is complex. A simpler approach:
+- Each warp handles a contiguous chunk of kv_pos, doing online softmax over its chunk
+- At the end, reduce across warps
+
+But then we&#x27;d have the issue: within a warp, all lanes must process the SAME kv_pos at the same time (to compute dot products correctly).
+
+So for warp i:
+```
+for kv_pos in chunk_i:
+    // All 32 lanes load K_{kv_pos}[lane], K_{kv_pos}[lane+32], etc.
+    // Compute dot product via warp reduce
+    // Each lane updates its own softmax accumulator? NO - the SCORE is the same for all lanes!
+```
+
+Wait, the score qk is the same for all lanes in a warp (since they all computed the same dot product). The softmax update should use this same qk. And all lanes should update the same accumulator!
+
+Actually, no. Each lane has its own accumulator for the OUTPUT values (weighted sum of V). But the softmax state (max and sum) is the same for all lanes in the warp.
+
+So within a warp:
+- All lanes compute same qk
+- All lanes update same m and l (but stored redundantly in each thread, or use one shared memory location per warp)
+- Each lane updates its own acc vector (for different output dimensions)
+
+But we can also store the warp-level m and l in registers, with all lanes having the same values.
+
+Actually, here&#x27;s a simpler and more correct approach:
+
+For a single (batch, q_head, q_pos):
+```cpp
+// In registers or shared memory: Q vector
+// For each warp in the block:
+//   Each warp processes a strip of kv positions
+//   Within the warp, for each kv_pos:
+//     Load K[kv_pos] elements distributed among lanes
+//     Warp reduce to get qk
+//     Update warp-level m, l
+//     Load V[kv_pos] elements distributed among lanes
+//     Update lane&#x27;s acc
+```
+
+After all kv_pos processed by all warps:
+```cpp
+// Reduce m across warps (find global max)
+// Scale each warp&#x27;s l and acc by exp(warp_m - global_m)
+// Reduce acc across warps (sum)
+// Output = acc / global_l
+```
+
+Wait, but if each warp processes a different set of kv_pos, and we need to do the scaling correctly...
+
+Actually after online softmax within each warp:
+- Warp i has (m_i, l_i, acc_i)
+- The true softmax requires:
+  M = max(m_0, m_1, ..., m_{num_warps-1})
+  l_total = sum_j l_j * exp(m_j - M)
+  acc_total = sum_j acc_j * exp(m_j - M)
+  output = acc_total / l_total
+
+This is correct!
+
+And within each warp, the online softmax is exact because the warp processes its kv_pos in order.
+
+Let me implement this correctly.
+
+For each warp, I need to store in shared memory:
+- m_i (float)
+- l_i (float)
+- acc_i could stay in registers but we&#x27;d need to reduce across warps
+
+Actually for acc reduction, I can do it in stages:
+1. Find global M
+2. Each warp scales its acc
+3. Warp 0 does a reduction of acc across warps in shared memory
+4. Divide by l_total
+
+For 8 warps, HEAD_SIZE=128, and each warp keeping acc for HEAD_SIZE/32 = 4 elements:
+- Warp 0 lane 0 has acc for output dims [0, 32, 64, 96] computed over warp 0&#x27;s kv positions
+- After scaling, we need to sum across warps: acc_total[d] = sum_warp acc_warp[d]
+- This can be done by having warp 0 iterate over warps and accumulate.
+
+But for simplicity, I can also write the output to shared memory for each warp, then reduce.
+
+Actually, a much simpler formulation that avoids all these issues:
+
+Use ONE BLOCK per (batch, q_head, q_pos). The block has 256 threads. Divide the KV sequence into 256 chunks (or have each thread process a few positions sequentially). Compute local max and sum using registers. At the end, reduce using shared memory.
+
+```cpp
+template &lt;int HEAD_SIZE&gt;
+__global__ void attention(...) {
+    const int b = blockIdx.x;
+    const int h = blockIdx.y;
+    const int pos = blockIdx.z;
+    
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+    const int kv_head = h / G;
+    
+    // Load Q into shared memory (all threads cooperate)
+    __shared__ float s_q[HEAD_SIZE];
+    const int q_offset = ((b * num_heads + h) * seq_len + pos) * HEAD_SIZE;
+    for (int d = tid; d &lt; HEAD_SIZE; d += num_threads) {
+        s_q[d] = __half2float(q[q_offset + d]);
+    }
+    __syncthreads();
+    
+    // Process KV positions assigned to this thread
+    float local_max = -1e30f;
+    float local_sum = 0.0f;
+    float local_out[HEAD_SIZE]; // This is too much for registers!
+}
+```
+
+Storing local_out[128] per thread is way too much. 128 floats = 512 bytes per thread. For 256 threads = 128KB just for output. Actually, the output needs to be the weighted sum across all positions, so we can&#x27;t compute it position by position in this naive way without storing per-position weights.
+
+Better approach: first compute all qk scores, find max, compute exp weights, then compute weighted sum. But storing all scores requires seq_len*sizeof(float) = ~2KB, which is fine.
+
+```cpp
+__shared__ float s_scores[SEQ_LEN]; // dynamic based on seq_len? For compile-time we can template or use dynamic smem
+```
+
+For seq_len=512:
+```cpp
+extern __shared__ float s_smem[];
+float* s_q = s_smem; // HEAD_SIZE elements
+float* s_scores = s_smem + HEAD_SIZE; // seq_len elements
+```
+
+Total shared memory: (128 + 512) * 4 = 2.5KB. Very small.
+
+Algorithm:
+1. Load Q to shared memory
+2. Each thread computes scores for several kv positions:
+```cpp
+for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += num_threads) { // causal
+    float score = 0.0f;
+    for (int d = 0; d &lt; HEAD_SIZE; ++d) {
+        const int kv_offset = ((b * num_kv_heads + kv_head) * seq_len + kv_pos) * HEAD_SIZE + d;
+        score += s_q[d] * __half2float(k[kv_offset]);
+    }
+    s_scores[kv_pos] = score * scale;
+}
+__syncthreads();
+```
+
+But wait, this has each thread reading K from global memory in a strided pattern. Not great for coalescing. Better to have threads load K values cooperatively.
+
+Actually, let me just do this: each thread handles a few dimensions and a few positions. The exact parallelization doesn&#x27;t matter much for seq_len=512 and HEAD_SIZE=128.
+
+But actually, I realize this approach requires each thread to read all of Q (which is in shared memory) and all of K_{kv_pos} for each position. This means reading K from global memory N_k times where N_k is the number of positions per thread. For 256 threads and 512 positions, each thread does 2 positions. Each position requires reading 128 halfs = 256 bytes. Total K reads per thread: 512 bytes. At 3.35TB/s, this should be fast enough.
+
+But I also need to read V for the weighted sum. Another 512 bytes per thread. Total memory per block: ~1KB for K and V per thread * 256 threads = 256KB per block. But that&#x27;s not right - each thread only reads its assigned positions. Total K+V reads across block: 512 positions * 256 bytes = 131KB. Which is small.
+
+OK let me just implement this simple approach correctly. I&#x27;ll avoid all the warp shuffle complexity and just use shared memory for scores.
+
+Actually, let me think if there&#x27;s a way to avoid storing all scores. I can use online softmax:
+
+```cpp
+float m = -1e30f, l = 0.0f;
+float acc[HEAD_SIZE]; // too big for registers
+
+// Instead, iterate in tiles:
+for (int kv_tile = 0; kv_tile &lt; num_tiles; ++kv_tile) {
+    // Load K and V for this tile to shared memory
+    // Compute scores for all positions in tile
+    // Find max in tile
+    // Update online softmax
+    // Compute weighted V sum for this tile
+    // Accumulate to output
+}
+```
+
+For tile size = 64:
+- smem_K[64][128] half = 64*128*2 = 16KB
+- smem_V[64][128] half = 16KB
+- Total = 32KB per block. Fine.
+
+Within a tile of 64 positions and 256 threads:
+- Each thread computes score for one position (256 threads, 64 positions -&gt; actually 64 threads needed for positions, rest idle or help with dot product)
+- To compute 64 dot products, we can assign each position to a warp (64 positions / 8 warps = 8 positions per warp)
+- Or assign each position to a thread block within the tile
+
+Actually, the simplest correct tile-based approach:
+```cpp
+__shared__ half smem_K[TILE_KV][HEAD_SIZE];
+__shared__ half smem_V[TILE_KV][HEAD_SIZE];
+
+for (int tile = 0; tile &lt; num_tiles; ++tile) {
+    // Load K and V for tile positions
+    for (int i = tid; i &lt; TILE_KV * HEAD_SIZE; i += blockDim.x) {
+        int pos_in_tile = i / HEAD_SIZE;
+        int d = i % HEAD_SIZE;
+        int kv_pos = tile * TILE_KV + pos_in_tile;
+        if (kv_pos &lt; seq_len) {
+            int kv_offset = ...;
+            smem_K[pos_in_tile][d] = k[kv_offset];
+            smem_V[pos_in_tile][d] = v[kv_offset];
+        }
+    }
+    __syncthreads();
+    
+    // For each kv_pos in tile (up to seq_len):
+    //   Compute qk = dot(Q, K[kv_pos])
+    //   Update online softmax
+    //   Accumulate V[kv_pos] * weight
+    
+    // But we need to process in order for online softmax!
+    for (int j = 0; j &lt; min(TILE_KV, seq_len - tile*TILE_KV); ++j) {
+        // All threads compute partial dot product
+        float qk = 0.0f;
+        for (int d = tid; d &lt; HEAD_SIZE; d += blockDim.x) {
+            qk += __half2float(smem_Q[d]) * __half2float(smem_K[j][d]);
+        }
+        // block reduce qk
+        // ... 
+        // update m, l
+        // accumulate V[j][d] * weight to acc[d]
+    }
+}
+```
+
+This processes one position at a time (sequentially within the tile), with all threads cooperating on the dot product and accumulation. This is slow because we only process one kv_pos at a time within a block.
+
+For H100, with great memory bandwidth, maybe the PyTorch kernel is already close to optimal or even faster than a naive CUDA kernel. But the challenge asks me to beat the reference. 
+
+Actually wait, the PyTorch reference for this is likely `F.scaled_dot_product_attention` which uses FlashAttention or a highly optimized cuDNN/cuBLAS path. That could be very fast.
+
+However, for small sequence lengths (512) and the GQA pattern, the overhead might be significant. A custom kernel could win.
+
+Let me try a hybrid approach: fuse the online softmax within each thread/ warp while processing tiles. I&#x27;ll use the tiled shared memory loading, but the score computation per tile will be done collaboratively.
+
+OK, let me write a simpler but correct version first. I&#x27;ll try to make it reasonably efficient.
+
+```cpp
+template &lt;int HEAD_SIZE, int BLOCK_SIZE&gt;
+__global__ void attention_kernel(...) {
+    // block handles one (batch, q_head, q_pos)
+    const int b = blockIdx.x;
+    const int h = blockIdx.y;
+    const int pos = blockIdx.z;
+    const int tid = threadIdx.x;
+    
+    const int kv_head = h / (num_heads / num_kv_heads);
+    
+    // Load Q to shared memory
+    __shared__ half smem_Q[HEAD_SIZE];
+    const int q_offset = ((b * num_heads + h) * seq_len + pos) * HEAD_SIZE;
+    for (int d = tid; d &lt; HEAD_SIZE; d += BLOCK_SIZE) {
+        smem_Q[d] = q[q_offset + d];
+    }
+    __syncthreads();
+    
+    // Each thread computes dot products for its assigned positions
+    // But we need to ensure the dot products are available for online softmax
+}
+```
+
+I keep going back and forth. Let me just try one approach and see if it&#x27;s correct.
+
+Simplest correct approach without rethinking:
+- One block per output position
+- Load all scores to shared memory first
+- Then do softmax
+- Then compute weighted sum
+- Optimize from there
+
+Given seq_len=512, scores array = 512*4=2KB, which is tiny.
+```cpp
+template &lt;int HEAD_SIZE, int BLOCK_SIZE&gt;
+__global__ void attention_kernel(
+    const half* q, const half* k, const half* v, half* o,
+    int num_heads, int num_kv_heads, int seq_len, float scale
+) {
+    const int b = blockIdx.x;
+    const int h = blockIdx.y;
+    const int pos = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int kv_head = h / (num_heads / num_kv_heads);
+    
+    extern __shared__ float smem[];
+    float* s_q = smem; // HEAD_SIZE
+    float* s_scores = smem + HEAD_SIZE; // seq_len
+    
+    // Load Q to shared memory as float
+    const int q_offset = ((b * num_heads + h) * seq_len + pos) * HEAD_SIZE;
+    for (int d = tid; d &lt; HEAD_SIZE; d += BLOCK_SIZE) {
+        s_q[d] = __half2float(q[q_offset + d]);
+    }
+    __syncthreads();
+    
+    // Compute scores for this position (causal: only kv_pos &lt;= pos)
+    for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+        const int kv_offset = ((b * num_kv_heads + kv_head) * seq_len + kv_pos) * HEAD_SIZE;
+        float score = 0.0f;
+        // Unroll or not depending on HEAD_SIZE
+        for (int d = 0; d &lt; HEAD_SIZE; ++d) {
+            score += s_q[d] * __half2float(k[kv_offset + d]);
+        }
+        s_scores[kv_pos] = score * scale;
+    }
+    __syncthreads();
+    
+    // Set non-causal positions to -inf
+    for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+        // already only computed up to pos
+    }
+    // Actually positions &gt; pos are already zero/uninitialized. Need to set them to -inf for max computation.
+    // But we can just not include them in the max.
+    
+    // Find max score
+    float local_max = -1e30f;
+    for (int kv_pos = 0; kv_pos &lt;= pos; ++kv_pos) {
+        local_max = fmaxf(local_max, s_scores[kv_pos]);
+    }
+    
+    // Hmm, that&#x27;s a sequential loop over 512 elements for EACH thread. Very inefficient!
+    // Better to do parallel reduction.
+}
+```
+
+The max reduction should be parallel. But with only ~512 elements, a simple loop might not be terrible if we do it in a few threads. Actually, here&#x27;s better:
+
+```cpp
+// Thread 0 finds max by iterating (512 elements, trivial)
+// Or use tree reduction in shared memory
+__shared__ float s_max[BLOCK_SIZE];
+s_max[tid] = -1e30f;
+for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+    s_max[tid] = fmaxf(s_max[tid], s_scores[kv_pos]);
+}
+__syncthreads();
+
+// Tree reduction for max
+for (int stride = BLOCK_SIZE/2; stride &gt; 0; stride /= 2) {
+    if (tid &lt; stride) {
+        s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
+    }
+    __syncthreads();
+}
+float global_max = s_max[0];
+```
+
+Then compute exp and sum:
+```cpp
+s_max[tid] = 0.0f; // reuse s_max for sum
+for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+    s_scores[kv_pos] = __expf(s_scores[kv_pos] - global_max);
+    s_max[tid] += s_scores[kv_pos];
+}
+__syncthreads();
+
+// Tree reduction for sum
+for (int stride = BLOCK_SIZE/2; stride &gt; 0; stride /= 2) {
+    if (tid &lt; stride) {
+        s_max[tid] += s_max[tid + stride];
+    }
+    __syncthreads();
+}
+float global_sum = s_max[0];
+```
+
+Then compute weighted sum:
+```cpp
+// Each thread computes a subset of output dimensions
+for (int d = tid; d &lt; HEAD_SIZE; d += BLOCK_SIZE) {
+    float out_val = 0.0f;
+    for (int kv_pos = 0; kv_pos &lt;= pos; ++kv_pos) {
+        const int kv_offset = ((b * num_kv_heads + kv_head) * seq_len + kv_pos) * HEAD_SIZE + d;
+        out_val += s_scores[kv_pos] * __half2float(v[kv_offset]);
+    }
+    const int o_offset = ((b * num_heads + h) * seq_len + pos) * HEAD_SIZE + d;
+    o[o_offset] = __float2half(out_val / global_sum);
+}
+```
+
+This is simple and should be correct! But each thread does a sequential loop over all kv_pos for each output dimension. The inner loop over kv_pos is 512 iterations, and each iteration reads from shared memory (s_scores) and global memory (v). The V reads go through L2.
+
+Wait, but all threads are reading V for the SAME kv_pos but DIFFERENT d. Actually, in the loop:
+```cpp
+for (int kv_pos = 0; kv_pos &lt;= pos; ++kv_pos) {
+    const int kv_offset = ... + d;
+    out_val += s_scores[kv_pos] * __half2float(v[kv_offset]);
+}
+```
+
+For thread 0 processing d=0: reads v[kv_offset + 0] for kv_pos=0, then v[kv_offset + 0] for kv_pos=1, etc.
+For thread 1 processing d=1: reads v[kv_offset + 1] for kv_pos=0, etc.
+
+This is NOT coalesced! Threads in a warp are reading different d for the same kv_pos. But the loop iterates over kv_pos. In iteration 0 (kv_pos=0), thread 0 reads v[... + 0], thread 1 reads v[... + 1]. These ARE coalesced if the kv_offset base is the same!
+
+Actually yes:
+kv_offset_base = ((b * num_kv_heads + kv_head) * seq_len + kv_pos) * HEAD_SIZE
+Thread 0: reads v[kv_offset_base + 0]
+Thread 1: reads v[kv_offset_base + 1]
+...
+Thread 31: reads v[kv_offset_base + 31]
+
+These are contiguous memory locations! They ARE coalesced! 
+
+Wait, but in my loop, d = tid, then d += BLOCK_SIZE. So in the first iteration of the d loop, thread 0 reads d=0, thread 1 reads d=1, etc. But if BLOCK_SIZE &gt; 32, not all threads in the warp process the same set. Actually, for BLOCK_SIZE=256:
+- Warp 0: threads 0-31 process d = 0, 1, ..., 31. Coalesced!
+- Warp 1: threads 32-63 process d = 32, 33, ..., 63.
+- etc.
+
+But each thread does the FULL kv_pos loop! So thread 0 does:
+for kv_pos=0: read v[base + 0]
+for kv_pos=1: read v[base + 0] (different base)
+etc.
+
+This means in each kv_pos iteration, warp 0 reads 32 contiguous halfs = 64 bytes. Perfect coalescing!
+
+The memory access pattern is:
+- For each kv_pos: read v[kv_pos * HEAD_SIZE + tid_global] for tid_global in each warp
+- But wait, thread 0 is always in the first warp and reads d=0 for all kv_pos
+- Thread 1 reads d=1 for all kv_pos
+
+So the accesses for a given thread jump by HEAD_SIZE * sizeof(half) = 256 bytes between consecutive kv_pos. That&#x27;s a stride of 256 bytes. For L2 cache, with 512 positions, each thread reads 512 * 2 = 1024 bytes spread across the sequence. Actually, the total memory accessed by all threads for the V reads is 512 positions * 128 halfs * 2 bytes = 131KB. That&#x27;s quite small and should be L2 cache friendly.
+
+Now the K reads in the score computation have a similar pattern:
+```cpp
+for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+    const int kv_offset = ... + kv_pos * HEAD_SIZE;
+    for (int d = 0; d &lt; HEAD_SIZE; ++d) {
+        score += s_q[d] * k[kv_offset + d];
+    }
+}
+```
+
+Thread 0: kv_pos=0, 256, 512 (if &lt;=512)
+For kv_pos=0: reads k[0], k[1], ..., k[127]. Sequential within thread.
+Thread 256: doesn&#x27;t exist (BLOCK_SIZE=256). Thread 255: kv_pos=255, 511.
+
+Wait, `kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE` means:
+Thread 0: kv_pos=0, 256, 512...
+Thread 1: kv_pos=1, 257, 513...
+Thread 255: kv_pos=255, 511, ...
+
+So each thread reads K for ONE specific sequence of positions. And within each position, it reads all HEAD_SIZE dimensions. 
+
+But s_q is in shared memory and accessed by all threads. The k reads are strided: each thread reads all of K_0, then all of K_256, etc. 
+
+Actually, the memory pattern for K is:
+Thread 0: read K_0[0..127], then K_256[0..127], etc.
+Thread 1: read K_1[0..127], then K_257[0..127], etc.
+
+This is not great for coalescing within a warp. Thread 0 and thread 1 are reading different positions simultaneously. Their memory accesses are far apart. But each thread reads its positions sequentially, which is good for cache within a thread.
+
+However, since 256 threads are all reading K at the same time, and the positions are spread out, the L2 cache might struggle.
+
+To improve coalescing, we could swap the loops: have each thread read a chunk of dimensions for all positions, or process positions in tiles where threads cooperate.
+
+But for correctness, let me first get the simple version working. Then I can optimize.
+
+Actually, the score computation loop:
+```cpp
+for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+    const int kv_offset = ...;
+    float score = 0.0f;
+    for (int d = 0; d &lt; HEAD_SIZE; ++d) {
+        score += s_q[d] * __half2float(k[kv_offset + d]);
+    }
+    s_scores[kv_pos] = score * scale;
+}
+```
+
+Thread 0: K_0, K_256, K_512 (if causal allows)
+For pos=511, thread 0 computes scores for 2 positions (0 and 256).
+
+Actually, if causal, kv_pos only goes up to pos. For pos=511, all 512 positions are included. Thread 0 computes 2 positions. Thread 1 computes 2 positions. Threads 0-255 compute 2 positions each, covering all 512.
+
+But wait, thread 0 takes 12.8us to compute the dot product for one position (128 mult-adds). That&#x27;s tiny. With 2 positions, 25.6us. In parallel with 256 threads, total time for score computation is roughly the time any one thread takes, about 25.6us + overhead. But the L2/memory might be the bottleneck.
+
+Actually, if each thread reads ~512 bytes (2 positions * 128 halfs) from K, and 256 threads read ~131KB total, this should be L2 cached.
+
+OK let me just implement this and see if it&#x27;s correct and reasonably fast. It might not beat PyTorch (which uses highly optimized FlashAttention or similar), but it&#x27;s a start.
+
+Wait, I just thought about something. The PyTorch `scaled_dot_product_attention` with causal mask likely uses FlashAttention-2 or a similar fused kernel. At seq_len=512, FlashAttention should still have good performance.
+
+But the task says the source kernel was hand-tuned for A100 and I need to adapt it for H100. Maybe the hidden reference IS the paged attention kernel, not PyTorch SDPA? But the I/O contract only shows q, k, v as inputs...
+
+Actually, I think the hidden test wraps the paged attention kernel in a way that matches the simple I/O. Or it just uses PyTorch ops. Either way, my kernel needs to match the reference output.
+
+Let me just write a correct kernel. I&#x27;ll go with the simple shared-memory based approach.
+
+Actually, let me optimize the score dot product computation. Instead of each thread doing its own independent dot products, I can have threads cooperate:
+
+```cpp
+// Each thread computes partial dot products for multiple positions and dimensions
+__shared__ float s_partial[BLOCK_SIZE];
+
+for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+    const int kv_offset = ...;
+    float partial = 0.0f;
+    for (int d = tid; d &lt; HEAD_SIZE; d += BLOCK_SIZE) {
+        partial += s_q[d] * __half2float(k[kv_offset + d]);
+    }
+    s_partial[tid] = partial;
+    __syncthreads();
+    
+    // Reduce partials
+    // ... tree reduction ...
+    
+    if (tid == 0) {
+        s_scores[kv_pos] = s_partial[0] * scale;
+    }
+    __syncthreads();
+}
+```
+
+This way threads cooperate on each dot product. But it requires a __syncthreads() per kv_pos, which for 512 positions means 512 syncs. That&#x27;s not great.
+
+Alternative: tile the computation. Process 256 positions at a time. Load K for 256 positions into shared memory. Then each thread computes its partial dot products for all positions in the tile. Then reduce within the block.
+
+Hmm, actually I think the original approach (each thread computing a few full dot products independently) is fine for now. Let me just make sure it&#x27;s correct.
+
+Let me rewrite the kernel correctly.
+
+```cpp
+template &lt;int HEAD_SIZE, int BLOCK_SIZE&gt;
+__global__ void attention_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    half* __restrict__ o,
+    int num_heads,
+    int num_kv_heads,
+    int seq_len,
+    float scale
+) {
+    const int b = blockIdx.x;
+    const int h = blockIdx.y;
+    const int pos = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int G = num_heads / num_kv_heads;
+    const int kv_head = h / G;
+    
+    // Each block needs shared memory for Q (HEAD_SIZE floats), scores (seq_len floats), and reductions
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* s_scores = smem + HEAD_SIZE;
+    // s_reduction can reuse s_q or s_scores space, but we&#x27;ll use explicit arrays
+    float* s_reduction = s_scores; // reuse for max and sum reduction
+    
+    const int q_offset = ((b * num_heads + h) * seq_len + pos) * HEAD_SIZE;
+    
+    // Load Q to shared memory
+    for (int d = tid; d &lt; HEAD_SIZE; d += BLOCK_SIZE) {
+        s_q[d] = __half2float(q[q_offset + d]);
+    }
+    __syncthreads();
+    
+    // Compute scores: each thread handles (pos+1)/BLOCK_SIZE positions
+    // Initialize non-causal positions to -inf (or just leave uninitialized since we only use up to pos)
+    for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+        const int kv_offset = ((b * num_kv_heads + kv_head) * seq_len + kv_pos) * HEAD_SIZE;
+        float score = 0.0f;
+        #pragma unroll
+        for (int d = 0; d &lt; HEAD_SIZE; ++d) {
+            score += s_q[d] * __half2float(k[kv_offset + d]);
+        }
+        s_scores[kv_pos] = score * scale;
+    }
+    __syncthreads();
+    
+    // Find max score among causal positions
+    float thread_max = -1e30f;
+    for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+        thread_max = fmaxf(thread_max, s_scores[kv_pos]);
+    }
+    
+    // Block reduction for max
+    s_reduction[tid] = thread_max;
+    __syncthreads();
+    
+    #pragma unroll
+    for (int stride = BLOCK_SIZE/2; stride &gt; 0; stride &gt;&gt;= 1) {
+        if (tid &lt; stride) {
+            s_reduction[tid] = fmaxf(s_reduction[tid], s_reduction[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float global_max = s_reduction[0];
+    
+    // Compute exp and sum
+    float thread_sum = 0.0f;
+    for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+        float exp_val = __expf(s_scores[kv_pos] - global_max);
+        s_scores[kv_pos] = exp_val;
+        thread_sum += exp_val;
+    }
+    
+    s_reduction[tid] = thread_sum;
+    __syncthreads();
+    
+    #pragma unroll
+    for (int stride = BLOCK_SIZE/2; stride &gt; 0; stride &gt;&gt;= 1) {
+        if (tid &lt; stride) {
+            s_reduction[tid] += s_reduction[tid + stride];
+        }
+        __syncthreads();
+    }
+    float global_sum = s_reduction[0];
+    float inv_sum = 1.0f / global_sum;
+    
+    // Compute weighted sum of V for each output dimension
+    for (int d = tid; d &lt; HEAD_SIZE; d += BLOCK_SIZE) {
+        float out_val = 0.0f;
+        #pragma unroll
+        for (int kv_pos = 0; kv_pos &lt;= pos; ++kv_pos) {
+            const int kv_offset = ((b * num_kv_heads + kv_head) * seq_len + kv_pos) * HEAD_SIZE + d;
+            out_val += s_scores[kv_pos] * __half2float(v[kv_offset]);
+        }
+        const int o_offset = ((b * num_heads + h) * seq_len + pos) * HEAD_SIZE + d;
+        o[o_offset] = __float2half(out_val * inv_sum);
+    }
+}
+```
+
+Wait, there&#x27;s an issue with the TREE REDUCTION. If BLOCK_SIZE is 256, the loop:
+```
+for (int stride = BLOCK_SIZE/2; stride &gt; 0; stride &gt;&gt;= 1)
+```
+Gives stride = 128, 64, 32, 16, 8, 4, 2, 1. 
+
+For stride=1, thread 0 reads s_reduction[0] and s_reduction[1]. This is a race condition! Both threads 0 and 1 are in the same warp, and thread 1 might still be writing s_reduction[1] while thread 0 is reading it.
+
+Actually, `__syncthreads()` before the loop iteration handles this. But within a warp, threads execute in lockstep, so thread 0 and thread 1 both do the comparison and the read/write simultaneously. Since thread 1 (tid=1) is reading s_reduction[1+1] = s_reduction[2] and writing to s_reduction[1], and thread 0 is reading s_reduction[0+1] = s_reduction[1], there IS a race!
+
+To fix this, I need to ensure that either:
+1. Only one thread per pair does the read-modify-write
+2. Or use a double-buffered approach
+
+Actually, the standard tree reduction in CUDA looks like:
+```cpp
+for (int stride = blockDim.x/2; stride &gt; 0; stride &gt;&gt;= 1) {
+    if (tid &lt; stride) {
+        shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+}
+```
+
+The issue is: when stride=1, thread 0 does `shared[0] += shared[1]`. Thread 1 doesn&#x27;t execute the body (tid=1, stride=1, 1 &lt; 1 is false). So thread 1 does NOT write to shared[1]. No race! 
+
+Wait, but what about thread 1&#x27;s previous value in shared[1]? Thread 0 reads it. But since thread 1 isn&#x27;t writing to shared[1] in this iteration, it&#x27;s fine.
+
+However, the REAL issue is that within a warp, `if (tid &lt; stride)` causes divergence only for the last warp when stride &lt; 32. Actually, all threads in a warp evaluate the same condition synchronously. For stride=16, threads 0-15 do the write, threads 16-31 don&#x27;t. But threads 0-15 all write to shared[0..15]. Thread 16 might read shared[16+16]=shared[32] but it doesn&#x27;t write. No issue.
+
+Actually, for this tree reduction pattern, the only potential issue is when stride=1 and thread 0 does `shared[0] += shared[1]`. But since threads execute in lockstep within a warp, and thread 1 is NOT doing the write (it&#x27;s doing nothing in this iteration due to the if), thread 0&#x27;s read of shared[1] is safe. Thread 1 might have written shared[1] in a previous iteration when stride was larger, but __syncthreads() after that iteration ensures the write is visible.
+
+Actually, there&#x27;s a known issue with tree reductions in CUDA. For a warp-level reduction, if you do:
+```cpp
+if (tid &lt; 16) s[tid] += s[tid + 16];
+__syncthreads();
+if (tid &lt; 8) s[tid] += s[tid + 8];
+...
+```
+
+When tid=0 and tid=16 are in the same warp: in the first iteration, tid=0 writes s[0] = s[0] + s[16]. tid=16 does nothing. Then __syncthreads(). In the next iteration, tid &lt; 8 includes threads 0-7. tid=0 reads s[0] (which was just updated) and s[4]. No thread reads s[16] anymore. So it&#x27;s fine.
+
+Actually wait, in my code I forgot the __syncthreads() INSIDE the loop for each stride! Oh no, I had it:
+```cpp
+#pragma unroll
+for (int stride = BLOCK_SIZE/2; stride &gt; 0; stride &gt;&gt;= 1) {
+    if (tid &lt; stride) {
+        s_reduction[tid] = ...;
+    }
+    __syncthreads();  // This is OUTSIDE the if!
+}
+```
+
+Wait, in my code above, I wrote:
+```cpp
+#pragma unroll
+for (int stride = BLOCK_SIZE/2; stride &gt; 0; stride &gt;&gt;= 1) {
+    if (tid &lt; stride) {
+        s_reduction[tid] = fmaxf(s_reduction[tid], s_reduction[tid + stride]);
+    }
+    __syncthreads();
+}
+```
+
+The `__syncthreads()` is inside the loop but outside the if. Good, this is correct.
+
+But you know what, there&#x27;s a more insidious bug. When BLOCK_SIZE = 256 and we do tree reduction, in the first iteration (stride=128), threads 0-127 read and write. But __syncthreads() is called by ALL 256 threads. Good. Next iteration (stride=64), all 256 threads call __syncthreads(). Good. 
+
+But actually, `__syncthreads()` inside a loop can be expensive. And for the last few iterations where stride &lt; 32, it&#x27;s within a warp and __syncthreads() might be unnecessary. But it&#x27;s correct.
+
+OK so my reduction is correct.
+
+Now, another potential issue: 
+```cpp
+for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+    ...
+    s_scores[kv_pos] = score * scale;
+}
+```
+
+If `pos` is 511 and `BLOCK_SIZE` is 256, then threads 0-255 handle positions 0-255 in the first iteration. Then in the second iteration, threads 0-255 handle positions 256-511. So all positions 0-511 are covered. Good.
+
+But what if pos &lt; BLOCK_SIZE - 1? Say pos = 100. Then only threads 0-100 execute the first iteration. Threads 101-255 don&#x27;t execute at all. But they still call __syncthreads(). Good.
+
+Then in the max reduction:
+```cpp
+float thread_max = -1e30f;
+for (int kv_pos = tid; kv_pos &lt;= pos; kv_pos += BLOCK_SIZE) {
+    thread_max = fmaxf(thread_max, s_scores[kv_pos]);
+}
+```
+
+For threads with no positions (tid &gt; pos), thread_max stays at -1e30f. In the tree reduction, it won&#x27;t affect the result since we take max. Good.
+
+Similarly for the sum: threads with no positions have sum=0. Good.
+
+Then in the output:
+```cpp
+for (int d = tid; d &lt; HEAD_SIZE; d += BLOCK_SIZE) {
+    float out_val = 0.0f;
+    for (int kv_pos = 0; kv_pos &lt;= pos; ++kv_pos) {
+```
+
+ALL threads iterate over ALL positions and read v[kv_offset_base + d]. So thread 0 reads v[..., 0] for all kv_pos. Thread 1 reads v[..., 1] for all kv_pos.
+
+This is correct! Each thread computes its assigned output dimensions.
+
+And the memory pattern: in iteration kv_pos=0, thread 0 reads v[base + 0], thread 1 reads v[base + 1], etc. Coalesced! Then kv_pos=1, thread 0 reads v[base2 + 0], etc. Also coalesced within each iteration.
+
+Perfect. This should be correct.
+
+However, there&#x27;s an inefficiency: each thread loops over all kv_pos sequentially. For 512 positions and 128 dimensions, thread 0 does 512 iterations. In each iteration, it reads v[..., 0]. The stride between consecutive reads is HEAD_SIZE * seq_len? No, consecutive reads for the same d but different kv_pos are:
+kv_pos=0: v[offset_base0 + d] = v[((b*kv_heads+kv_head)*seq_len+0)*HEAD_SIZE + d]
+kv_pos=1: v[offset_base1 + d] = v[((b*kv_heads+kv_head)*seq_len+1)*HEAD_SIZE + d]
+
+The difference is HEAD_SIZE * sizeof(half) = 256 bytes. So thread 0 reads every 256th byte. With 512 reads, it reads 512 * 2 = 1024 bytes, spaced 256 bytes apart. That&#x27;s 256KB... wait, let me recalculate.
+
+Actually the virtual address difference between v[kv_pos=0, d] and v[kv_pos=1, d] is:
+=&amp;v[((b*kv_heads+kv_head)*seq_len+1)*HEAD_SIZE + d] - &amp;v[((b*kv_heads+kv_head)*seq_len+0)*HEAD_SIZE + d]
+= HEAD_SIZE * sizeof(half) = 128 * 2 = 256 bytes
+
+So consecutive reads for a single thread are 256 bytes apart. This is quite strided and not great for cache. But the total memory footprint per thread is small (1024 bytes). And there are 256 threads in a block, spread across different dimensions. A whole block reads 256 * 512 * 2 = 262KB. This should fit in L2 cache.
+
+Now, for the K reads during score computation:
+Thread 0 reads K for positions 0, 256, 512 (for pos=511). Consecutive reads are also 256 bytes apart in K memory. Mixed across all threads:
+- Thread 0 reads pos 0, 256
+- Thread 1 reads pos 1, 257
+- ...
+- Thread 255 reads pos 255, 511
+
+In the first assignment (pos=0 for thread 0, pos=1 for thread 1, ...), threads 0-255 are reading K[0], K[256], ... wait no:
+kv_offset for thread 0, pos 0: ((b * num_kv_heads + kv_head) * seq_len + 0) * HEAD_SIZE
+thread 1, pos 1: ((b * num_kv_heads + kv_head) * seq_len + 1) * HEAD_SIZE
+
+So threads 0 and 1 read K at offsets 0 and 256 bytes respectively. That&#x27;s not coalesced! Each thread is reading 256 bytes worth of data (128 halfs), and consecutive threads read data offset by 256 bytes. That&#x27;s actually fairly coalesced across the warp if we consider each thread reading a burst of memory. But within a single memory transaction (128 bytes on H100), thread 0 reads bytes 0-255, thread 1 reads bytes 256-512. So two adjacent threads cover 512 bytes. A warp of 32 threads covers 32*256=8192 bytes. The L2 cache can handle this.
+
+Actually, for better memory coalescing in the score computation, I could have threads cooperate. But for correctness, let me leave it.
+
+Now, one more important detail: dynamic shared memory size. I need to allocate:
+- HEAD_SIZE floats for s_q
+- seq_len floats for s_scores
+
+In the kernel launch:
+```cpp
+size_t smem_size = (HEAD_SIZE + seq_len) * sizeof(float);
+```
+Actually, seq_len is known at runtime. The contract says SEQ_LEN=512 but hidden tests might vary. I should compute dynamically.
+
+But wait, the kernel is templated on HEAD_SIZE but not on seq_len. So s_scores needs to be dynamically sized. I can use dynamic shared memory:
+
+```cpp
+extern __shared__ float smem[];
+float* s_q = smem;
+float* s_scores = smem + HEAD_SIZE;
+```
+
+And in the launch:
+```cpp
+size_t smem_bytes = (HEAD_SIZE + seq_len) * sizeof(float);
+kernel&lt;&lt;&lt;grid, block, smem_bytes, stream&gt;&gt;&gt;(...);
+```
+
+Actually, the `extern __shared__` syntax in CUDA with templated kernels can be tricky. But it should work as long as we pass the size in the launch config.
+
+OK, let me also add causal mask handling properly. Actually, in my design:
+- We only compute scores for kv_pos &lt;= pos. Good.
+- The max, sum, and output loops all use `kv_pos &lt;= pos`. Good.
+- Positions &gt; pos are never touched in s_scores and never included. 
+
+So causal masking is implicit. Good.
+
+One more thing: the q, k, v tensors might not have exactly the memory layout I think. PyTorch default is channels_last=False, so [batch, heads, seq_len, head_size] is stored in row-major order:
+- q[b][h][s][d] = q[((b * num_heads + h) * seq_len + s) * head_size + d]
+
+This is correct.
+
+OK let me write the full kernel now. Also, I should handle head_size values from the switch statement. But the test contract says HEAD_SIZE = 128. Hidden tests might use other values. I&#x27;ll support a few values with a switch statement and fall back to PyTorch for unsupported ones... wait, the contract says to implement ModelNew with custom CUDA. For unsupported head sizes, I can just error or use a generic path.
+
+Actually, to make it work for all the head sizes in the original kernel (32, 64, 80, 96, 112, 120, 128, 192, 256), I need to either:
+1. Template instantiate for all of them
+2. Or use a generic non-templated version
+
+For performance, templating is better. Let me add cases for all of them.
+
+But wait, the problem constraints for this specific test are:
+- NUM_HEADS = 32
+- NUM_KV_HEADS = 8
+- HEAD_SIZE = 128
+- SEQ_LEN = 512
+- BATCH = 4
+
+So I only need HEAD_SIZE=128 for this test. But hidden tests might use other values. Let me handle 64, 128, and maybe others.
+
+Actually, looking back at the original kernel, it supports 32 through 256 with specific values. I should add template instantiations for at least the common ones. Let me add 64, 128.
+
+But the real question: will the generic non-templated loop be good enough? With unroll, the inner loop over d from 0 to HEAD_SIZE should be fine with a runtime HEAD_SIZE. The pragma unroll on a runtime loop doesn&#x27;t really unroll, but the compiler might still vectorize.
+
+I&#x27;ll use a switch statement and instantiate for 64, 128, and 256 to cover the bases.
+
+Now for the grid and block configuration:
+- grid: (batch_size, num_heads, seq_len)
+- block: 256 threads
+
+Wait, each block handles ONE query position. For seq_len=512, num_heads=32, batch=4, that&#x27;s 65536 blocks. Each block has 256 threads. Total thread count: 65536 * 256 = 16,777,216 threads. At 3.35 TB/s memory bandwidth, each block reads ~131KB (K + V) + 0.5KB (Q) = ~131.5KB. Total memory read: 65536 * 131.5KB = ~8.3GB. At 3.35TB/s, this takes about 2.5ms if purely memory bound. But we also have substantial computation (dot products, exp, etc).
+
+Hmm, 65536 blocks with 256 threads each is a LOT for H100. H100 has 132 SMs. Each SM can run up to 2048 threads (with 1024 threads per block max, but practically limited by registers). With 256 threads per block, each SM can run up to 8 blocks concurrently (2048 / 256 = 8). Total concurrent blocks: 132 * 8 = 1056. Total blocks: 65536. So it takes 65536 / 1056 ≈ 62 waves. Each wave processes all SMs.
+
+For memory-bound kernels, wave count doesn&#x27;t matter much if latency is hidden. But with only 2.5ms memory time and 62 waves, the overhead of block scheduling might add up.
+
+Can I optimize by processing multiple positions per block? Or using a 2D thread block?
+
+One optimization: since each block only uses ~2.5KB shared memory and has low register pressure, maybe I can increase block size to process more output dimensions per thread. But with online softmax per position, each position needs its own weights, making it hard to share.
+
+Another optimization: instead of one block per position, use one warp per position. Then a block of 256 threads handles 8 positions. This increases parallelism per SM.
+
+For warp-level processing:
+- Warp 0 handles pos=0, warp 1 handles pos=1, etc. within a block
+- But then a block only handles 8 positions, and we need seq_len/8 blocks in z-dimension
+
+Actually, a cleaner approach:
+- grid: (batch_size, num_heads, seq_len / POS_PER_BLOCK)
+- block: 256 threads = 8 warps
+- Each warp handles one position. So each block handles 8 positions.
+
+For seq_len=512, z-dimension = 512 / 8 = 64.
+Total blocks = 4 * 32 * 64 = 8192.
+Each block handles 8 positions. 
+
+Within a block:
+- Warp 0: pos = blockIdx.z * 8 + 0
+- Warp 1: pos = blockIdx.z * 8 + 1
+- ...
+- Warp 7: pos = blockIdx.z * 8 + 7
+
+Each warp does the full attention computation for its position. Warps within a block are independent! No need for __syncthreads() between warps.
+
+For a warp:
+1. Load Q for its position into registers
+2. Iterate over kv_pos=0..pos (causal)
+3. For each kv_pos, compute qk:
+   - Load K[kv_pos] elements (32 lanes load 4 elements each for HEAD_SIZE=128)
+   - Warp reduce to get full dot product
+   - Update online softmax
+   - Load V[kv_pos] elements
+   - Accumulate weighted sum
+4. After all kv_pos, normalize and write output
+
+But the warp-level dot product with lanes loading different positions (as I mistakenly did before) is wrong. Instead, ALL lanes in the warp should load elements from the SAME kv_pos. Each lane loads different dimensions.
+
+For HEAD_SIZE=128:
+- Lane 0: loads K[kv_pos][0..3], K[kv_pos][32..35], K[kv_pos][64..67], K[kv_pos][96..99]
+Wait, if we want each thread to compute partial dot products and warp-reduce, we need a pattern where each lane is responsible for a different subset of dimensions.
+
+Actually classic parallel dot product:
+- Lane i loads K[kv_pos][i], K[kv_pos][i+32], K[kv_pos][i+64], K[kv_pos][i+96]
+- Q should be loaded similarly: Lane i loads Q[pos][i], Q[pos][i+32], ...
+- Each lane computes: qk_partial += Q[d] * K[kv_pos][d] for its d values
+- Warp reduce sum to get full qk
+
+BUT: for this to work, the lanes must be computing dot products for the SAME kv_pos. That&#x27;s fine! All lanes in a warp process the same kv_pos together, then move to the next kv_pos.
+
+So the warp-level algorithm:
+```cpp
+// Load Q[pos] to registers
+half q_regs[4]; // for lane i: dimensions i, i+32, i+64, i+96
+for (int j = 0; j &lt; 4; ++j) {
+    int d = lane + j * 32;
+    q_regs[j] = q[q_offset + d];
+}
+
+float m = -1e30f;
+float l = 0.0f;
+float acc[4] = {0, 0, 0, 0};
+
+for (int kv_pos = 0; kv_pos &lt;= pos; ++kv_pos) { // causal
+    half k_regs[4];
+    const int kv_offset = ...;
+    for (int j = 0; j &lt; 4; ++j) {
+        int d = lane + j * 32;
+        k_regs[j] = k[kv_offset + d];
+    }
+    
+    float qk = 0.0f;
+    for (int j = 0; j &lt; 4; ++j) {
+        qk += __half2float(q_regs[j]) * __half2float(k_regs[j]);
+    }
+    
+    // Warp reduce
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        qk += __shfl_down_sync(0xffffffff, qk, offset);
+    }
+    qk = __shfl_sync(0xffffffff, qk, 0);
+    qk *= scale;
+    
+    // Update softmax
+    float old_m = m;
+    float new_m = fmaxf(old_m, qk);
+    float scale_factor = __expf(old_m - new_m);
+    float weight = __expf(qk - new_m);
+    m = new_m;
+    l = l * scale_factor + weight;
+    
+    // Load V and update accumulator
+    half v_regs[4];
+    for (int j = 0; j &lt; 4; ++j) {
+        int d = lane + j * 32;
+        v_regs[j] = v[kv_offset + d];
+    }
+    for (int j = 0; j &lt; 4; ++j) {
+        acc[j] = acc[j] * scale_factor + weight * __half2float(v_regs[j]);
+    }
+}
+
+// Normalize and write
+float inv_l = 1.0f / l;
+const int o_offset = ...;
+for (int j = 0; j &lt; 4; ++j) {
+    int d = lane + j * 32;
+    o[o_offset + d] = __float2half(acc[j] * inv_l);
+}
+```
+
+This is CORRECT because:
+1. All lanes load Q for the SAME position (pos)
+2. All lanes load K and V for the SAME kv_pos in each iteration
+3. Each lane computes partial dot product for its dimensions
+4. Warp reduce gives the full dot product for that kv_pos
+5. All lanes get the same qk value
+6. All lanes update their m and l identically (redundantly)
+7. Each lane updates its own acc for its own dimensions
+
+The warp-level m and l are the same across all lanes because they all update with the same qk values in the same order. This is a key insight: since all lanes process kv_pos in the SAME order and get the SAME qk, their m and l stay synchronized.
+
+Wait, does each lane need its own m and l? Since they&#x27;re always the same, one lane could compute it and broadcast. But keeping them in registers is fine.
+
+Even better: I can have only lane 0 track m and l, then broadcast. Other lanes wait. But the overhead of shuffling is small compared to the memory loads. For simplicity, I&#x27;ll have all lanes track it redundantly.
+
+Now, for multiple warps per block handling different positions:
+- blockDim.x = 256 = 8 warps
+- Warp w handles position: base_pos + w
+- Where base_pos = blockIdx.z * 8
+
+Each warp is completely independent. No shared memory needed (except maybe for Q loading if we want to share across warps, but each warp loads a different Q anyway since positions differ).
+
+Total blocks = 4 * 32 * 64 = 8192. Total warps = 8192 * 8 = 65536. Total threads = 8192 * 256 = 2,097,152. 
+
+Each warp processes pos+1 kv positions on average ~256. Each kv_pos loads 128 halfs K + 128 halfs V = 512 bytes. Per warp: ~256 * 512 = 131KB memory. Total memory: 65536 warps * 131KB = 8.3GB. Same total memory but fewer blocks means less scheduling overhead.
+
+For register pressure: each thread stores:
+- q_regs[4] = 4 halfs = 8 bytes
+- acc[4] = 4 floats = 16 bytes
+- k_regs[4], v_regs[4] could be loaded directly without storing, or reused
+- m, l, qk, etc. = ~20 bytes
+Total per thread: ~50 bytes, mostly in registers. Well within 255 register limit.
+
+Wait, if I use 50 registers per thread, a warp uses 1600 registers. An SM with 65536 registers can handle 65536 / 1600 = 40 warps. But max warps per SM on H100 is 64 (2048 threads / 32 = 64). So register limit allows 40 warps, which is more than enough for 8 warps per block.
+
+Actually, 50 registers might not be enough. Let me think about what the compiler actually uses. With loops, unrolling, etc., it could be more. But 255 is the max, and with 256 threads per block, the register file per block is 256 * ~64 = ~16K. Per SM: 64K. So up to 4 blocks per SM. Total concurrent blocks on H100: 132 * 4 = 528. Total blocks: 8192. Waves: 8192 / 528 ≈ 15.5.
+
+This is a 4x improvement in wave count compared to the previous design (62 waves). Less scheduling overhead.
+
+But wait, can we do even better? What if we process more positions per block, or use fewer threads per warp?
+
+With 8 positions per block of 256 threads, that&#x27;s 32 threads per position. For HEAD_SIZE=128, 32 threads can compute the dot product exactly (each handling 4 dimensions). Perfect.
+
+But if HEAD_SIZE=64, we&#x27;d have 32 threads each handling 2 dimensions. Or we could increase positions per block to 16 (16 warps = 512 threads), but 512 is the max block size. If HEAD_SIZE=256, 32 threads each handling 8 dimensions.
+
+The pattern generalizes: for HEAD_SIZE, each thread handles HEAD_SIZE/32 dimensions. Works for any multiple of 32.
+
+But actually, wait. The problem mentions that the contract has NUM_HEADS=32, NUM_KV_HEADS=8, HEAD_SIZE=128. If hidden tests vary head size, they could use any of the sizes in the original switch. But to keep things simple, let me focus on HEAD_SIZE=128 and make sure it&#x27;s fast.
+
+One optimization: in the V loading, I load v_regs and then multiply by weight and add to acc. But I can fuse:
+```cpp
+acc[j] = acc[j] * scale_factor + weight * __half2float(v[kv_offset + lane + j*32]);
+```
+Avoiding the v_regs array entirely.
+
+Similarly for K:
+```cpp
+qk += __half2float(q_regs[j]) * __half2float(k[kv_offset + lane + j*32]);
+```
+
+This reduces register pressure.
+
+Now, what about the GQA grouping? With this design:
+- grid.y = num_heads (32), not num_kv_heads (8)
+- Each block handles one query head
+- Within the block, each warp handles a different position
+
+Wait, if grid.y = num_heads = 32, and grid.z = seq_len / 8 = 64, grid.x = 4:
+Total blocks = 4 * 32 * 64 = 8192.
+Each warp handles one (head, pos) combination.
+
+For warp in block:
+kv_head = (blockIdx.y * 8 + warp_id) / G ?
+
+Wait no. The warp positions are: base_pos + warp_id.
+The head is fixed: blockIdx.y.
+
+So for head h, pos = blockIdx.z * 8 + warp_id.
+kv_head = h / G.
+
+This is correct! Each query head attends to the appropriate KV head.
+
+But grid.y = num_heads = 32 means we have 32*64 = 2048 blocks per batch. For 4 batches, 8192 blocks. Each block handles 8 positions (one per warp), and each position is a different query head? No wait:
+
+For block (b=0, h=0, z=0):
+- Warp 0: pos=0, h=0
+- Warp 1: pos=1, h=0
+- ...
+- Warp 7: pos=7, h=0
+
+For block (b=0, h=0, z=1):
+- Warp 0: pos=8, h=0
+- ...
+- Warp 7: pos=15, h=0
+
+For block (b=0, h=1, z=0):
+- Warp 0: pos=0, h=1
+- ...
+- Warp 7: pos=7, h=1
+
+This is correct! Each block handles 8 positions for ONE query head.
+
+For block (b=0, h=0, z=0), all warps use kv_head = 0 / 4 = 0.
+For block (b=0, h=4, z=0), all warps use kv_head = 4 / 4 = 1.
+
+This is correct.
+
+Now, for batch=4, heads=32, seq_len=512:
+Total outputs = 4 * 32 * 512 = 65536 positions.
+Each block computes 8 positions.
+Total blocks = 65536 / 8 = 8192.
+
+This is very clean. I like this design.
+
+Now, the causu
+Wait, I need to handle causal masking. Each position pos can only attend to kv_pos &lt;= pos.
+For warp with pos=p: loop kv_pos from 0 to p.
+
+For warp 7 (p=7): 8 iterations.
+For warp 0 (p=0): 1 iteration.
+For warp 7 in block z=63 (p=511): 512 iterations.
+
+Average iterations per warp: ~256.
+
+Total iterations across all warps: 65536 warps * ~256 = 16.7M iterations.
+Each iteration loads 256 bytes (128 halfs K + 128 halfs V). Total memory: 16.7M * 256B = 4.2GB. Plus Q loads: 65536 warps * 256B = 16MB. Negligible.
+
+Wait, earlier I said each warp reads 131KB for K+V and there are 65536 warps, giving 8.3GB. Why the discrepancy?
+
+If average pos = 256, each warp processes ~256 positions. Each position: 128*2 + 128*2 = 512 bytes. 256 * 512 = 131KB per warp. 65536 * 131KB = 8.3GB. 
+
+But that&#x27;s the TOTAL memory read if every position is independent. However, K and V are the same across query heads that share the same kv_head. So there could be cache reuse!
+
+For query heads 0,1,2,3 (all use kv_head=0), and position p=5: they all read K_0 through K_5 and V_0 through V_5. If these blocks run concurrently or near each other, L2 cache can reuse the K and V data.
+
+Actually, the total unique K+V memory is:
+batch * num_kv_heads * seq_len * HEAD_SIZE * 2 (K and V)
+= 4 * 8 * 512 * 128 * 2 * 2 bytes
+= 4 * 8 * 512 * 512 bytes
+= 8,388,608 bytes = 8MB
+
+So K+V total is only 8MB! This fits easily in L2 cache (50MB on H100). So cache reuse should be very high!
+
+In fact, if we process all query heads for a batch and kv_head together (which we do, since they share the same K and V), the effective memory bandwidth is much lower.
+
+For 8MB of K+V data, reading it ~4 times (for each query head in the group) = 32MB. That&#x27;s negligible.
+
+So the kernel is actually compute-bound! The main operations are:
+- Dot products: 65536 positions * avg 256 positions * 128 mult-add = 2.1B FMAs
+- Exp: 65536 * 256 = 16.7M exp operations
+- Weighted sums: same as dot products
+
+At 1979 TFLOPS (FP16 Tensor Core), 2.1B FMAs = 4.2B FLOPs. With 50% utilization, that&#x27;s ~4 microseconds. But we&#x27;re not using Tensor Cores... 
+
+Wait, our kernel uses scalar half operations and converts to float. To use Tensor Cores, we&#x27;d need to use MMA instructions. But that requires very different data layout and is much harder to implement correctly.
+
+For FP32 compute throughput (67 TFLOPS), 4.2B FLOPs takes ~62 microseconds. At 100% utilization. Realistically, with memory stalls and non-FMA operations, maybe 200-500 microseconds.
+
+Hmm, but the PyTorch SDPA with FlashAttention likely uses Tensor Cores and could be much faster.
+
+But wait, the problem specifically says &quot;adapt tile sizes, shared memory, thread block dimensions, register pressure, memory access patterns, and any architecture-specific intrinsics for the target hardware&quot; and &quot;optimized for FP16&quot;. This implies we should consider using Tensor Cores or at least vectorized half2 operations.
+
+Actually, looking at the original A100-optimized kernel, it likely used warp-level primitives and careful shared memory usage but probably not explicit Tensor Cores (since attention softmax is not easily tensor-core friendly without specific kernels like FlashAttention).
+
+For H100, the key differences are:
+1. More SMs and higher frequency
+2. Much higher memory bandwidth
+3. Better L2 cache
+4. Newer architecture with potential new instructions
+
+Actually, Hopper has Thread Block Clusters, which could help with data sharing across blocks. But for this workload, since K and V fit in L2 cache, it&#x27;s not necessary.
+
+Hopper also has improvements to async copy (TMA - Tensor Memory Accelerator), which can prefetch data efficiently. But using TMA in inline CUDA is complex.
+
+For now, let me get correctness with the warp-based approach, then submit and see the performance. If needed, I can try to optimize further.
+
+Let me think about one more optimization: using half2 for the dot product and accumulation could halve the instruction count and improve throughput.
+
+With half2:
+```cpp
+half2 q2 = *(half2*)&amp;q_vec[2*j];
+half2 k2 = *(half2*)&amp;k_val[2*j];
+float2 prod = __half22float2(__hmul2(q2, k2));
+qk += prod.x + prod.y;
+```
+
+But this requires Q and K to be aligned. Since HEAD_SIZE=128 is a multiple of 2, and we&#x27;re reading at lane*4... wait, if lane=0 reads at offset 0, lane=1 reads at offset 4 (in terms of half indices). Then lane 0 reads halfs 0,1 and lane 1 reads halfs 4,5. Actually, reading half2 requires alignment to 4 bytes (2 halfs). With lane=1 starting at offset 1 (in elements), reading 2 halfs from offset 1 is NOT aligned to 4 bytes. So half2 would fail.
+
+To use half2, lanes would need to read at even offsets. For example, if lane 0 reads elements 0,1, lane 1 reads elements 2,3, etc. Then each half2 is aligned. But then we&#x27;d need a slightly different distribution.
+
+Actually, for HEAD_SIZE=128, WARP_SIZE=32:
+Option 1: each lane handles 4 elements. Lane i handles [i, i+32, i+64, i+96]. These are strided and not contiguous. half2 requires contiguous elements.
+
+Option 2: each lane handles 4 contiguous elements. Lane i handles [i*4, i*4+1, i*4+2, i*4+3]. These ARE contiguous! And half2 reads at i*4 and i*4+2 are both 4-byte aligned because i*4 is always a multiple of 4? Wait, i*4 = 0, 4, 8, 12, etc. Yes, all multiples of 4. Each half2 spans 2 halfs = 4 bytes. So reading at i*4 gives elements (i*4, i*4+1) and reading at i*4+2 gives elements (i*4+2, i*4+3). Both are 4-byte aligned. Perfect!
+
+But wait, does this match the original pattern? For 32 lanes, lane i handles elements [i*4, i*4+1, i*4+2, i*4+3]. That covers 0..127 exactly once. Good.
+
+So the half2-based dot product:
+```cpp
+// lane i reads Q[i*4], Q[i*4+1], Q[i*4+2], Q[i*4+3]
+half2 q2_0 = *(half2*)(q_ptr + i*4);
+half2 q2_1 = *(half2*)(q_ptr + i*4 + 2);
+```
+
+Similarly for K.
+
+Then:
+```cpp
+float2 qf0 = __half22float2(q2_0);
+float2 kf0 = __half22float2(k2_0);
+qk += qf0.x * kf0.x + qf0.y * kf0.y;
+float2 qf1 = __half22float2(q2_1);
+float2 kf1 = __half22float2(k2_1);
+qk += qf1.x * kf1.x + qf1.y * kf1.y;
+```
+
+Or using __fmaf:
+```cpp
+qk = fmaf(qf0.x, kf0.x, qk);
+qk = fmaf(qf0.y, kf0.y, qk);
+qk = fmaf(qf1.x, kf1.x, qk);
+qk = fmaf(qf1.y, kf1.y, qk);
+```
+
+This is 4 FMAs instead of 4 separate multiplies and adds. Slightly more efficient.
+
+For accumulation, I can also use half2 to load V and do the update. But the scaling factors (scale_factor and weight) are scalars, so the multiply is still scalar.
+
+Actually, I realize that for simplicity, let me keep the scalar version first. I can optimize with half2 later if needed.
+
+Let me also think about grid dimensions. I&#x27;ll use:
+- grid.x = batch_size
+- grid.y = num_heads
+- grid.z = (seq_len + 7) / 8  // number of blocks along sequence dimension
+
+blockDim.x = 256 (8 warps)
+
+In the kernel:
+```cpp
+const int b = blockIdx.x;
+const int h = blockIdx.y;
+const int base_pos = blockIdx.z * 8;
+const int warp_id = threadIdx.x / 32;
+const int lane = threadIdx.x % 32;
+const int pos = base_pos + warp_id;
+
+if (pos &gt;= seq_len) return;
+```
+
+This way, if seq_len is not a multiple of 8, the last block&#x27;s extra warps simply return.
+
+Let me write this kernel now.
+
+Actually, for correctness verification, the first step is to make sure the logic is right, then verify with the tool.
+
+One more important point: head_size might not be exactly 128 in hidden tests. The kernel template needs to handle different sizes. But the register arrays `q_regs[HEAD_SIZE/WARP_SIZE]` need to be sized at compile time. That&#x27;s fine if HEAD_SIZE is a template parameter.
+
+For HEAD_SIZE=128: q_regs[4]
+For HEAD_SIZE=64: q_regs[2]
+For HEAD_SIZE=32: q_regs[1]
+
+All good with template parameter.
+
+But if I need to handle arbitrary head sizes, I&#x27;d need a non-templated version. But I&#x27;ll use a switch statement to instantiate common sizes.
+
+Let me write the kernel now. I&#x27;ll also handle the case where Q/K/V might be non-contiguous. The problem uses standard contiguous tensors, so I don&#x27;t need to worry about strides for now. But just in case.
+
+Wait, looking at the original kernel, it takes explicit q_stride, kv_stride, etc. The problem&#x27;s test contract creates `torch.randn(...)` which are dense and contiguous. So I can assume default row-major layout.
+
+OK, I&#x27;ll write the kernel assuming contiguous tensors with shape [batch, heads, seq_len, head_size].
+
+One more concern: the output of softmax attention at position 0 with causal mask should be exactly v[0] (since only position 0 has nonzero weight). At position 0, the dot product of Q[0] with K[0], after softmax, weight[0] = 1.0. Output = V[0].
+
+Does my online softmax handle this correctly?
+For kv_pos=0:
+old_m = -inf
+new_m = qk0
+scale_factor = exp(-inf - qk0) = 0
+weight = exp(qk0 - qk0) = 1
+m = qk0
+l = 0 * 0 + 1 = 1
+
+acc = 0 * 0 + 1 * V_0 = V_0
+
+inv_l = 1/1 = 1
+output = V_0
+
+Correct!
+
+What about at position 1 with two positions?
+kv_pos=0: m=qk0, l=1, acc=V_0*exp(0) wait...
+
+Actually let&#x27;s trace:
+kv_pos=0:
+old_m = -inf
+new_m = qk0
+scale = exp(-inf - qk0) = 0
+weight = exp(qk0 - qk0) = 1
+m = qk0
+l = 0*0 + 1 = 1
+acc = 0*0 + 1*V_0 = V_0
+
+kv_pos=1:
+old_m = qk0
+new_m = max(qk0, qk1)
+scale_factor = exp(qk0 - new_m)
+weight = exp(qk1 - new_m)
+m = new_m
+l = 1 * scale_factor + weight
+acc = V_0 * scale_factor + V_1 * weight
+
+inv_l = 1 / l
+output = acc / l
+= (V_0 * exp(qk0 - M) + V_1 * exp(qk1 - M)) / (exp(qk0 - M) + exp(qk1 - M))
+
+Where M = max(qk0, qk1). Correct!
+
+Great, the online softmax is correct.
+
+Now let me think about whether there are inter-warp synchronization issues. In my new design, each warp is completely independent. No shared memory, no __syncthreads(). This is very clean and even faster because there&#x27;s no synchronization overhead.
+
+The only consideration is occupancy. Each block has 8 warps. They can run in parallel on an SM if there are enough resources. Since they&#x27;re independent (no barriers), as soon as one warp stalls on memory, the SM can switch to another warp. 
+
+For H100, each SM can have up to 64 warps resident. With 8 warps per block, an SM can run up to 8 blocks (64/8 = 8). But resource limits (registers, shared memory) might reduce this. With low register usage, we should be able to get good occupancy.
+
+OK let me write the actual code.
+
+I also need to think about whether to use `__launch_bounds__`. The H100 has 64K registers per SM and 2048 max threads. If I use 256 threads per block, each block could use up to 64K/8 = 8K registers per thread if we want 8 blocks per SM. But realistically, if each thread uses ~40 registers, 256 threads * 40 = 10K registers per block. With 64K per SM, we can fit 6 blocks = 1536 threads. That&#x27;s 75% occupancy, which should be fine.
+
+I&#x27;ll add `__launch_bounds__(256)` just to be explicit.
+
+Now I realize that the original kernel source was for paged attention, which is for inference (decode phase). The input shapes in the test are for prefill. But that&#x27;s fine - I just need to match the reference output.
+
+Let me write the final kernel.
+
+One optimization for H100: H100 supports `__hmul` and `__hfma` which operate directly on half types. This could reduce the conversion overhead and use the FP16 ALUs instead of converting to float. However, for accumulation in softmax, float precision is important to avoid overflow/underflow. The dot product itself could be done in half2 for speed.
+
+Actually, for the dot products, the values are small (normal dist ~N(0,1)) and the sum of 128 products has std ~sqrt(128) ~ 11. In fp16, the dynamic range is enough. But for numerical accuracy matching the reference, we might need fp32 accumulation. The tolerance for fp16 is 1e-2, so fp16 accumulation might be borderline.
+
+I&#x27;ll stick with fp32 accumulation for correctness. Later I can check if fp16 works.
+
+Wait, for performance: the dot product with fp32 requires conversion. Each `__half2float` is one instruction. For 4 elements per lane, that&#x27;s 8 conversions per dot product. Could be significant.
+
+Alternative: use `__half2` and `__half22float2` to convert 2 halfs at once, reducing conversion count by half.
+
+```cpp
+// q_regs is stored as half2
+half2 q2_a = q2_regs[0];  // elements 0,1
+half2 q2_b = q2_regs[1];  // elements 2,3
+float2 qf_a = __half22float2(q2_a);
+float2 qf_b = __half22float2(q2_b);
+
+half2 k2_a = k2_regs[0];
+half2 k2_b = k2_regs[1];
+float2 kf_a = __half22float2(k2_a);
+float2 kf_b = __half22float2(k2_b);
+
+qk = fmaf(qf_a.x, kf_a.x, qk);
+qk = fmaf(qf_a.y, kf_a.y, qk);
+qk = fmaf(qf_b.x, kf_b.x, qk);
+qk = fmaf(qf_b.y, kf_b.y, qk);
+```
+
+This might be slightly faster. But first, let me get correctness.
+
+I&#x27;ll write the kernel cleanly and submit.
+
+Argh, I keep thinking but not writing. Let me just write the code now.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n#include &lt;ATen/cuda/CUDAContext.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cuda_fp16.h&gt;\n#include &lt;cmath&gt;\n\n#define WARP_SIZE 32\n\ntemplate &lt;int HEAD_SIZE&gt;\n__global__ void __launch_bounds__(256) gqa_kernel(\n    const half* __restrict__ q,\n    const half* __restrict__ k,\n    const half* __restrict__ v,\n    half* __restrict__ o,\n    int num_heads,\n    int num_kv_heads,\n    int seq_len,\n    float scale\n) {\n    const int b = blockIdx.x;\n    const int h = blockIdx.y;\n    const int base_pos = blockIdx.z * 8;\n    const int warp_id = threadIdx.x / WARP_SIZE;\n    const int lane = threadIdx.x % WARP_SIZE;\n    const int pos = base_pos + warp_id;\n\n    if (pos &gt;= seq_len) return;\n\n    const int G = num_heads / num_kv_heads;\n    const int kv_head = h / G;\n\n    const int elems_per_lane = HEAD_SIZE / WARP_SIZE;\n\n    // Load Q for this position into registers\n    half q_regs[elems_per_lane];\n    const int q_offset = ((b * num_heads + h) * seq_len + pos) * HEAD_SIZE;\n    #pragma unroll\n    for (int i = 0; i &lt; elems_per_lane; ++i) {\n        int d = lane + i * WARP_SIZE;\n        q_regs[i] = q[q_offset + d];\n    }\n\n    float m = -1e30f;\n    float l = 0.0f;\n    float acc[elems_per_lane];\n    #pragma unroll\n    for (int i = 0; i &lt; elems_per_lane; ++i) {\n        acc[i] = 0.0f;\n    }\n\n    // Iterate over KV positions (causal)\n    const int kv_base_offset = ((b * num_kv_heads + kv_head) * seq_len) * HEAD_SIZE;\n\n    for (int kv_pos = 0; kv_pos &lt;= pos; ++kv_pos) {\n        const int kv_offset = kv_base_offset + kv_pos * HEAD_SIZE;\n\n        // Compute dot product Q \u00b7 K[kv_pos]\n        float qk = 0.0f;\n        #pragma unroll\n        for (int i = 0; i &lt; elems_per_lane; ++i) {\n            int d = lane + i * WARP_SIZE;\n            qk += __half2float(q_regs[i]) * __half2float(k[kv_offset + d]);\n        }\n\n        // Warp reduce to full dot product\n        #pragma unroll\n        for (int offset = WARP_SIZE / 2; offset &gt; 0; offset &gt;&gt;= 1) {\n            qk += __shfl_down_sync(0xffffffff, qk, offset);\n        }\n        qk = __shfl_sync(0xffffffff, qk, 0) * scale;\n\n        // Online softmax update\n        float old_m = m;\n        float new_m = fmaxf(old_m, qk);\n        float scale_factor = __expf(old_m - new_m);\n        float weight = __expf(qk - new_m);\n        m = new_m;\n        l = l * scale_factor + weight;\n\n        // Accumulate weighted V\n        #pragma unroll\n        for (int i = 0; i &lt; elems_per_lane; ++i) {\n            int d = lane + i * WARP_SIZE;\n            acc[i] = acc[i] * scale_factor + weight * __half2float(v[kv_offset + d]);\n        }\n    }\n\n    // Write output\n    float inv_l = 1.0f / l;\n    const int o_offset = ((b * num_heads + h) * seq_len + pos) * HEAD_SIZE;\n    #pragma unroll\n    for (int i = 0; i &lt; elems_per_lane; ++i) {\n        int d = lane + i * WARP_SIZE;\n        o[o_offset + d] = __float2half(acc[i] * inv_l);\n    }\n}\n\ntorch::Tensor gqa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {\n    const int batch_size = q.size(0);\n    const int num_heads = q.size(1);\n    const int seq_len = q.size(2);\n    const int head_size = q.size(3);\n    const int num_kv_heads = k.size(1);\n\n    auto o = torch::empty_like(q);\n    const float scale = 1.0f / sqrtf(static_cast&lt;float&gt;(head_size));\n\n    dim3 grid(batch_size, num_heads, (seq_len + 7) / 8);\n    dim3 block(256);\n\n    switch (head_size) {\n        case 64:\n            gqa_kernel&lt;64&gt;&lt;&lt;&lt;grid, block, 0, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(\n                reinterpret_cast&lt;const half*&gt;(q.data_ptr&lt;at::Half&gt;()),\n                reinterpret_cast&lt;const half*&gt;(k.data_ptr&lt;at::Half&gt;()),\n                reinterpret_cast&lt;const half*&gt;(v.data_ptr&lt;at::Half&gt;()),\n                reinterpret_cast&lt;half*&gt;(o.data_ptr&lt;at::Half&gt;()),\n                num_heads, num_kv_heads, seq_len, scale);\n            break;\n        case 128:\n            gqa_kernel&lt;128&gt;&lt;&lt;&lt;grid, block, 0, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(\n                reinterpret_cast&lt;const half*&gt;(q.data_ptr&lt;at::Half&gt;()),\n                reinterpret_cast&lt;const half*&gt;(k.data_ptr&lt;at::Half&gt;()),\n                reinterpret_cast&lt;const half*&gt;(v.data_ptr&lt;at::Half&gt;()),\n                reinterpret_cast&lt;half*&gt;(o.data_ptr&lt;at::Half&gt;()),\n                num_heads, num_kv_heads, seq_len, scale);\n            break;\n        default:\n            TORCH_CHECK(false, \&quot;Unsupported head size: \&quot;, head_size);\n    }\n    return o;\n}\n&#x27;&#x27;&#x27;\n\ncpp_source = r&#x27;&#x27;&#x27;\ntorch::Tensor gqa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v);\n&#x27;&#x27;&#x27;\n\nmodule = load_inline(\n    name=&#x27;gqa_hopper&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;gqa_forward&#x27;],\n    extra_cuda_cflags=[\n        &#x27;-O3&#x27;,\n        &#x27;--use_fast_math&#x27;,\n        &#x27;-gencode=arch=compute_90,code=sm_90&#x27;,\n    ],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, num_heads, num_kv_heads, head_size):\n        super().__init__()\n        self.num_heads = num_heads\n        self.num_kv_heads = num_kv_heads\n        self.head_size = head_size\n\n    def forward(self, q, k, v):\n        return module.gqa_forward(q, k, v)\n&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
