@@ -6,14 +6,14 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 27</a></div><div class="site-subtitle">Kimi-K2.6 · hardware_translation_stub · l5_hw_translation_single_turn_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-10 09:30:59 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 27</a></div><div class="site-subtitle">Kimi-K2.6 · hardware_translation_stub · l5_hw_translation_single_turn_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-10 09:36:11 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
-  <span class="outcome-badge outcome-in_progress">in_progress</span>
+  <span class="outcome-badge outcome-error">error</span>
   <span style="font-size:13px;">27_batched_gemm.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 1</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 1</div></div>
   <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp16</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">hardware_translation_stub</div></div>
@@ -30,5 +30,1339 @@
 # I/O contract: level5/hardware_translation/io/27_batched_gemm.toml
 # Oracle CUDA reference: level5/hardware_translation/oracle/27_batched_gemm.py
 
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 0 tool call(s) · 334.7s · 136,961 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 334.7s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to rewrite a custom CUDA kernel for batched GEMM (specifically, a strided batched GEMM with column-major layout) optimized for H100 (Hopper). The input is a PyTorch model that takes a single tensor of shape [BATCH, M, K] (batch size 17, M=520, K=129). Wait, but there are two inputs? The reference code uses A, B, C.
+
+Let&#x27;s read the I/O contract carefully.
+
+```python
+import torch
+import torch.nn as nn
+
+BATCH = 17
+M = 520
+N = 219
+K = 129
+ALPHA = 1.0
+BETA = 2.0
+
+def get_inputs():
+    return [torch.randn(BATCH, M, K, dtype=torch.float32).cuda()]
+
+def get_init_inputs():
+    return [BATCH, K, N, ALPHA, BETA]
+
+# ModelNew must define __init__(*get_init_inputs()) and forward(*get_inputs()) so outputs match the hidden reference implementation on the evaluation GPU.
+```
+
+So `ModelNew.__init__(self, BATCH, K, N, ALPHA, BETA)` takes these parameters. 
+`forward` takes `x` which is `[BATCH, M, K]`.
+
+But the reference operation seems to be `C = alpha * A * B + beta * C`. But where do B and C come from? The hidden reference likely creates fixed B and C internally, or perhaps B is initialized in __init__ and C is also. Wait, looking at the C++ code: B and C are filled with specific patterns in the reference test. But the I/O contract for PyTorch only gives A as input. So the hidden reference must initialize B and C in `__init__` based on `BATCH, K, N, ALPHA, BETA`.
+
+Let&#x27;s infer the hidden reference implementation.
+
+Probably:
+```python
+class Model(nn.Module):
+    def __init__(self, BATCH, K, N, ALPHA, BETA):
+        super().__init__()
+        self.BATCH = BATCH
+        self.K = K
+        self.N = N
+        self.ALPHA = ALPHA
+        self.BETA = BETA
+        # B is fixed shape [BATCH, K, N]? Wait in the C++ code B is of shape [ldb * n] where ldb = k * batch_count.
+        # Actually in C++ code: count_B = ldb * n, where ldb = k * batch_count. And B is column major.
+        # In column major, dimensions are (ldb, n). ldb is leading dimension (rows). So B has ldb rows and n columns.
+        # ldb = k * batch_count. So B is effectively all batches concatenated along the row dimension (K)?
+        # Let&#x27;s look at indexing: `host_B[row_idx + col_idx * ldb + b_idx * k]`. For batch b_idx, row_idx is within [0, k-1], column_idx within [0, n-1].
+        # So batch b_idx&#x27;s slice starts at offset `b_idx * k`. And within slice, element (row, col) is at `row + col * ldb`.
+        # Since ldb = k * batch_count, this means batch slices are interleaved? No, `row + col * ldb + b_idx * k`. For col=0, it&#x27;s `row + b_idx * k`. So batch b_idx occupies rows [b_idx*k, b_idx*k + k - 1] in column 0. For col=1, it&#x27;s `row + ldb + b_idx*k`. So each batch is a contiguous block of k rows, and columns are separated by ldb.
+        # So B is a column-major matrix with shape (ldb, n), where ldb = K * BATCH. Each batch corresponds to a block of K rows.
+        # A is column-major with shape (lda, k*batch_count)? Wait count_A = batch_count * lda * k. lda = m.
+        # `host_A[row_idx + col_idx * lda + b_idx * lda * k]`. So batch b_idx has columns [b_idx*k, b_idx*k + k - 1], each column has m rows with stride lda = m. So A is column-major with shape (m, k*batch_count). It&#x27;s all batches concatenated along the column dimension.
+        # C is column-major with shape (m, n*batch_count). count_C = batch_count * ldc * n, ldc=m. `host_C[row_idx + col_idx * ldc + b_idx * ldc * n]`.
+        # batch_stride_A = lda * k = m*k. batch_stride_B = k. batch_stride_C = ldc * n = m*n.
+        # This is strided batched gemm where A and C are batched along columns/rows with fixed strides, while B is strided by k (i.e., each batch is a contiguous block of k rows).
+        # However, the I/O contract gives us only A (shape [BATCH, M, K]) as input. 
+        # The reference Model likely constructs B and C in __init__ using the same patterns as the C++ code, or perhaps C is initialized to ones and B is created with a specific pattern.
+        # The operation is: C = alpha * A * B + beta * C. Here A is [BATCH, M, K], B is [BATCH, K, N] or similar, C is [BATCH, M, N].
+        # But from the C++ code, B has shape [K*BATCH, N] in column-major. Translating to row-major (PyTorch default), that would be [N, K*BATCH]? No, need to be careful.
+        # Actually PyTorch tensors are row-major (last dimension contiguous). But the C++ code uses column-major layout. The hidden reference likely converts or uses row-major equivalents.
+        # Wait, the user says: &quot;The source kernel was hand-tuned for A100... Adapt tile sizes...&quot;. And &quot;Note: The kernels should be optimized for FP16 (16-bit floating point) precision.&quot;
+        # So we need to write a custom CUDA kernel. But can we just use cuBLAS or CUTLASS? The user says: &quot;Your ModelNew must use custom inlined CUDA operators (e.g. torch.utils.cpp_extension.load_inline), not library routines that replace the whole kernel you were asked to port.&quot;
+        # This means we cannot just call torch.matmul or cublas. We must write a custom CUDA kernel. But we can use CUTLASS? The original code used CUTLASS. But the instruction says &quot;not library routines that replace the whole kernel you were asked to port.&quot; This is ambiguous. It says &quot;custom inlined CUDA operators&quot;. Probably they want handwritten CUDA, not calling cutlass or cublas. Because otherwise it&#x27;s trivial to just call cublasGemmStridedBatchedEx. Let&#x27;s try to write a custom CUDA kernel for batched GEMM.
+        # However, writing a high-performance GEMM kernel from scratch that beats cuBLAS is extremely hard. But maybe for this specific smallish size (BATCH=17, M=520, N=219, K=129), a custom kernel can be competitive.
+        # Wait, the original code was using CUTLASS. But we are asked to re-optimize the CUDA operator. We can still use CUTLASS but tune it for Hopper? The instruction says &quot;not library routines that replace the whole kernel you were asked to port.&quot; That suggests the evaluator expects custom CUDA code, not a single library call. But perhaps using CUTLASS&#x27;s building blocks is okay? The original code was CUTLASS GemmArray and GemmBatched. But we need to output a PyTorch model with custom CUDA via load_inline. We could write a custom kernel that does the strided batched gemm using shared memory tiling.
+        # Given the complexity, maybe the best approach is to write a custom kernel that is at least correct and reasonably optimized. The sizes are moderate. Let&#x27;s calculate: M=520, N=219, K=129. Each batch is a small GEMM. Total FLOPs = 2 * BATCH * M * N * K = 2 * 17 * 520 * 219 * 129 ≈ 2 * 17 * 14,677,560 ≈ 499,037,040 ≈ 0.5 GFLOPs. This is tiny. The kernel will be memory-bound or latency-bound.
+        # Actually 520*219*129*2*17 = let&#x27;s compute precisely:
+        # 520*219 = 113,880.
+        # 113,880*129 = 14,690,520.
+        # *2 = 29,381,040.
+        # *17 = 499,477,680.
+        # So ~0.5 GFLOPs. This is tiny. Launch overhead and memory bandwidth will dominate.
+        # Using a custom kernel might be okay if we can fuse the operation or efficiently load data.
+        # But the hidden reference likely uses a naive or tuned CUTLASS kernel. The speedup might be small.
+        # However, the instruction says &quot;Write a custom CUDA kernel that replaces a PyTorch reference, producing numerically equivalent output faster than the reference.&quot; So we need to beat PyTorch reference. PyTorch reference for FP32 matmul will likely use cuBLAS. For FP16, also cuBLAS. cuBLAS for such irregular sizes might not be perfect. But cuBLAS is highly optimized.
+        # Wait, the model takes FP32 input (`torch.randn(..., dtype=torch.float32)`), but the note says &quot;kernels should be optimized for FP16 precision&quot;. So perhaps the hidden reference converts to FP16 and does matmul in FP16? Or maybe the reference does FP32, but we should do FP16 tensor core? The instruction says &quot;optimized for FP16&quot;. We can cast to half, compute in half (using tensor cores via WMMA or mma.sync instructions), and cast back. But correctness tolerance for fp16 is 1e-2.
+        # Let&#x27;s look at the original C++ code: it&#x27;s float (SGEMM). But the note says optimize for FP16. So maybe the evaluator expects the kernel to accept float32 but compute in float16? Or maybe the reference also uses float16.
+        # The user says: &quot;Note: The kernels should be optimized for FP16 (16-bit floating point) precision.&quot; This likely means the internal computation should use FP16 (to leverage H100&#x27;s massive FP16 throughput). Since input is FP32, we can cast to FP16 in the kernel.
+        # However, the output must match reference within tolerance: fp16 uses atol=rtol=1e-2. So computing in FP16 is acceptable.
+        # On H100, we can use the new wgmma (warpgroup matrix multiply accumulate) instructions available on Hopper. These are asynchronous and operate on descriptors in shared memory. Using wgmma is the key to high performance on H100.
+        # But writing raw PTX wgmma in inline CUDA is advanced. We can use CUTLASS 3.x which targets Hopper with warpgroup MMA. But the instruction says not to replace with library routines. However, we might be able to use CUTLASS&#x27;s components but wrap them in our own kernel? Or we can write a simpler kernel using `wmma` (which is deprecated on Hopper but still works) or `mma.sync` (Ampere). For Hopper, the main improvement is support for FP8 and wgmma.
+        # But to write a custom kernel that beats cuBLAS for 0.5 GFLOPs is basically impossible if we do a single kernel launch, because cuBLAS has tiny kernels and software pipelining. However, if we fuse the batched operation or use asynchronous copies, maybe we can do better? Actually for strided batched, cuBLAS might launch multiple kernels or one batched kernel. For small GEMMs, it might be better to process multiple batches within one thread block.
+        # Wait, the user says &quot;Re-optimize the given CUDA operators device code for a different GPU.&quot; The original code is a CUTLASS batched GEMM. Maybe the evaluator just wants us to provide a CUTLASS 3.x kernel tuned for H100? But the requirement &quot;not library routines that replace the whole kernel&quot; suggests we should write the kernel manually.
+        # However, looking at other similar tasks, often the best approach is to use `torch.utils.cpp_extension.load_inline` with a custom CUDA kernel that uses shared memory tiling and maybe tensor cores via the `mma` PTX instruction, or simply a well-tuned CUDA kernel. But for H100, they might expect using `cp.async.bulk` and wgmma.
+        # Given the constraints, maybe we should write a kernel that:
+        # - Takes A (B, M, K), B_weight (B, K, N), and C (B, M, N) from internal state.
+        # - Computes C = alpha * A @ B + beta * C.
+        # - B and C are created in __init__ with the specific patterns from the C++ code.
+        # Wait, the I/O contract: `forward` receives only A. B and C must be internal to the model. The hidden reference likely initializes B and C in __init__. So we need to infer the initialization patterns from the C++ code.
+        # In the C++ reference:
+        # A is filled: `host_A[row_idx + col_idx * lda + b_idx * lda * k] = static_cast&lt;float&gt;((row_idx + col_idx * lda + b_idx * lda * k) % kRange);`
+        # B is filled: `host_B[row_idx + col_idx * ldb + b_idx * k] = static_cast&lt;float&gt;(((n + k * ldb + batch_count * k) - (row_idx + col_idx * ldb + b_idx * k)) % kRange);`
+        # C is filled: `host_C[...] = 1.f`
+        # Wait, but the hidden reference model might not initialize with these specific deterministic patterns; it might use random? No, the reference outputs must match for given inputs. Since the forward only receives A, B and C must be fixed properties of the model. The `get_init_inputs` returns `BATCH, K, N, ALPHA, BETA`. So the model uses these to initialize B and C. But what are the initialization values? The C++ code is just an example. The hidden reference is different.
+        # Actually, the I/O contract says: &quot;ModelNew must define __init__(*get_init_inputs()) and forward(*get_inputs()) so outputs match the hidden reference implementation on the evaluation GPU.&quot; The hidden reference takes the same init inputs. We don&#x27;t know exactly how B and C are initialized. But likely they are initialized to random values or fixed values. Wait, but we need to match the hidden reference exactly. How can we know B and C?
+        # Let&#x27;s look at the C++ code again: `strided_batched_gemm_nn_reference` takes A, B, C vectors. But in `run_batched_gemm`, it fills A, B, C with specific values, then calls CUTLASS, then compares with reference. This is just a test harness. The actual operator to port is the batched GEMM itself.
+        # In PyTorch, the hidden reference might simply do:
+        # self.B = torch.randn(BATCH, K, N)  # No, that would not be deterministic.
+        # Or maybe it creates fixed values using some formula? The get_inputs returns random A. The B and C might be parameters or buffers fixed at init.
+        # But we cannot see the reference. However, the problem says &quot;Your ModelNew must match the hidden evaluation reference on the tensor I/O contract below (same numerical outputs for the same inputs).&quot; The only input to forward is A. The init args are BATCH, K, N, ALPHA, BETA. So B and C must be functions of these args only.
+        # In the original C++ code, B and C are generated using formulas. But perhaps the hidden reference is exactly the C++ code wrapped in PyTorch: i.e., B and C are generated as in the example. Or perhaps the hidden reference just does `torch.baddbmm` with internal B and C? If C is initialized to zeros and B to ones? No.
+        # Let&#x27;s analyze: The user gave us the C++ code as &quot;the existing CUDA implementation to translate&quot;. So the hidden reference likely wraps exactly this computation. The test harness inside the C++ code might be what the hidden reference replicates in Python. In that harness, B and C are generated deterministically. So our ModelNew must generate B and C in the same way.
+        # Let&#x27;s assume:
+        # - B is of shape (BATCH, K, N) or (K*BATCH, N) but stored as a PyTorch tensor.
+        # Wait, the original is column major. PyTorch is row-major. We need to match mathematically.
+        # Let&#x27;s reconstruct the math.
+        # In C++, A is column-major [m, k*b] (lda=m). For batch b_idx, the slice is columns [b_idx*k, b_idx*k + k - 1]. Each column j has elements at rows 0..m-1.
+        # In row-major terms (like PyTorch), this corresponds to A being shape [b, k, m]? No.
+        # Let&#x27;s define A_CM(row, col) = A[row + col*lda].
+        # For batch b_idx, the matrix A_b is m x k, column-major. The columns are contiguous in memory with stride m.
+        # In PyTorch, a tensor of shape [BATCH, M, K] is row-major: element (b, m, k) is at offset b*M*K + m*K + k.
+        # To get column-major layout for A_b, A_pyroch[b, :, :] would be stored as row-major, which is K x M column-major? Actually a [M, K] tensor in PyTorch (row-major) has A[i,j] at offset i*K + j. In column-major, offset is j*M + i.
+        # So a PyTorch tensor `A_pt` of shape [BATCH, M, K] corresponds to a column-major matrix where each batch slice is M x K but transposed? Let&#x27;s check.
+        # If we view A_pt as [BATCH, M, K], then element (b, i, j) is at offset b*M*K + i*K + j.
+        # In column-major for a matrix of dimensions (M, K*BATCH) with lda=M, element (row=i, col=b*K + j) is at offset (b*K + j)*M + i = b*K*M + j*M + i.
+        # That&#x27;s not the same as b*M*K + i*K + j. So it&#x27;s a different layout.
+        # However, PyTorch&#x27;s matmul is row-oriented: `torch.bmm(A, B)` where A is [B, M, K] and B is [B, K, N] computes standard matrix multiplication (row-major) C[b,m,n] = sum_k A[b,m,k] * B[b,k,n].
+        # The reference C++ code computes in column-major: C = A * B. Let&#x27;s map the dimensions. In column-major GEMM, if A is M x K, B is K x N, then C is M x N. The formula is C_{m,n} = sum_k A_{m,k} B_{k,n}. This is the same algebra, just different memory layout.
+        # In the C++ test, A is [m, k*batch] column-major (batch strided along columns). B is [k*batch, n] column-major (batch strided along rows). C is [m, n*batch] column-major (batch strided along columns).
+        # Wait, B has ldb = k*batch, and is n columns. For batch b, the rows are [b*k, b*k + k - 1]. So B_b is K x N column-major. Indeed, B overall is (K*BATCH) x N.
+        # A is M x (K*BATCH) column-major. So A_b is M x K, columns [b*k, (b+1)*k - 1].
+        # C is M x (N*BATCH) column-major. C_b is M x N, columns [b*n, (b+1)*n - 1].
+        # The operation is C_b = alpha * A_b * B_b + beta * C_b, for each batch.
+        # In PyTorch terms, if we have A_pt of shape [BATCH, M, K] and B_pt of shape [BATCH, K, N], then C_pt[b] = alpha * A_pt[b] @ B_pt[b] + beta * C_pt[b]. This is the same computation. The difference is memory layout.
+        # Therefore, we don&#x27;t need to worry about column-major vs row-major if we just write PyTorch-like matmul. The hidden reference probably initializes B and C as PyTorch tensors and uses `torch.baddbmm` or something.
+        # But we need to know the initialization values of B and C. Since the C++ example initializes them deterministically, the hidden reference might as well. Or maybe it&#x27;s just a test harness, and the actual hidden reference is a simple `nn.Parameter` or buffer that is part of the model state.
+        # Let&#x27;s look at the init args: BATCH, K, N, ALPHA, BETA. No seed. So initialization must be deterministic from these numbers. The C++ code uses `kRange = 8`. B is generated with formula. C is all ones. So it&#x27;s deterministic. This is very likely what the hidden reference does, because otherwise the output wouldn&#x27;t be deterministic across runs.
+        # Let&#x27;s assume the hidden reference initializes B and C exactly as in the C++ code. We should replicate that.
+        # Wait, the user says: &quot;The source kernel was hand-tuned for A100... Re-optimize the CUDA operators kernel above for H100.&quot; This implies the operation performed by the kernel is what we need to preserve. The test harness is just an example. But the hidden Model likely does the same strided batched gemm with the same data patterns? Hmm, typical hidden references in these tasks replicate the given reference logic in PyTorch. The C++ code contains both the kernel (CUTLASS calls) and the reference loop. The hidden reference likely just uses the Python equivalent of the reference loop or PyTorch&#x27;s bmm.
+        # But if the hidden reference uses PyTorch `torch.baddbmm`, then B and C would need to be known. Since we don&#x27;t see them, they are probably created in `__init__`.
+        # In fact, we can write a kernel that doesn&#x27;t depend on B and C being specific, but just takes them as internal buffers. We can initialize B and C in `__init__` using any deterministic method, as long as it matches the hidden reference. But we don&#x27;t know the hidden reference.
+        # Let&#x27;s search for clues. The C++ code&#x27;s `run_batched_gemm` uses `use_array` or `strided`. But the I/O contract gives only one tensor as input. So the hidden reference must be using the &quot;strided batched&quot; version, not the array version, because the array version requires pointer arrays. The strided version only needs A, B, C pointers and strides. In PyTorch, A is input, B and C are buffers.
+        # Let&#x27;s replicate the exact initialization from the C++ strided batched test (the `else` branch).
+        # In that branch:
+        # A is of size count_A = batch_count * lda * k = 17 * 520 * 129.
+        # B is of size count_B = ldb * n = (k * batch_count) * n = 129 * 17 * 219. Note ldb = k * batch_count = 2193.
+        # C is of size count_C = batch_count * ldc * n = 17 * 520 * 219.
+        # A fill: for b_idx in range(batch_count): for col_idx in range(k): for row_idx in range(m): A[row_idx + col_idx * lda + b_idx * lda * k] = (row_idx + col_idx * lda + b_idx * lda * k) % 8
+        # B fill: for b_idx in range(batch_count): for col_idx in range(n): for row_idx in range(k): B[row_idx + col_idx * ldb + b_idx * k] = ((n + k * ldb + batch_count * k) - (row_idx + col_idx * ldb + b_idx * k)) % 8
+        # Let&#x27;s compute constant for B: n + k*ldb + batch_count*k. Here n=219, k*ldb = 129 * 2193 = 282,897? Wait ldb = k * batch_count = 129 * 17 = 2193. So k * ldb = 129 * 2193 = 282,897. batch_count * k = 17*129 = 2193. Sum = 219 + 282897 + 2193 = 285,309. So B[i] = (285309 - i) % 8.
+        # C fill: all 1.0f.
+        # Then it does cutlass_strided_batched_sgemm with alpha=1.0, beta=2.0.
+        # Then compares with strided_batched_gemm_nn_reference which does the same in CPU.
+        # So the hidden reference might literally create these buffers and call a batched GEMM. Our ModelNew must produce the same output for the same A. Wait, but the hidden reference&#x27;s forward takes A as input, and presumably B and C are fixed buffers. So the output is `alpha * A @ B + beta * C`, with B and C initialized as above.
+        # Since we have the exact formulas, we can replicate B and C exactly. Then we just need to compute the GEMM.
+        # But what if the hidden reference uses a different initialization? The problem says &quot;same numerical outputs for the same inputs&quot;. Since inputs only include A, B and C must be deterministic properties of the model. Given the context of porting the existing CUDA implementation, it&#x27;s very likely the hidden reference matches the C++ test harness exactly.
+        # So our plan:
+        # 1. In `__init__`, create self.B and self.C using the exact formulas from the C++ test harness, adapted to PyTorch.
+        # 2. In `forward`, implement a custom CUDA kernel for `C = alpha * A @ B + beta * C`.
+        # Since the input A has shape [BATCH, M, K], and B should have shape [BATCH, K, N] for standard bmm. Let&#x27;s derive B&#x27;s shape in row-major.
+        # In C++, B is column-major with shape (ldb, n) = (K*BATCH, N). In row-major, a tensor of shape (N, K*BATCH) would have the same memory layout as the transpose of B? Actually column-major shape (R, C) is equivalent to row-major shape (C, R) with transposed indices. So B_CM(K*BATCH, N) is equivalent to B_RM(N, K*BATCH). We can view this as [N, BATCH, K] or [N, K*BATCH]. But we want to use PyTorch bmm, so we need B in [BATCH, K, N].
+        # Let&#x27;s index B_CM(row=r, col=c) = B_CM[r + c*ldb], with r in [0, ldb-1], c in [0, n-1].
+        # In the test, for batch b, row r_b in [0, k-1], the offset is (r_b + b*k) + c*ldb.
+        # In row-major [BATCH, K, N], element (b, r_b, c) is at offset b*K*N + r_b*N + c.
+        # In column-major [BATCH, N, K]? No.
+        # Let&#x27;s not overcomplicate. We can just create B and C as flat tensors of the same size and layout as C++ (i.e., column-major), and then write a custom CUDA kernel that reproduces the C++ reference loop&#x27;s indexing exactly. That guarantees correctness regardless of layout translation issues.
+        # Wait, but the input A is a PyTorch tensor of shape [BATCH, M, K] which is row-major. We can either:
+        # a) Keep A as row-major and do the math in row-major (i.e., C = A @ B where A is [B,M,K], B is [B,K,N]). This is easiest.
+        # b) Convert A to column-major layout inside the kernel.
+        # Since we have to match the hidden reference, which likely does (a) using PyTorch operations, we should match that. But the hidden reference could be using the column-major layout exactly as C++. However, since PyTorch tensors are row-major, if the reference creates B and C using `torch.arange` and reshape, the memory layout will be row-major, but the element values at logical indices (b, k, n) might match the C++ reference&#x27;s logical indexing if we reinterpret the shapes correctly.
+        # Let&#x27;s try to map the C++ indexing to PyTorch logical shapes.
+        # A in C++: column-major, m rows, k*batch_count cols. The element at (row, col) is A[row + col*m].
+        # batch b corresponds to cols [b*k, b*k + k - 1].
+        # So A_b(row, col_in_batch) = A[row + (b*k + col_in_batch)*m].
+        # In PyTorch, if we have A_pt of shape [BATCH, M, K], element (b, row, col_in_batch) is at offset b*M*K + row*K + col_in_batch.
+        # These are different memory layouts.
+        # However, the C++ code computes: accum += alpha * A[batch_idx * batch_stride_A + k_idx * lda + m_idx] * B[batch_idx * batch_stride_B + n_idx * ldb + k_idx]
+        # where lda=m, ldb=k*batch_count, batch_stride_A=m*k, batch_stride_B=k.
+        # So A batch offset = batch_idx * m * k. A element = A[batch_idx*m*k + k_idx*m + m_idx].
+        # This is exactly the layout of a [BATCH, K, M] row-major tensor! Because offset = batch_idx*(K*M) + k_idx*M + m_idx.
+        # So A in C++ is actually equivalent to a PyTorch tensor of shape [BATCH, K, M]! Wait, in C++ they had `host_A[row_idx + col_idx * lda + b_idx * lda * k]`. Here col_idx is k_idx, row_idx is m_idx, lda=m. So offset = m_idx + k_idx*m + b_idx*m*k = b_idx*(m*k) + k_idx*m + m_idx. This is row-major for shape [BATCH, K, M].
+        # Let&#x27;s check: In the strided batched gemm, A is supposed to be column-major with lda=m. The batch_stride_A is m*k. So the batch is strided along the column dimension (K dimension). A is M x K per batch, column-major. In column-major, element (m, k) is at offset k*lda + m = k*m + m. For batch b, offset = b*batch_stride_A + k*m + m. That&#x27;s exactly the same as row-major [BATCH, K, M]. Because row-major [BATCH, K, M] has offset b*K*M + k*M + m. Yes! So A&#x27;s memory layout is identical to a PyTorch tensor of shape [BATCH, K, M].
+        # Similarly, B in C++: element `B[batch_idx * batch_stride_B + n_idx * ldb + k_idx]`. batch_stride_B=k, ldb=k*batch_count. Offset = batch_idx*k + n_idx*(k*batch_count) + k_idx.
+        # In PyTorch, a tensor of shape [N, BATCH, K] row-major has offset n*(BATCH*K) + batch_idx*K + k_idx. That&#x27;s not the same.
+        # What about shape [BATCH, N, K]? Offset = batch_idx*N*K + n*K + k_idx. Not same.
+        # What about shape [N, K*BATCH]? Offset = n*K*BATCH + batch_idx*K + k_idx. Yes! Because ldb = K*BATCH. So B is a column-major matrix of size ( ldb, n ) = (K*BATCH, N). In row-major, the transpose of that is (N, K*BATCH). So B is equivalent to a PyTorch tensor of shape [N, K*BATCH] or [N, BATCH, K]. Let&#x27;s check: [N, BATCH, K] row-major offset = n*(BATCH*K) + batch*K + k. This matches n*ldb + batch*k + k. Yes! So B corresponds to a PyTorch tensor of shape [N, BATCH, K] (or [N, BATCH, K]).
+        # Let&#x27;s check C: offset = batch_idx*batch_stride_C + n_idx*ldc + m_idx = batch_idx*(m*n) + n_idx*m + m_idx. This is row-major for shape [BATCH, N, M]. Because offset = batch*(N*M) + n*M + m. Yes! So C corresponds to PyTorch tensor of shape [BATCH, N, M].
+        # Therefore, the operation in PyTorch terms is:
+        # A: [BATCH, K, M] (note: M is last dim)
+        # B: [N, BATCH, K] (note: N is first dim)
+        # C: [BATCH, N, M] (note: batch first, then N, then M)
+        # The compute: C[b, n, m] = alpha * sum_k A[b, k, m] * B[n, b, k] + beta * C[b, n, m].
+        # Wait, B[n, b, k] is not a standard batched matrix multiply. This is like a transposed/strange batched GEMM.
+        # Actually, in standard bmm, A is [B, M, K], B is [B, K, N], C is [B, M, N] with C[b,m,n] = sum_k A[b,m,k] * B[b,k,n].
+        # But here A is stored as [B, K, M] (i.e., A transposed). B is stored as [N, B, K] (i.e., B transposed and batch/N swapped). C is stored as [B, N, M] (i.e., C transposed).
+        # Let&#x27;s see if there&#x27;s a simple view/transpose relationship.
+        # If we transpose A: A_t = A.permute(0, 2, 1) -&gt; [B, M, K].
+        # If we transpose B: B_t = B.permute(1, 2, 0) -&gt; [B, K, N].
+        # Then standard C_t = bmm(A_t, B_t) -&gt; [B, M, N].
+        # Our C is [B, N, M]. So C = C_t.permute(0, 2, 1)? That would be [B, N, M]. Yes!
+        # Let&#x27;s verify the math:
+        # C[b, n, m] = sum_k A_t[b, m, k] * B_t[b, k, n] = sum_k A[b, k, m] * B[n, b, k]. This matches the C++ indexing!
+        # Because A[b,k,m] is A[b, k_idx, m_idx] and B[n,b,k] is B[n_idx, batch_idx, k_idx].
+        # So indeed the C++ column-major strided batched GEMM can be implemented in PyTorch as:
+        # A_t = input.permute(0, 2, 1)   # [B, M, K]
+        # B_t = self.B.permute(1, 2, 0)   # [B, K, N]
+        # C_t = torch.baddbmm(self.C.permute(0, 2, 1), A_t, B_t, alpha=alpha, beta=beta) # [B, M, N]
+        # output = C_t.permute(0, 2, 1)   # [B, N, M]
+        # Wait, self.C needs to be stored as [B, N, M]. In `__init__`, C is initialized to 1.0f for all elements. So self.C = torch.ones(BATCH, N, M). But is that what the hidden reference does? Let&#x27;s check C++: C is of size [BATCH, N, M] equivalent (since count_C = batch_count * ldc * n = 17 * 520 * 219). And all ones. So yes.
+        # For B: the C++ B has shape [N, BATCH, K] equivalent. Let&#x27;s compute the B values using the formula and store them in that shape.
+        # B_cpp_offset = n_idx * ldb + batch_idx * k + k_idx. With ldb = K*BATCH.
+        # B_val = ((n + k*ldb + batch_count*k) - offset) % kRange.
+        # Let&#x27;s compute constant = N + K*ldb + BATCH*K = N + K*(K*BATCH) + BATCH*K = N + K^2*BATCH + BATCH*K.
+        # Wait ldb = k * batch_count. So K*ldb = K*(K*BATCH) = K^2*BATCH.
+        # So constant = N + K^2*BATCH + BATCH*K.
+        # For each (n_idx, batch_idx, k_idx), offset = n_idx*(K*BATCH) + batch_idx*K + k_idx.
+        # B_val = (constant - offset) % 8.
+        # But if the hidden reference is just a wrapper around the C++ test, it might create these exact values.
+        # Alternatively, the hidden reference might use `torch.baddbmm` with B of shape [BATCH, K, N] (standard) and C of shape [BATCH, M, N] (standard). But then the output would be [BATCH, M, N]. But the C++ code&#x27;s C is [BATCH, N, M] equivalent. Hmm.
+        # Wait, the I/O contract says `get_inputs` returns `[torch.randn(BATCH, M, K, dtype=torch.float32).cuda()]`.
+        # If the hidden reference does `torch.bmm(input, self.B)`, then self.B must be [BATCH, K, N]. Output is [BATCH, M, N].
+        # But the C++ output C is stored as [BATCH, N, M] equivalent. However, the hidden reference could just transpose everything internally.
+        # We need to be absolutely sure about the shapes. Let&#x27;s look at the C++ reference loop:
+        # for batch_idx: for n_idx: for m_idx:
+        #   accum = beta * C[batch_idx * batch_stride_C + n_idx * ldc + m_idx];
+        #   for k_idx: accum += alpha * A[batch_idx * batch_stride_A + k_idx * lda + m_idx] * B[batch_idx * batch_stride_B + n_idx * ldb + k_idx];
+        #   C[...] = accum;
+        # Here C is indexed as [batch, n, m]. A is indexed as [batch, k, m]. B is indexed as [batch?, n, k]? Let&#x27;s look at B index: `batch_idx * batch_stride_B + n_idx * ldb + k_idx`. Since batch_stride_B = k, and ldb = k*batch_count. So for a fixed batch_idx, the B slice is at offset batch_idx*k, but within that, moving n_idx adds ldb = k*batch_count. So the B elements for different batches are interleaved within each column! Specifically, for n_idx=0, B[batch_idx*k + k_idx] = B[0, batch_idx, k_idx] if shape is [N, BATCH, K]. For n_idx=1, B[k*batch_count + batch_idx*k + k_idx] = B[1, batch_idx, k_idx]. So B is indeed logically [N, BATCH, K]. 
+        # The operation is: output[batch, n, m] = beta * C[batch, n, m] + alpha * sum_k A[batch, k, m] * B[n, batch, k].
+        # This is not a standard bmm; it&#x27;s a batched matrix multiply with B transposed and swizzled.
+        # Let&#x27;s define A&#x27; = A.permute(0, 2, 1) = [B, M, K] (standard). B&#x27; = B.permute(1, 2, 0) = [B, K, N] (standard). Then C&#x27; = C.permute(0, 2, 1) = [B, M, N]. Then standard baddbmm computes:
+        # C&#x27;[b, m, n] = beta * C&#x27;[b, m, n] + alpha * sum_k A&#x27;[b, m, k] * B&#x27;[b, k, n]
+        # = beta * C[b, n, m] + alpha * sum_k A[b, k, m] * B[n, b, k].
+        # This matches! So the operation is equivalent to: 
+        # C_out = baddbmm(C.permute(0,2,1), A.permute(0,2,1), B.permute(1,2,0), alpha=alpha, beta=beta).permute(0,2,1)
+        # where A is input [B, M, K], B is stored as [N, B, K], C is stored as [B, N, M].
+        # This is crucial. If we get the shapes wrong, we fail.
+        # So we must initialize self.B as shape [N, BATCH, K] and self.C as shape [BATCH, N, M].
+        # Let&#x27;s verify B initialization formula for shape [N, BATCH, K]:
+        # For n in range(N): for b in range(BATCH): for k in range(K):
+        #   offset = n * (BATCH*K) + b * K + k
+        #   val = ((N + K*LDB + BATCH*K) - offset) % 8, where LDB = K*BATCH.
+        #   constant = N + K*(K*BATCH) + BATCH*K = N + K^2*BATCH + BATCH*K.
+        #   But the C++ code uses `ldb = k * batch_count`. So LDB = K*BATCH.
+        #   val = ((N + K*LDB + BATCH*K) - offset) % 8.
+        # Let&#x27;s compute for N=219, K=129, BATCH=17.
+        # LDB = 129*17 = 2193.
+        # constant = 219 + 129*2193 + 17*129 = 219 + 282,897 + 2,193 = 285,309.
+        # So val = (285309 - offset) % 8.
+        # Since offset can be up to 219*2193 + 16*129 + 128 = 480,567 + 2064 + 128 = 482,759. 285309 - offset can be negative. In C++, `%` with negative numbers yields negative remainder. But they cast to float. Wait!
+        # In C++: `((n + k * ldb + batch_count * k) - (row_idx + col_idx * ldb + b_idx * k)) % kRange`
+        # If the subtraction is negative, `% 8` in C++ yields a negative result (since numerator is negative). But then `static_cast&lt;float&gt;(negative % 8)` could be negative.
+        # For example, if offset = 300000, 285309 - 300000 = -14691. -14691 % 8 = -3 (since -14691 = -1837*8 + 5? Wait in C++11, integer division truncates toward zero. So -14691 / 8 = -1836 (since -1836*8 = -14688). Remainder = -14691 - (-14688) = -3. So -14691 % 8 = -3.
+        # But if the term `((n + k*ldb + batch_count*k) - offset)` is always positive? Let&#x27;s check max offset: max n_idx=N-1=218, max row_idx=K-1=128, max col_idx=n-1=218, max b_idx=16.
+        # B offset = b_idx*k + col_idx*ldb + row_idx. Max = 16*129 + 218*2193 + 128 = 2064 + 478,074 + 128 = 480,266. Wait earlier I used n_idx for col_idx and row_idx for k_idx. Max offset = 16*129 + 218*(129*17) + 128 = 2064 + 218*2193 + 128 = 2064 + 478,074 + 128 = 480,266.
+        # constant = n + k*ldb + batch_count*k = 219 + 129*2193 + 17*129 = 219 + 282,897 + 2,193 = 285,309.
+        # 285,309 - 480,266 = -194,957. So indeed many values are negative.
+        # So B values can be negative: e.g., -1, -2, ..., down to -7.
+        # Let&#x27;s verify with Python&#x27;s `%` behavior: In Python, `-3 % 8` = 5. So we must replicate C++ behavior exactly.
+        # C++ behavior for negative a and positive b: `a % b` has the sign of a. So we can compute: `r = a - (a // b) * b` where `//` is truncated division. In Python, `int(a / b)` truncates toward zero. Or we can do: `a % b` in Python gives non-negative. To get C++ behavior: `r = a % b; if r &lt; 0: r += b` is wrong. Actually Python&#x27;s `a % b` is always non-negative. C++&#x27;s `(a % b)` can be negative. So we need: `cpp_mod = lambda a, b: abs(a) % b * (1 if a &gt;= 0 else -1)`? No, that would give negative of abs remainder. For a=-14691, abs(-14691)%8 = 14691%8 = 3. With sign of a, -3. Yes, that&#x27;s correct for C++11. But wait, C++ standard says: `(a/b)*b + a%b == a`. Since `a/b` truncates toward zero. So for a=-14691, b=8: a/b = -1836 (truncated toward zero). Then a%b = a - (a/b)*b = -14691 - (-1836*8) = -14691 + 14688 = -3. So yes, sign follows dividend.
+        # So to compute: `val = (constant - offset) % 8` in C++ style in Python: `v = constant - offset; val = v - (v // 8) * 8` using integer division truncating toward zero. Or `int(v % 8)` in Python won&#x27;t work for negatives. Better: `val = v % 8` gives Python style (0..7). But we want C++ style. Wait, the C++ values are negative. Does it matter? The reference CPU also uses the same formula. So if we create B using Python&#x27;s `%`, we get different values (e.g., 5 instead of -3). Then the GEMM result will be completely different. So we absolutely need to match C++ initialization exactly.
+        # We can compute: `v = constant - offset; val = v - (v // 8) * 8` where `//` in Python is floor division. For negative v, we need truncation toward zero.
+        # `int(v / 8)` in Python truncates toward zero. So `val = v - int(v / 8) * 8`. Let&#x27;s test: v=-3, int(-3/8)=0, val=-3. v=-14691, int(-14691/8)=-1836, val=-14691 - (-1836*8) = -14691 + 14688 = -3. Good.
+        # Actually for v=-14691, int(v/8) = -1836 (since -1836.375 truncated toward zero is -1836). Correct.
+        # For v=3, int(3/8)=0, val=3. Good.
+        # So B_val = v - int(v/8)*8.
+        # We can just compute B using this logic in Python and store as float32.
+        # Similarly A initialization? No, A is an input from get_inputs(), it&#x27;s random. So we don&#x27;t need to initialize A. Wait, in the C++ test harness, A is also initialized deterministically, but `get_inputs()` returns random A. So our forward only receives random A. The hidden reference&#x27;s forward also receives the same random A.
+        # B and C are internal buffers. C is all ones. B is deterministic based on the formula. So we need to create them in __init__.
+        # Wait, but what if the hidden reference uses a different B? Could it be that the hidden reference wraps the C++ code exactly, including A initialization? But `get_inputs()` returns random A. In the hidden evaluation, they will call `get_inputs()` and pass that to `forward`. So A is random. The C++ test harness is just an example; the actual operator is a strided batched GEMM with internal B and C.
+        # But how do we know B and C? The only clue is the C++ test harness. In many similar challenge problems, the hidden reference replicates the exact test harness logic: it creates B and C using the same deterministic formulas, then runs the operation. So we should replicate that.
+        # However, there&#x27;s another possibility: The hidden reference might simply be `torch.baddbmm(self.C, input, self.B, alpha=self.alpha, beta=self.beta)` where `self.B` is a buffer of shape [BATCH, K, N] initialized from `torch.randn` with a fixed seed derived from init args? But there is no seed in init args.
+        # The deterministic formulas are the most logical.
+        # Let&#x27;s check the constant for B again: `((n + k * ldb + batch_count * k) - (row_idx + col_idx * ldb + b_idx * k)) % kRange`.
+        # `n` here is the loop bound `n=219`, not the index `n_idx`. It&#x27;s a constant. `k` is loop bound `k=129`. `ldb = k * batch_count`. `batch_count=17`. So constant = 219 + 129*(129*17) + 17*129 = 219 + 282,897 + 2,193 = 285,309. Yes.
+        # For A, if it were internal, the formula was `(row_idx + col_idx * lda + b_idx * lda * k) % kRange = offset % 8`. But A is input.
+        # For C, it was `1.f`. So self.C = torch.ones(BATCH, N, M) (in the shape [B, N, M]).
+        # So our __init__ should create self.B of shape [N, BATCH, K] with values computed as above, and self.C of shape [BATCH, N, M] with ones.
+        # Let&#x27;s verify: if self.B is [N, BATCH, K], then `self.B.permute(1, 2, 0)` is [BATCH, K, N], which matches standard BMM.
+        # self.C is [BATCH, N, M]; `self.C.permute(0, 2, 1)` is [BATCH, M, N].
+        # Then output = torch.baddbmm(self.C.permute(0,2,1), input.permute(0,2,1), self.B.permute(1,2,0), alpha=ALPHA, beta=BETA).permute(0,2,1).
+        # Output shape: [BATCH, N, M].
+        # Is that the output we need to produce? Yes.
+        # But if we write a custom kernel, we can fuse the transposes and compute directly on the logical shapes.
+        # However, since input A is [BATCH, M, K], it might be more efficient to just write a kernel that computes output[b,n,m] = beta*C[b,n,m] + alpha*sum_k A[b,m,k]*B[n,b,k].
+        # Actually we can do this directly without any transposes in memory by just mapping threads appropriately.
+        # Let&#x27;s think about writing a custom CUDA kernel.
+        # Given the small size, we can have each thread block handle one batch or one tile.
+        # Total output elements: BATCH * N * M = 17 * 219 * 520 = 1,936,  ... let&#x27;s compute: 219*520 = 113,880. *17 = 1,935,960. About 2M output elements.
+        # For FP16, each element is 2 bytes. A is 17*520*129 = 1,134,960 elements (~2.2MB). B is 219*17*129 = 480,267 elements (~0.9MB). C is 17*219*520 = 1,935,960 elements (~3.7MB). Total memory is small (~7MB). 7MB fits in L2 cache easily. So this is a cache-resident problem. Memory bandwidth is not the bottleneck; it&#x27;s latency and instruction throughput.
+        # Since total FLOPs are ~0.5 GFLOPs, even a naive kernel might take ~0.5 ms on H100? Actually H100 does 2 PFLOPS FP16, so 0.5 GFLOPs is tiny. The kernel will be overhead-bound. We need to launch enough threads to keep SMs busy and do the compute efficiently.
+        # But since it&#x27;s cache-resident, we can read A, B, C into shared memory or registers and compute.
+        # However, writing a high-performance tensor core kernel is complex. But maybe we can use CUTLASS 3.x as a header-only library included via load_inline? The instruction says &quot;not library routines that replace the whole kernel you were asked to port.&quot; CUTLASS is a library, but if we write the kernel using CUTLASS&#x27;s components (e.g., define a custom CUTLASS gemm kernel), is that allowed? The user says: &quot;Your ModelNew must use custom inlined CUDA operators (e.g. torch.utils.cpp_extension.load_inline), not library routines that replace the whole kernel you were asked to port.&quot; This likely means: don&#x27;t just call `torch.matmul` or `cublas` or `cutlass::gemm::device::GemmBatched`. Instead, write the kernel yourself. So I think we need custom CUDA.
+        # But writing a correct and fast custom batched GEMM for these sizes is doable. We can write a simple tiled kernel using shared memory. Since the sizes are small and fit in L2, we don&#x27;t need extreme tile sizes. We need to exploit H100&#x27;s features: larger shared memory (228KB per SM), more bandwidth, etc. We can also use `__half` and tensor cores? But for a custom kernel, using the `mma` instruction is tricky.
+        # Actually, for such small problem, we might get best performance by using a kernel where each thread computes one output element (or a small tile) and loops over K. We can load A and B into registers/shared memory. Since K=129 is small, we can keep a tile of A and B in shared memory.
+        # Let&#x27;s consider a simple approach: Each thread computes one output element (m, n) for a given batch. Then we need 2M threads. With block size 256, that&#x27;s ~7558 blocks. H100 has many SMs, so that&#x27;s enough. Each thread loops over K=129, reading A[b,m,k] and B[n,b,k]. Since B[n,b,k] has n as the first dimension, threads in a warp with varying n will access different memory locations, but if we group by n, we can coalesce.
+        # Better: each block processes a tile of M and N. E.g., blockDim = (32, 8, 1) =&gt; 256 threads. Tile M=64, N=16? Or M=32, N=8. Let&#x27;s pick a tile that matches well. M=520, N=219.
+        # We can tile M dimension with 64 or 128, N dimension with 32 or 64. Since the output is [BATCH, N, M], to coalesce writes, we should have threads in a warp write contiguous M elements. So the inner dimension should be M.
+        # Let&#x27;s define: each block handles a tile [M_tile, N_tile] for one batch. For example, M_tile=64, N_tile=8. Then we have 64*8=512 output elements per block. blockDim=(32,8,1) maybe 256 threads, each handles 2 elements? Or blockDim=(64,8,1)=512 threads.
+        # Within a block, threads can cooperatively load A and B into shared memory. Since K=129 is small, we can load a stripe of A: [M_tile, K] and B: [N_tile, K] or [K, N_tile]. Wait, B is logically [N, BATCH, K]. To compute output[m,n] = sum_k A[b,m,k] * B[n,b,k], for a tile of n, we need B[n, b, :] for n in tile. That&#x27;s contiguous in K dimension for fixed n,b. But moving n changes by stride K. So for B, we can load [K] for each n in the tile.
+        # Actually B is stored as [N, BATCH, K] (PyTorch tensor). So B[n, b, k] is at offset n*(BATCH*K) + b*K + k. For fixed b, varying n changes by stride BATCH*K. For fixed n, varying k is contiguous.
+        # A is [BATCH, M, K]. A[b,m,k] is at offset b*M*K + m*K + k. For fixed b, varying m changes by K, varying k is contiguous.
+        # C is [BATCH, N, M]. C[b,n,m] is at offset b*N*M + n*M + m. For fixed b,n, varying m is contiguous.
+        # So to compute a tile of output (n_start..n_end-1, m_start..m_end-1) for batch b:
+        # Each output row (fixed n) requires A tile [m_start..m_end-1, :] and B[n,b,:].
+        # A tile: for each m, K elements contiguous. So we can load A into shared memory as [M_tile][K]. B tile: for each n, K elements contiguous. So [N_tile][K].
+        # Since K=129, M_tile=64, N_tile=8, shared memory for A = 64*129*2 bytes = 16.5KB (fp16). For B = 8*129*2 = 2KB. Total ~18.5KB. Very small.
+        # We can also use FP32 accumulation.
+        # On H100, using FP16 with vectorized loads (float4 / half4) is good. We can load A in half4 (8 bytes = 4 elements). K=129 is not divisible by 4. But we can pad or handle tail.
+        # Actually, since sizes are small and fixed (M, N, K, BATCH are constants), we can use static shared memory sizes and compile-time loops for maximum efficiency.
+        # Wait, are M, N, K fixed? The init args pass BATCH, K, N, ALPHA, BETA. But M is not passed (it&#x27;s a global constant 520). Actually the I/O contract has M=520 as a constant. So yes, M, N, K, BATCH are all fixed constants. We can template them or just use them as compile-time constants in the kernel.
+        # This is great: because we can unroll loops and precisely size shared memory.
+        # Let&#x27;s compute: M=520, N=219, K=129, BATCH=17.
+        # For H100, we might want to use warpgroup MMA (wgmma) for FP16. But that requires copying data to shared memory in a specific swizzled layout. Writing raw wgmma PTX is very complex and error-prone. However, for 0.5 GFLOPs, a simple tiled kernel might be enough if the reference also uses something relatively simple (like the reference CPU loop in Python?). But the user says the source kernel was hand-tuned for A100 using CUTLASS. The hidden reference might be using PyTorch&#x27;s `baddbmm` which calls cuBLAS. cuBLAS for these sizes is highly optimized but might have some overhead for batch=17.
+        # Actually, PyTorch&#x27;s `baddbmm` for [17, 520, 129] x [17, 129, 219] is a standard batched GEMM. cuBLAS likely handles this well. Beating cuBLAS with a handwritten naive kernel for FP32 is close to impossible. But for FP16, maybe we can exploit tensor cores with a custom kernel that avoids some overhead. Or maybe the reference is not cuBLAS but a custom Python loop (slow). The challenge says &quot;producing numerically equivalent output faster than the reference.&quot; The reference is hidden; it&#x27;s likely the PyTorch equivalent of the C++ code: maybe it does a CPU-style loop or uses naive CUDA? Or maybe it&#x27;s the CUTLASS kernel from the source but compiled for A100 and we need to beat it on H100? The prompt says &quot;The source kernel was hand-tuned for A100... you must adapt it to run efficiently on H100.&quot; So the reference might be the same source kernel running on H100 (i.e., compiled generically). That would mean we need to write a kernel that is faster than the A100-tuned kernel on H100. Since the A100-tuned kernel might not be optimal for H100, we can use H100-specific features.
+        # Given the instruction &quot;not library routines that replace the whole kernel&quot;, I think the safest and most impressive approach is to write a custom CUDA kernel that uses:
+        # - FP16 compute (`half`)
+        # - Shared memory tiling
+        # - Vectorized loads (`half4` or `float2` for fp16)
+        # - Loop unrolling (since K is known at compile time? Not necessarily in the kernel, but we can make it a template parameter or just rely on compiler. Since it&#x27;s a constant 129, compiler may unroll if we use `pragma unroll`.
+        # - Perhaps use `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16` (Ampere/Hopper tensor core instructions). On H100, we can use the new wgmma, but mma.sync is still supported.
+        # But using mma.sync requires complex data movement to shared memory and registers in fragments. For a one-off kernel, it&#x27;s a lot.
+        # Let&#x27;s consider using CUTLASS 3.x through `torch.utils.cpp_extension.load_inline`. Can we include CUTLASS headers? CUTLASS is header-only. We could download or include it. But `load_inline` only compiles the provided source; we don&#x27;t have internet. However, PyTorch includes some CUTLASS headers? No, not necessarily.
+        # We could write a Triton kernel? Triton is not guaranteed to be available in the evaluation environment, and the prompt specifically mentions custom inlined CUDA operators.
+        # So we will write a raw CUDA kernel.
+        # Let&#x27;s design the kernel:
+        # Kernel signature:
+        # `__global__ void gemm_kernel(const half* A, const half* B, const half* C, half* out, float alpha, float beta)`
+        # A is [BATCH, M, K] (row-major) -&gt; logical shape.
+        # But we determined A memory layout matches [BATCH, K, M]? Actually no, we determined the C++ offset for A was `b*M*K + k*M + m`, which is exactly row-major [BATCH, K, M] if we think dimensions are [batch, k, m]. But `get_inputs()` returns [BATCH, M, K]. So A is row-major with shape [BATCH, M, K]. That means offset = b*M*K + m*K + k.
+        # Wait, we have a contradiction. Let&#x27;s recalculate carefully.
+        # In C++ test harness: `host_A[row_idx + col_idx * lda + b_idx * lda * k]`. Here lda=m=520. So offset = row_idx + col_idx*520 + b_idx*520*129.
+        # If row_idx is m (0..519), col_idx is k (0..128). So offset = m + k*520 + b*520*129.
+        # This is column-major for a matrix with dimensions (520, 129) per batch. In row-major with shape [BATCH, 520, 129], offset = b*520*129 + m*129 + k.
+        # These are different. But earlier we said the C++ reference loop computes `A[batch_idx * batch_stride_A + k_idx * lda + m_idx]` where batch_stride_A = lda*k = 520*129. So `offset = b*520*129 + k*520 + m`. This is column-major A_b (520 rows, 129 cols).
+        # Wait, but the input from `get_inputs()` is a PyTorch tensor of shape [BATCH, M, K] = [17, 520, 129]. If we use PyTorch&#x27;s standard layout, offset = b*520*129 + m*129 + k.
+        # So A from get_inputs() is NOT the same memory layout as C++ A. 
+        # However, the hidden reference is a PyTorch model. It will receive this A. It might reinterpret the layout. The C++ code was column-major. The hidden reference might compute the equivalent using PyTorch operations.
+        # Let&#x27;s figure out the math again. The reference operation is: for each batch, C_b = alpha * A_b * B_b + beta * C_b.
+        # In C++, A_b is MxK column-major. B_b is KxN column-major. C_b is MxN column-major.
+        # In PyTorch (row-major), the equivalent is: A_b^T is KxM row-major (i.e., A_py of shape [K, M]). B_b^T is NxK row-major (shape [N, K]). C_b^T is NxM row-major (shape [N, M]).
+        # The compute C_b = A_b @ B_b in column-major is mathematically equivalent to C_b^T = B_b^T @ A_b^T in row-major.
+        # Check: (A_b @ B_b)^T = B_b^T @ A_b^T. Since C_b = alpha * A_b @ B_b + beta * C_b, then C_b^T = alpha * (A_b @ B_b)^T + beta * C_b^T = alpha * B_b^T @ A_b^T + beta * C_b^T.
+        # So if we define A&#x27; = A_b^T (shape [K, M]), B&#x27; = B_b^T (shape [N, K]), C&#x27; = C_b^T (shape [N, M]), then C&#x27; = alpha * B&#x27; @ A&#x27; + beta * C&#x27;.
+        # In batched form: for each batch b, A&#x27; has shape [K, M], B&#x27; has shape [N, K], C&#x27; has shape [N, M]. Then output C&#x27; = alpha * B&#x27; @ A&#x27; + beta * C&#x27;.
+        # But A&#x27; for batch b is just the transpose of A_b. In PyTorch, if we are given A of shape [B, M, K] (row-major), then `A.transpose(1,2)` gives shape [B, K, M], which is exactly A&#x27; stacked: A&#x27;[b] = A[b].T.
+        # Similarly, if B is stored such that B_b is KxN column-major, then B_b^T is NxK row-major. B overall in C++ is [K*BATCH, N] column-major. Transposing gives [N, K*BATCH] row-major. Which can be reshaped to [N, BATCH, K] or viewed as B&#x27; stacked per batch? Actually B&#x27; for batch b is NxK. If we have a tensor B_pt of shape [BATCH, N, K], then B_pt[b] is NxK row-major = B_b^T. That&#x27;s exactly what we need.
+        # But earlier we saw C++ B indexing matches [N, BATCH, K] shape. Let&#x27;s verify: B_cpp offset for element in batch b, row k, col n is `n*ldb + b*k + k`. If we reshape this as [N, BATCH, K] row-major, offset = n*(BATCH*K) + b*K + k. This matches exactly! So B_cpp as a raw array is identical to a PyTorch tensor of shape [N, BATCH, K] (row-major).
+        # But B_b in C++ is the KxN column-major matrix for batch b. Let&#x27;s see if B_pt[n, b, k] corresponds to B_b^T[n, k] = B_b[k, n]. In C++, B_b[k, n] = B_cpp[n*ldb + b*k + k]. And B_pt[n, b, k] = value at index (n,b,k). Since B_pt is row-major [N, BATCH, K], offset = n*BATCH*K + b*K + k. This matches B_cpp offset. So B_pt[n,b,k] = B_b[k,n]. Thus B_pt is exactly the collection of B_b^T across batches, but organized with N as outermost.
+        # To compute C&#x27;_b = B&#x27;_b @ A&#x27;_b, where B&#x27;_b is [N, K] and A&#x27;_b is [K, M]. In batched standard PyTorch, we want tensors of shape [B, N, K] and [B, K, M]. Then bmm gives [B, N, M]. Our B_pt of shape [N, BATCH, K] can be permuted to [B, N, K] via `B_pt.permute(1, 0, 2)`. That&#x27;s exactly what we did earlier: `self.B.permute(1, 2, 0)`? Wait, if B is [N, BATCH, K], permute(1,0,2) gives [BATCH, N, K]. Then bmm with A&#x27; of shape [B, K, M] gives [B, N, M]. That&#x27;s C&#x27;.
+        # Indeed: C&#x27; = torch.bmm(B.permute(1,0,2), A.transpose(1,2)) -&gt; [B, N, K] @ [B, K, M] = [B, N, M]. Then C_b^T is [N, M]. Correct.
+        # So the operation in PyTorch is:
+        # A_t = input.transpose(1, 2)  # [B, K, M]
+        # B_t = self.B.permute(1, 0, 2) # [B, N, K] (since self.B is [N, B, K])
+        # C_t = self.C.transpose(1, 2) # [B, M, N]? Wait, self.C is [B, N, M] (C_b^T). Actually C&#x27; = C_b^T has shape [N, M]. If self.C is shape [B, N, M], then it&#x27;s already C&#x27; stacked. So we don&#x27;t need to transpose C. We need C&#x27; = alpha * B_t @ A_t + beta * C&#x27;. Output should be [B, N, M].
+        # Wait, let&#x27;s double-check C shape. In C++, C is MxN column-major per batch. C^T is NxM row-major. In the C++ reference loop, C is stored as `C[batch_idx * batch_stride_C + n_idx * ldc + m_idx]`. offset = b*m*n + n*m + m. This is row-major for shape [B, N, M]. So self.C should be shape [B, N, M]. It stores C&#x27; directly. Then output should be [B, N, M].
+        # So the operation is: output[b] = alpha * (B_t[b] @ A_t[b]) + beta * C[b], where B_t[b] is [N, K], A_t[b] is [K, M], C[b] is [N, M]. Output is [B, N, M].
+        # In PyTorch: `output = torch.baddbmm(self.C, B_t, A_t, alpha=alpha, beta=beta)`. Here `self.C` has shape [B, N, M]. `B_t` [B, N, K]. `A_t` [B, K, M].
+        # `torch.baddbmm(C, B, A)` computes `C + alpha * B @ A`. So this matches perfectly if we permute correctly.
+        # So:
+        # `A_t = input.transpose(1, 2)` -&gt; [B, K, M]
+        # `B_t = self.B.permute(1, 0, 2)` -&gt; [B, N, K]
+        # `out = torch.baddbmm(self.C, B_t, A_t, alpha=self.alpha, beta=self.beta)`
+        # This would compute [B, N, M].
+        # Is this the hidden reference? Very likely. It replicates the math with standard PyTorch ops.
+        # So our custom kernel should compute exactly this: Out[b,n,m] = beta*C[b,n,m] + alpha * sum_k (B_t[b,n,k] * A_t[b,k,m]).
+        # Where A_t[b,k,m] = input[b,m,k] (since A_t = input.transpose(1,2)).
+        # B_t[b,n,k] = self.B[n,b,k] (since B_t = self.B.permute(1,0,2)).
+        # So Out[b,n,m] = beta*C[b,n,m] + alpha * sum_k self.B[n,b,k] * input[b,m,k].
+        # This is the formula we need to implement in CUDA.
+        # Let&#x27;s define the pointers:
+        # A (input) shape [B, M, K], stride (M*K, K, 1).
+        # B (self.B) shape [N, B, K], stride (B*K, K, 1). (We can create it this way).
+        # C (self.C) shape [B, N, M], stride (N*M, M, 1).
+        # Output shape [B, N, M], stride (N*M, M, 1).
+        # Kernel computation for element (b, n, m):
+        # float acc = 0;
+        # for k in 0..K-1:
+        #   half a = A[b*M*K + m*K + k];
+        #   half b = B[n*B*K + b*K + k];
+        #   acc += float(a) * float(b);
+        # out[b*N*M + n*M + m] = beta * C[b*N*M + n*M + m] + alpha * acc.
+        # This is straightforward. Since M=520, N=219, B=17.
+        # To optimize for H100 and FP16:
+        # - Convert A, B, C to half precision in the kernel (cast at load).
+        # - Since A and B are half (or float) in memory, we can store them as `half` to halve memory traffic. But the input is float32. We can store self.B and self.C as half tensors. For input A, we can read float32 and convert to half.
+        # Actually the input is float32. To save memory bandwidth, we can load float32 and maybe use vectorized loads.
+        # But B and C are internal. We can initialize them as `torch.float16` to save memory and bandwidth.
+        # However, alpha and beta are float. So accumulation should be in float32 for better accuracy (though tolerance is 1e-2).
+        # The kernel should write output as float32 or float16? The reference likely outputs float32 (since input is float32). But the tolerance for fp16 is 1e-2. The user said optimized for FP16. So we can compute in FP16 and output FP16? But `get_inputs()` returns float32, and usually output should be same dtype as input. Let&#x27;s output float32 to be safe, but compute internally in FP16.
+        # Wait, &quot;kernels should be optimized for FP16 precision&quot;. This could mean the tensors should be half, but the input is float32. We can just cast input to half inside the kernel. The output might be float32 or half. Let&#x27;s make output float32 to avoid dtype mismatch with reference.
+        # Actually, if reference uses `torch.baddbmm` with float32 tensors, output is float32. If we do half internal, we might get slightly different result but within 1e-2? The tolerance for fp32 is 1e-4. If reference is fp32 and we compute in fp16, the error could be &gt; 1e-4. But the user said &quot;Note: The kernels should be optimized for FP16 (16-bit floating point) precision.&quot; This might mean the reference itself is using FP16. Let&#x27;s look: `get_inputs()` returns `torch.float32`. But maybe the hidden reference casts to half. Or maybe the trick is that on H100, FP16 is much faster, and they expect us to use FP16 compute, which changes tolerance to fp16&#x27;s 1e-2. The evaluation system chooses tolerance based on the dtype used? It says &quot;fp32 uses atol=rtol=1e-4; fp16/bf16 use atol=rtol=1e-2.&quot; If our output tensor is float32, does it use fp32 tolerance? Probably yes. Then computing in fp16 might cause errors &gt;1e-4. That&#x27;s risky.
+        # So perhaps we should keep high precision accumulation but use FP16 for inputs/weights to reduce bandwidth, and output FP32. Then the error relative to FP32 reference would be small (within 1e-4) because the GEMM is small and data range is limited (but B has values up to 7). Actually fp16 has about 3e-4 relative precision. Summing 129 terms could lead to ~0.04 absolute error. The tolerance 1e-4 is strict. If we compute in fp16 and output fp32, the error might exceed 1e-4.
+        # So maybe we should compute in FP32 but load data as FP16 converted to FP32. That gives the same accuracy as FP32 compute but saves bandwidth. Wait, converting FP16 to FP32 then doing FP32 multiply-add gives exact FP32 result (since FP16 is exactly representable in FP32). So if we store B and C as FP16, load as FP16-&gt;FP32, and compute in FP32, the result is identical to FP32 compute with the truncated values. Since reference B and C are exact integers (0..7), storing them as FP16 is exact. A is random float32 from `get_inputs()`. If we load A as FP32 (since input is FP32) and B as FP16-&gt;FP32, the product is exact (since B is integer and exactly representable). Sum of 129 products could have rounding, but same as FP32 reference using integer B.
+        # However, if the reference uses FP32 B and C (exact integers), our use of FP16 B and C is exact, so no difference.
+        # What about the input A? Input is float32. The reference uses float32 B. If our kernel loads A in float16 (truncated), we lose precision and might exceed 1e-4. So we should keep A as float32. But A is the input, so we can&#x27;t change it.
+        # So the plan: store self.B and self.C as `torch.float16` to save memory bandwidth (they are internal). Load them as `__half`, convert to `float` in the kernel. A is float32, load as `float` directly (or `float2` for vectorized). Compute accumulation in `float`. Write output as `float`.
+        # Total memory read: A (17*520*129*4 = 4.5MB), B (17*219*129*2 = 0.95MB), C (17*219*520*2 = 3.8MB). Total read ~9.3MB. Write output (17*219*520*4 = 7.6MB). Total memory traffic ~17MB. At 3.35 TB/s, theoretical minimum time is ~5 microseconds. But kernel overhead will be larger. Still, we can aim for under 50 microseconds.
+        # Let&#x27;s design the kernel.
+        # Using constant K=129, M=520, N=219, BATCH=17.
+        # We can tile N and M. Let&#x27;s define M_tile = 64, N_tile = 8? Or maybe M_tile=32, N_tile=32.
+        # Since output is [N, M] per batch, and M=520 is somewhat large, and N=219 is smaller.
+        # Let&#x27;s have each thread compute a small tile, e.g., 4x1 or 8x1. Or use warp-level tiling.
+        # Each block could be 16x16 threads, handling a 64x64 tile? But K=129, so shared memory for A tile 64*129*2 = 16KB, B tile 64*129*2 = 16KB, total 32KB. Comfortable.
+        # However, block size 256 threads, tile 64x64 means each thread handles 16 elements. Could do 2D thread layout.
+        # Let&#x27;s consider a simpler design: each thread computes one output element. BlockDim = (32, 8, 1) = 256 threads. GridDim = ceil(N/8) * ceil(M/64) * BATCH? Wait, if each block handles 32x8? Let&#x27;s say each block handles a tile of MxN: tileM=64, tileN=8. Then blockDim=(64,8,1)=512 threads. Each thread computes one (m,n). K loop is sequential. For each k, we need to load A[m,k] for all m and B[n,k] for all n. If threads in a block load cooperatively into shared memory, we can reduce global memory loads. But since K is small (129), for each tile we need to load A tile [64][129] and B tile [8][129] once, then compute. That means each block loads ~ (64+8)*129 values. Each value is used by 8 or 64 threads. This is efficient.
+        # Let&#x27;s do cooperative loading:
+        # Shared memory: `__shared__ half sA[TILE_M][K+PAD]; __shared__ half sB[TILE_N][K+PAD];` (but K=129, so maybe `sA[129][TILE_M]` to avoid bank conflicts? For H100, shared memory bank width is 4 bytes? Actually Ampere/Hopper have 32 banks of 4 bytes. For half (2 bytes), a 128-bit load covers 8 banks. But we can just use 1D arrays and let compiler handle.
+        # Actually we can load A and B transposed in shared memory to ensure coalesced access.
+        # Let&#x27;s think about global memory access patterns:
+        # A is [B, M, K]. For a fixed batch b and tile of m, A[b, m, k] is accessed. For varying m and fixed k, elements are separated by stride K (since A[b, m+1, k] is at offset +K). Not contiguous in m. Wait, A is row-major [B, M, K], so A[b, m, k] is at offset b*M*K + m*K + k. For fixed b,k, varying m gives stride K. So contiguous in k, strided by K in m. So to load A tile for a range of m and all k, it&#x27;s best to load by k as the inner dimension: for each m in tile, load k sequentially (contiguous). Since K=129 is small, each thread can load a slice.
+        # B is [N, B, K]. B[n, b, k] is at offset n*B*K + b*K + k. For fixed n,b, varying k is contiguous.
+        # So for a tile of N (n range), B[n,b,k] for varying n has stride B*K. B*K = 17*129 = 2193. So not contiguous in n.
+        # In the kernel, we fix batch b per block or per group of blocks.
+        # Since BATCH=17 is small, we can have each block handle one batch and a tile of (M,N).
+        # Total tiles: N_tiles = ceil(219 / N_tile), M_tiles = ceil(520 / M_tile). With N_tile=8, M_tile=64, N_tiles=28 (28*8=224), M_tiles=9 (9*64=576 &gt; 520). Total tiles per batch = 252. Total blocks = 252*17 = 4284. With H100 having ~144 SMs, this provides enough parallelism (4284 blocks). Block size 512 -&gt; about 2M threads launched.
+        # Inside each block, we need to load A slice [tileM_start:tileM_end, :] for batch b. That&#x27;s contiguous in K per M. We can have threads load A into shared memory. For 512 threads and 64*129=8256 half elements, each thread loads ~16 halfs. Fine.
+        # Similarly B slice [:, b, :] for n in tile: N_tile*K = 8*129 = 1032 half elements. Each thread loads ~2 halfs.
+        # Then we compute: For each m in tileM and n in tileN, accumulate sum_k sA[m_loc][k] * sB[n_loc][k]. But careful: sA should store A[b,m,k] (m dimension fast or k dimension fast?). We want to avoid bank conflicts when threads access sA for same k but different m. If sA is [K][TILE_M], then threads reading same k but different m will access consecutive m, which are in consecutive shared memory locations. In shared memory banks (4 bytes per bank), half2 (4 bytes) would be bank-conflict-free for consecutive threads if each reads a half2. But reading half (2 bytes) with stride 1 might have 2-way bank conflict? Actually bank index = (addr / 2) % 32 for half? Wait, bank width is 4 bytes for compute capability &gt;= 3.0? Actually compute capability 9.0 (Hopper) has 32 banks of 4 bytes. So successive 4-byte words map to successive banks. If each thread reads a half (2 bytes), then two threads accessing consecutive halfs will fall into the same bank (since each bank is 4 bytes). So there will be 2-way bank conflicts for simple half loads. But if we load as half2 (4 bytes), then consecutive threads have no bank conflicts. So we should use half2 or float for shared memory. Since we are doing FP16 memory but FP32 compute, we can store shared memory as half2 and unpack.
+        # However, K=129 is odd, so half2 loads would need to handle odd size.
+        # Alternatively, we can keep A and B in shared memory as `float` (converted from half) to avoid bank conflicts (4 bytes per element). But then shared memory size doubles: A tile 64*129*4 = 33KB. B tile 8*129*4 = 4KB. Total 37KB. Still under 227KB limit. But we lose the bandwidth benefit of loading half from global memory. Actually we load half from global memory and convert to float in registers, then store float in shared memory. That&#x27;s fine.
+        # Wait, A is float32 global memory, B is half global memory. So sA can be float, sB can be float. Bank conflict-free for float accesses.
+        # Let&#x27;s use `float` shared memory for both. Then each thread loads from global memory and writes to shared memory.
+        # Actually, if A is float32, we can just load A directly into sA (float). For B (half), load half, convert to float, store in sB.
+        # But we can also avoid shared memory for B entirely. Since B tile is only 8*129 = 1032 floats = 4KB, and each thread needs all K values for a given n. If each thread loads its own B values into registers and reuses them across m, we might not need shared memory for B. Similarly A tile is 64*129 = 8256 floats = 33KB. We can keep A in shared memory, and B in registers. Let&#x27;s explore.
+        # Suppose each block handles N_tile=8, M_tile=64. There are 512 threads. We can assign each thread to one (m,n) pair? 64*8=512. Perfect.
+        # Each thread computes `acc = 0; for k in 0..128: acc += A[b,m,k] * B[n,b,k]`.
+        # Threads with same m but different n share A[b,m,:] across the K dimension. So caching A in shared memory helps: load A[b, tileM_start + tid_m, : ] into sA[tid_m][k]. Then each thread reads sA for its m.
+        # Threads with same n share B[n,b,:]. So we could also cache B in shared memory, or each thread can load its own B into registers. Since N_tile is only 8, there are 64 threads sharing the same n (for different m). So we can have each warp (or thread group) load B[n,b,:] into shared memory or broadcast registers.
+        # Simpler: Use shared memory for both A and B.
+        # Layout: `__shared__ float sA[TILE_M][K]; __shared__ float sB[TILE_N][K];`
+        # Phase 1: Load sA. Threads iterate over m and k. Each thread loads a few elements. E.g., threadIdx.x = tx, threadIdx.y = ty. Total threads = TM*TN? Let&#x27;s set blockDim = (TM, TN). But TM*TN should be &lt;= 1024. Let&#x27;s pick TM=32, TN=16 -&gt; 512 threads. But tile is 64x8. We can have each thread load multiple elements.
+        # Actually we can set blockDim = (128, 1, 1). But then mapping to 2D tile is less direct.
+        # Let&#x27;s set blockDim = (TILE_M, TILE_N) = (64, 8) = 512 threads. Then:
+        # thread (tm, tn) handles output (m_start + tm, n_start + tn).
+        # Loading A: each thread (tm, tn) can load A elements for a subset of k. Since K=129, each thread could load `K / (TILE_M*TILE_N)`? 129/512 &lt; 1, so not enough. Better to have all threads cooperate.
+        # Since sA has size TILE_M*K = 64*129 = 8256 floats. With 512 threads, each thread loads 16 floats (8 float2 loads) from A. The mapping: thread linear id = tm + tn*TILE_M. We can assign it to load a chunk of sA. For example, `int tid = threadIdx.x + threadIdx.y * blockDim.x;`. But we need to ensure A global loads are coalesced.
+        # A global: `&amp;A[b*M*K + (m_start + row)*K + k]`. For fixed row, consecutive k are contiguous. So to coalesce, threads should load consecutive k for the same row, or consecutive rows. But since threads are in 2D grid (tm, tn), linearizing as `tid = tm + tn*64` means consecutive tids correspond to consecutive tm (same tn). So threads (0,tn), (1,tn), (2,tn)... have tids 0..63. For coalesced load, we want consecutive threads to access consecutive memory. If we load A column-wise (k dimension), for a fixed row m_start + some row, threads should load consecutive k.
+        # Let&#x27;s restructure: load A into sA row-major: sA[row][k] = A[b, m_start+row, k]. We can have threads load float2 or float4 from A. For float4 (4 floats = 16 bytes), warp reads 128 bytes per instruction, fully coalesced.
+        # Since K=129 is not divisible by 4, we can pad to 132 or handle remainder. With static K, compiler might handle loops.
+        # Simpler: tile K dimension as well. K=129, we can process it in chunks of e.g., 32 or 64. Since K is small, we can load the whole K for the tile. But if we want to use shared memory efficiently, maybe tile K into 32 chunks? No, K is only 129, loading all at once is fine.
+        # Actually, since K is small, we can load A and B entirely into shared memory per tile, and then unroll the k-loop to let the compiler optimize.
+        # Let&#x27;s do this:
+        # Block size: 256 threads (16x16).
+        # Tile sizes: M_tile=64, N_tile=32? Then each block handles 64*32=2048 outputs, with 256 threads =&gt; each thread handles 8 outputs. This might be too many registers. But we can compute 8 accumulators per thread.
+        # Alternatively, block size 128 (16x8), tile M=64, N=16. 1024 outputs / 128 threads = 8 outputs per thread.
+        # Actually given the small K, doing a large tile is fine.
+        # Let&#x27;s step back. The total work is small. A kernel with each thread doing a 1x1 output with a loop over K might be fast enough if we have enough parallelism.
+        # If each thread computes 1 output, total threads = 17*219*520 = 1,935,960. With blocksize 256, grid = 7566 blocks. H100 can run many concurrently. Each thread does 129 multiply-adds. Very light. Memory: each thread reads A (129 floats) and B (129 halfs) and C (1 float). Total memory per thread: ~1KB. With 1.9M threads, total reads ~2GB, but cached. Since L2 is large (~50MB), A and B for each batch might stay in L2. But each thread reads its own A and B slices, so there will be redundancy: A for same m but different n is read multiple times. Without shared memory, each thread reads A[b,m,:] and B[n,b,:] redundantly across the N and M dimensions. Total global reads = B*N*M*K*2 = 17*219*520*129*2 * 4 bytes (for A) and 2 bytes (for B). That&#x27;s a lot of L2 traffic but might still fit in L2 bandwidth.
+        # However, to be fast, we should use shared memory to load A and B once per tile.
+        # Let&#x27;s use a design inspired by CUDA GEMM tutorials but simplified for these small dimensions.
+        # Kernel config:
+        # - TILE_M = 64
+        # - TILE_N = 16
+        # - TILE_K = 129 (full K, since it&#x27;s small)
+        # - blockDim = (16, 16, 1) =&gt; 256 threads.
+        # Each block handles 64x16 output tile. It loads A_tile [64][129] and B_tile [16][129] into shared memory.
+        # Loading A:
+        #   sA is 64 x 129 floats. We can partition the load among 256 threads. Each thread loads `ceil(64*129 / 256) = 33` floats. That&#x27;s a lot but okay.
+        #   Actually 64*129 = 8256. 8256/256 = 32.25. So some threads load 33.
+        #   To coalesce: thread linear id `tid = threadIdx.x + threadIdx.y*blockDim.x`. We map tid to `idx` in [0, 8255]. Then `row = idx / 129`, `col = idx % 129`. Then load `A[b*M*K + (m_start+row)*K + col]`. Since consecutive tids load consecutive `idx`, they load consecutive col for same row, then next row. This is coalesced (consecutive threads access consecutive memory) because for a given row, col increases by 1, so address increases by 4 bytes. Consecutive threads accessing consecutive 4-byte words: fully coalesced. Perfect.
+        # Loading B:
+        #   sB is 16 x 129 halfs (or floats). Size = 2064. 2064/256 = 8.06. Each thread loads ~8 elements.
+        #   Map tid to `idx` in [0, 2063]. `row = idx / 129`, `col = idx % 129`. Load `B[n_start+row, b, col]`. Offset = (n_start+row)*B*K + b*K + col. Consecutive `row` (i.e., consecutive n) have stride B*K = 2193. So consecutive threads might access memory with stride 2193 if they map to consecutive row. That is not coalesced!
+        #   To coalesce B loads, we want consecutive threads to access consecutive memory. B memory layout for fixed b and varying n, fixed k: offset = n*B*K + b*K + k. For fixed k, consecutive n have stride B*K = 2193 elements = 4386 bytes. That&#x27;s not contiguous. So loads across n are strided.
+        #   But for fixed n, varying k is contiguous. So to coalesce, we should have consecutive threads access consecutive k for the same n. That means within a warp, threads should have same n but different k. But our tid mapping to idx gave row = idx / 129, col = idx % 129. Consecutive idx = 0,1 correspond to (row=0,col=0) and (row=0,col=1): same n, consecutive k. That&#x27;s contiguous. Then idx=128 is (0,128), idx=129 is (1,0). So when crossing n boundary, there&#x27;s a big stride. But consecutive threads within a warp (e.g., tids 0..31) will cover cols 0..31 for n=0. This is fully coalesced! Great. Then next warp (tids 32..63) covers cols 32..63 for n=0, etc. So as long as we load in column-major order within the B tile (k dimension first), it&#x27;s coalesced. Good.
+        # So loading B as `idx` linear is fine: for each n, we load all k contiguously. Each group of 129 consecutive tids covers one n. But tids are sequential, so memory access is sequential for k, and jumps by stride B*K between groups. Since a warp covers 32 tids, and 32 &lt; 129, a warp stays within the same n, accessing contiguous k. So fully coalesced. Excellent.
+        # So we can load both A and B by linearizing the tile and mapping tid-&gt;idx.
+        # After loading into shared memory, we need to compute.
+        # We have 256 threads and an output tile of 64x16 = 1024 elements. Each thread handles 4 elements. We can distribute the 64x16 elements across the 16x16 threads in a block.
+        # Mapping: thread (tx, ty) handles outputs at (m = ty*4 + ..., n = tx*...?). Let&#x27;s think.
+        # We can have each thread handle a sub-tile of size (M_thread, N_thread) = (4, 1) or (2, 2) etc. Since 1024/256 = 4.
+        # Let&#x27;s have each thread handle a 4x1 column: for a given n_offset = threadIdx.x (0..15) and m_offset = threadIdx.y * 4 (0..60). Then each thread handles (m_start + m_offset + i, n_start + n_offset) for i=0..3.
+        # Actually blockDim=(16,16). threadIdx.x in [0,15] -&gt; n. threadIdx.y in [0,15] -&gt; m group of 4.
+        # Elements per thread: 4. So we can have accumulator array `float acc[4];`.
+        # Loop over k=0..128:
+        #   float a0 = sA[threadIdx.y*4 + 0][k];
+        #   float a1 = sA[threadIdx.y*4 + 1][k];
+        #   float a2 = sA[threadIdx.y*4 + 2][k];
+        #   float a3 = sA[threadIdx.y*4 + 3][k];
+        #   float b = sB[threadIdx.x][k];
+        #   acc0 += a0 * b; ... etc.
+        # This requires reading sB[threadIdx.x][k] which has stride 129 in k. With 16 threads in x dimension, each reading a different n but same k. Since sB is stored as row-major [16][129], consecutive threads (different n, same k) access consecutive rows? Wait, `sB[n][k]` where n=threadIdx.x. `&amp;sB[n][k] = sB + n*129 + k`. So for fixed k, consecutive n have addresses +129 apart. 129 floats = 516 bytes. Bank width is 4 bytes. Bank index = (addr / 4) % 32. For n=0, addr offset = k*4. Bank = (k) % 32. For n=1, addr offset = 129*4 + k*4 = (129+k)*4. Bank = (129+k) % 32 = (1+k) % 32. So consecutive n have banks shifted by 1. That means 32 consecutive threads reading sB[n][k] for n=0..31 would each hit a different bank! No bank conflicts! Wait, 129 is odd. For half, bank width is 4 bytes, so address diff between n and n+1 is 129*2 = 258 bytes = 64.5 * 4 bytes. For float, diff is 129*4 = 516 bytes = 16.125 * 4 bytes. Bank increment = 16 (mod 32). So 32 threads reading n=0..31 for same k: banks are (base + n*16) % 32. Since 16 and 32 are not coprime (gcd=16), this will have 2-way bank conflicts: threads 0 and 16 share bank, 1 and 17, etc. Because 16 mod 32 has period 2. Actually bank = (base/4 + n*129) % 32. Since 129 % 32 = 1. Wait, 129 = 4*32 + 1. So n*129 mod 32 = n*1 mod 32 = n mod 32! Oh! 129 mod 32 = 1. So bank index = (k + n) % 32 for float.
+        # Let&#x27;s recompute: base address of sB[n][k] = base + n*K*4 + k*4. Divide by 4: offset = n*K + k. Bank = offset % 32 = (n*K + k) % 32. Since K=129, K % 32 = 1. So bank = (n*1 + k) % 32 = (n + k) % 32. For 32 threads with n=0..31 and same k, banks are k, k+1, ..., k+31 mod 32. That&#x27;s all different! No bank conflicts! Amazing.
+        # Wait, I mistakenly used 129*4 earlier. The stride in elements is K=129. The bank index depends on element offset modulo 32 (since 32 banks). offset = n*K + k. K mod 32 = 129 mod 32 = 1. So offset mod 32 = (n + k) mod 32. Perfect. So for float shared memory, no bank conflicts when threads read same k and consecutive n. Great.
+        # For sA: address of sA[m][k] = base + m*K*4 + k*4. offset = m*K + k. bank = (m*K + k) % 32 = (m + k) % 32. For threads reading sA with m = threadIdx.y*4 + i. Within a warp, threads have same threadIdx.x (n) but different threadIdx.y. If blockDim.x=16, then threads with same threadIdx.x but threadIdx.y differing by 1 are in the same warp? Actually warps are arranged in x-major order. So thread (tx=0, ty=0) is lane 0; (tx=1, ty=0) is lane 1; ... (tx=15, ty=0) is lane 15; (tx=0, ty=1) is lane 16; etc. So within a warp, threadIdx.x varies 0..15 and threadIdx.y is fixed for lanes 0..15? Wait, blockDim.x=16. So lane = tx + ty*16. For a warp of 32 threads, it can contain two rows of ty. For example, warp 0: ty=0, tx=0..15 (lanes 0..15) and ty=1, tx=0..15 (lanes 16..31). So within a warp, m = ty*4 + i could be different for the two halves.
+        # Let&#x27;s define blockDim=(16,16). threadIdx.x in [0,15] (n), threadIdx.y in [0,15] (m_group). Each thread handles 4 m values: m_base = threadIdx.y * 4, m0..m3. For a warp, half the threads have ty=0 (m_base=0) and half have ty=1 (m_base=4). When reading sA[m][k], threads in a warp read m values 0..3 and 4..7 (for i=0..3). For same k, banks are (m + k) % 32. This will have no bank conflicts as long as m values are distinct modulo 32. Since m values are 0..7, they are distinct. For other warps (ty=2..15), m_base = 8,12,...,60. Still within 0..63, all distinct. So no bank conflicts for sA either.
+        # Therefore, loading from shared memory in this pattern is bank-conflict-free. Excellent.
+        # So the kernel design:
+        # Constants: B=17, M=520, N=219, K=129.
+        # TILE_M = 64, TILE_N = 16.
+        # blockDim = (TILE_N, TILE_M/4) = (16, 16). That is 256 threads.
+        # Each thread handles 4 M values and 1 N value.
+        # Grid:
+        #   batch = blockIdx.z (0..B-1)
+        #   n_tile = blockIdx.y (0..ceil(N/TILE_N)-1 = ceil(219/16) = 14)
+        #   m_tile = blockIdx.x (0..ceil(M/TILE_M)-1 = ceil(520/64) = 9)
+        # Total blocks = 9 * 14 * 17 = 2142. With block size 256, total threads = 2142*256 = 548,352. Each thread does 4*129 = 512 MADs. Total FLOPs = 548,352 * 512 * 2 ≈ 561M? Wait, actual FLOPs should be 0.5G. Let&#x27;s see: each block computes up to 64*16 outputs. For interior blocks, 1024 outputs * 129*2 FLOPs = 264,192 FLOPs per block. 2142 blocks -&gt; ~566M FLOPs. But actual problem size is 17*219*520*129*2 ≈ 500M. The extra is from padding (last tiles). So okay.
+        # Wait, total threads is less than total outputs (1.9M). Each thread computes 4 outputs. 548k threads * 4 = 2.19M &gt; 1.93M. Fine.
+        # Shared memory:
+        #   float sA[TILE_M][K];  // 64*129*4 = 33,024 bytes
+        #   float sB[TILE_N][K];  // 16*129*4 = 8,256 bytes
+        #   Total ~41.3KB. Well within limits.
+        # We can also add a small padding to avoid any potential conflicts, but not needed.
+        # Loading A:
+        #   float* gA = A + batch * M * K + m_tile * TILE_M * K;
+        #   int tid = threadIdx.x + threadIdx.y * blockDim.x; // 0..255
+        #   int total_A = TILE_M * K; // 8256
+        #   for (int i = tid; i &lt; total_A; i += blockDim.x * blockDim.y) {
+        #       int row = i / K;
+        #       int col = i % K;
+        #       sA[row][col] = gA[row * K + col];
+        #   }
+        # But wait, for the last m_tile, m_tile*TILE_M may exceed M. M=520, TILE_M=64, m_tile ranges 0..8. 8*64=512. Last tile has rows 512..575, but M=520, so only rows 512..519 are valid (8 rows). We need bounds checking.
+        # For A, row ranges 0..TILE_M-1, but actual rows = min(TILE_M, M - m_tile*TILE_M). The extra rows shouldn&#x27;t be loaded (or should be zero). Similarly for B: n ranges 0..TILE_N-1, actual = min(TILE_N, N - n_tile*TILE_N).
+        # So in loading loops, we check bounds. Since the tile is mostly full except edges, we can handle with conditionals.
+        # For A:
+        #   int m_end = min(TILE_M, M - m_tile * TILE_M);
+        #   for i in range(tid, total_A, threads):
+        #       int row = i / K; int col = i % K;
+        #       if (row &lt; m_end) sA[row][col] = A[...]; else sA[row][col] = 0;
+        # For B:
+        #   int n_end = min(TILE_N, N - n_tile * TILE_N);
+        #   float* gB = B + (n_tile * TILE_N) * B * K + batch * K; // Wait B shape is [N, B, K].
+        #   B offset for n, b, k: n*(B*K) + b*K + k.
+        #   For tile n_start = n_tile*TILE_N, row = 0..TILE_N-1 corresponds to n = n_start + row.
+        #   gB_local = B + (n_start + row) * (B*K) + batch * K + col.
+        #   if (row &lt; n_end) load; else 0.
+        # Then __syncthreads().
+        # Compute:
+        #   int m_local_end = min(4, M - (m_tile*TILE_M + threadIdx.y*4));
+        #   Actually if we just compute and store with bounds check later, it&#x27;s fine. We can compute all 4 but only write valid ones.
+        #   float acc0=0, acc1=0, acc2=0, acc3=0;
+        #   for (int k=0; k&lt;K; ++k) {
+        #       float b = sB[threadIdx.x][k];
+        #       float a0 = sA[threadIdx.y*4 + 0][k];
+        #       float a1 = sA[threadIdx.y*4 + 1][k];
+        #       float a2 = sA[threadIdx.y*4 + 2][k];
+        #       float a3 = sA[threadIdx.y*4 + 3][k];
+        #       acc0 += a0 * b; ... 
+        #   }
+        #   Then write to output.
+        # Output address: Out[batch * N * M + (n_tile*TILE_N + threadIdx.x) * M + (m_tile*TILE_M + threadIdx.y*4 + i)].
+        # C address: same pattern.
+        # We need alpha and beta as float.
+        # out_val = beta * C_val + alpha * acc.
+        # Since the output tile might be partially out of bounds, check m and n before writing.
+        # This is a solid design.
+        # Can we vectorize loads? For A: loading float4 would help. Since K=129 is not divisible by 4, it&#x27;s a bit annoying but doable with a loop of float4 and a tail. But since each thread loads only ~32 floats, scalar loads are fine. However, we can optimize by loading float2 or float4 where possible.
+        # Let&#x27;s do vectorized loads for the main loop to ensure coalescing. For A: for a given row, K=129 floats. We can process in float4 chunks: 129/4 = 32 remainder 1. So 32 float4 loads and 1 float load per row. Since threads are assigned linearly, consecutive threads handle consecutive elements, so they can form vectorized loads? Not automatically with the linear mapping unless consecutive threads cover consecutive float4s. For example, thread 0 handles idx 0..3 (float4), thread 1 handles idx 4..7? No, our mapping is one element per thread.
+        # We can change mapping: each thread handles 4 consecutive elements (float4). `int i = tid; int row = i / (K/4); ...` But this complicates the loop.
+        # Given the small size and L2 cache, scalar loads might be sufficient. Let&#x27;s aim for correctness first, then maybe add `float4` if needed.
+        # Actually, since we only have 1 turn and 1 submit, we must get it right. Let&#x27;s stick to a simple but correct kernel.
+        #
+        # Wait, I just realized: H100 has a lot of shared memory (228KB). We can increase tile sizes to reduce block count? Block count = 2142 is fine. But we can also increase TILE_N to 32 to cover N=219 with 7 tiles (7*32=224). Then M_tiles = ceil(520/64)=9. Total blocks = 9*7*17 = 1071. Still okay.
+        # With TILE_N=32, sB = 32*129*4 = 16.5KB. sA = 33KB. Total ~50KB. blockDim = (32, 16) = 512 threads. Each thread handles 4 M and 1 N. Total outputs per block = 64*32=2048. Threads=512 =&gt; each thread 4 outputs. Fine. Total threads = 1071*512 = 548k. Same number of threads. But fewer blocks. Might be slightly better occupancy? H100 can handle many blocks anyway.
+        # Let&#x27;s try TILE_M=64, TILE_N=32, blockDim=(32,16). This might be good.
+        # However, N=219, so last tile has 27 elements. With TILE_N=32, wasted compute 5/32. Not huge.
+        # Let&#x27;s also think about register usage. Each thread has 4 accumulators (float). That&#x27;s 4 regs. Plus loop variables, plus a few for shared memory indexing. Total maybe 20-30 registers. Very low. Occupancy will be max.
+        # Let&#x27;s write the kernel in C++.
+        #
+        ## Using FP16 memory for B and C
+        # We should store self.B and self.C as `torch::kFloat16` to save memory bandwidth. But the output should be `torch::kFloat32` to match reference? The reference likely outputs float32. But if we cast output to float32, that&#x27;s fine.
+        # In the kernel:
+        # A is `const float* A` (input).
+        # B is `const half* B` (internal buffer).
+        # C is `const half* C` (internal buffer).
+        # out is `float* out`.
+        # When loading B and C, convert: `float b = __half2float(B[idx]);` `float c = __half2float(C[idx]);`
+        # This uses the `__half` type. Need to include `&lt;cuda_fp16.h&gt;`.
+        # For best performance on H100, maybe we can use `__nv_bfloat16`? But user says FP16.
+        # So `half` it is.
+        #
+        # Let&#x27;s write the full code for `ModelNew`.
+        #
+        # We need to handle the initialization of B and C exactly as in C++.
+        # In Python:
+        # self.B = torch.empty(N, BATCH, K, dtype=torch.float16, device=&#x27;cuda&#x27;)
+        # constant = N + K * (K * BATCH) + BATCH * K  # Note: ldb = K * BATCH
+        # for n in range(N):
+        #   for b in range(BATCH):
+        #     for k in range(K):
+        #       offset = n * (BATCH * K) + b * K + k
+        #       v = constant - offset
+        #       val = v - int(v / 8) * 8  # C++ style modulo
+        #       self.B[n,b,k] = float(val)
+        # self.C = torch.ones(BATCH, N, M, dtype=torch.float16, device=&#x27;cuda&#x27;)
+        # Wait, but in PyTorch, we can just vectorize this with integer arithmetic on a CPU tensor and then .cuda().half().
+        # Let&#x27;s do it efficiently:
+        # offsets = torch.arange(N * BATCH * K)
+        # Actually `self.B` shape [N, BATCH, K]. Flatten: `val = constant - torch.arange(N*BATCH*K)`.
+        # Then `val_cpp = val - (val // 8) * 8`? In Python, `//` is floor division. For negative v, `v//8` is floor (more negative than truncate). We need truncate toward zero. So `val_cpp = val - torch.trunc(val / 8).long() * 8`. Wait val is integer. `torch.div(val, 8, rounding_mode=&#x27;trunc&#x27;)` gives C++ style integer division. But for integers, we can do: `val % 8` is Python style (0..7). For C++ style with sign of dividend: `val - (val // 8) * 8` with floor division doesn&#x27;t match. Example: v=-3. v//8 = -1 (floor), (-3) - (-1)*8 = 5. That&#x27;s Python mod. Truncate: int(-3/8) = 0, (-3) - 0 = -3. That&#x27;s C++ mod.
+        # So `cpp_mod = lambda t, m: t - torch.div(t, m, rounding_mode=&#x27;trunc&#x27;) * m`.
+        # Then `self.B = cpp_mod(constant - torch.arange(N*BATCH*K), 8).view(N, BATCH, K).half().cuda()`.
+        # But wait, `torch.arange` returns long/int. `constant` is int. This will be exact.
+        # Let&#x27;s verify with C++: `((n + k * ldb + batch_count * k) - offset) % kRange`.
+        # `n + k*ldb + batch_count*k` is int. `offset` is int. So it&#x27;s int arithmetic.
+        # `constant = N + K * (K * BATCH) + BATCH * K`. In C++: `n=219`, `k=129`, `ldb=k*batch_count=2193`. `k*ldb = 129*2193 = 282897`. `batch_count*k = 17*129 = 2193`. Sum = 219 + 282897 + 2193 = 285309. Yes.
+        # Offsets: For shape [N, BATCH, K], row-major flatten: offset = n*(BATCH*K) + b*K + k. Max offset = 218*2193 + 16*129 + 128 = 478074 + 2064 + 128 = 480266.
+        # So val ranges from 285309 down to -194957.
+        # Let&#x27;s compute for offset=0: val=285309. C++ mod: 285309 % 8 = 5 (since 285309 = 35663*8 + 5). Python: 285309 % 8 = 5. So same for positive.
+        # For offset=285310: val=-1. C++: -1 % 8 = -1. Python: 7.
+        # We need C++ style. Use `trunc_div`.
+        # `B_vals = torch.empty(N * BATCH * K, dtype=torch.float32)`
+        # `offsets = torch.arange(N * BATCH * K, dtype=torch.int64)`
+        # `v = constant - offsets`
+        # `B_vals = (v - torch.div(v, 8, rounding_mode=&#x27;trunc&#x27;) * 8).float()`
+        # `self.B = B_vals.view(N, BATCH, K).cuda().half()`
+        # Wait, `.cuda().half()` will cast to half on GPU. Or `.half().cuda()`.
+        # For C: `self.C = torch.ones(BATCH, N, M, dtype=torch.float16, device=&#x27;cuda&#x27;)`.
+        #
+        # Now, in the kernel, we need to pass alpha and beta as floats.
+        #
+        # Let&#x27;s write the kernel code carefully.
+        #
+        # One more thing: The kernel should handle the fact that A, B, C are stored as PyTorch tensors with strides.
+        # A (input) is contiguous [B, M, K].
+        # B is contiguous [N, B, K].
+        # C is contiguous [B, N, M].
+        # Output is contiguous [B, N, M].
+        # So we can use `.data_ptr&lt;float&gt;()` and `.data_ptr&lt;at::Half&gt;()` etc.
+        #
+        # Wait, PyTorch&#x27;s `at::Half` is the host-side type, but in CUDA we can use `at::Half` or `half`. `at::Half` has `__half` inside and conversion operators. Let&#x27;s use `half` in CUDA and cast pointers: `reinterpret_cast&lt;const half*&gt;(B.data_ptr&lt;at::Half&gt;())`. Or we can just use `at::Half*` and rely on implicit conversion? Better to use `half` for arithmetic. Actually `at::Half` can be implicitly converted to float. But for loads, we can do `static_cast&lt;float&gt;(B[index])` if B is `const at::Half*`. Let&#x27;s use `at::Half` to avoid including `&lt;cuda_fp16.h&gt;`? Actually `&lt;cuda_fp16.h&gt;` is standard. Let&#x27;s include it and use `half`. But PyTorch&#x27;s ATen uses `at::Half`. In inline CUDA, the type `at::Half` is available. It defines `operator float()`. So `float(a)` works.
+        # However, to be safe, I&#x27;ll include `&lt;cuda_fp16.h&gt;` and use `__half`. When getting pointer from tensor: `const __half* B_ptr = reinterpret_cast&lt;const __half*&gt;(B.data_ptr&lt;at::Half&gt;());`. This is safe because `at::Half` is layout-compatible with `__half` (both 16-bit).
+        #
+        # Let&#x27;s draft the kernel:
+        #
+        # ```cpp
+        #include &lt;cuda_runtime.h&gt;
+        #include &lt;cuda_fp16.h&gt;
+        #include &lt;torch/types.h&gt;
+        #
+        #define BATCH 17
+        #define M 520
+        #define N 219
+        #define K 129
+        #define TILE_M 64
+        #define TILE_N 32
+        #
+        # __global__ void gemm_kernel(
+        #     const float* __restrict__ A,
+        #     const half* __restrict__ B,
+        #     const half* __restrict__ C,
+        #     float* __restrict__ out,
+        #     float alpha,
+        #     float beta) {
+        #
+        #     int batch = blockIdx.z;
+        #     int n_tile = blockIdx.y;
+        #     int m_tile = blockIdx.x;
+        #
+        #     int n_start = n_tile * TILE_N;
+        #     int m_start = m_tile * TILE_M;
+        #
+        #     int n_idx = n_start + threadIdx.x; // threadIdx.x in [0, TILE_N-1]
+        #     int m_base = m_start + threadIdx.y * 4; // threadIdx.y in [0, TILE_M/4 - 1]
+        #
+        #     // Bounds
+        #     int m_end = min(TILE_M, M - m_start);
+        #     int n_end = min(TILE_N, N - n_start);
+        #
+        #     // Load A into smem
+        #     __shared__ float sA[TILE_M][K];
+        #     __shared__ float sB[TILE_N][K];
+        #
+        #     int tid = threadIdx.x + threadIdx.y * blockDim.x;
+        #     int nthreads = blockDim.x * blockDim.y;
+        #
+        #     // A pointer for this batch
+        #     const float* gA = A + batch * M * K + m_start * K;
+        #     int total_A = TILE_M * K;
+        #     for (int i = tid; i &lt; total_A; i += nthreads) {
+        #         int row = i / K;
+        #         int col = i % K;
+        #         float val = 0.0f;
+        #         if (row &lt; m_end) {
+        #             val = gA[row * K + col];
+        #         }
+        #         sA[row][col] = val;
+        #     }
+        #
+        #     // B pointer: shape [N, BATCH, K]
+        #     const half* gB = B + n_start * (BATCH * K) + batch * K;
+        #     int total_B = TILE_N * K;
+        #     for (int i = tid; i &lt; total_B; i += nthreads) {
+        #         int row = i / K;
+        #         int col = i % K;
+        #         float val = 0.0f;
+        #         if (row &lt; n_end) {
+        #             val = __half2float(gB[row * (BATCH * K) + col]);
+        #         }
+        #         sB[row][col] = val;
+        #     }
+        #
+        #     __syncthreads();
+        #
+        #     // Compute
+        #     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        #
+        #     // Only compute if this thread is within bounds
+        #     if (n_idx &lt; N &amp;&amp; m_base &lt; M) {
+        #         #pragma unroll
+        #         for (int kk = 0; kk &lt; K; ++kk) {
+        #             float b = sB[threadIdx.x][kk];
+        #             acc[0] += sA[threadIdx.y*4 + 0][kk] * b;
+        #             if (1 &lt; m_end - threadIdx.y*4) {}
+        #             // Wait, we must check bounds for each m sub-element to avoid out-of-bounds smem read. But sA for row &gt;= m_end is set to 0, so it&#x27;s safe to read, but unnecessary compute.
+        #             // Since K is small and m_end mostly TILE_M except last tile, we can just compute all 4 and later mask writes.
+        #             acc[1] += sA[threadIdx.y*4 + 1][kk] * b;
+        #             acc[2] += sA[threadIdx.y*4 + 2][kk] * b;
+        #             acc[3] += sA[threadIdx.y*4 + 3][kk] * b;
+        #         }
+        #     }
+        #
+        #     // Write output
+        #     // C and out shape [BATCH, N, M]
+        #     float* gOut = out + batch * N * M + n_idx * M + m_base;
+        #     const half* gC = C + batch * N * M + n_idx * M + m_base;
+        #
+        #     if (n_idx &lt; N) {
+        #         for (int i = 0; i &lt; 4; ++i) {
+        #             int m = m_base + i;
+        #             if (m &lt; M) {
+        #                 float c = __half2float(gC[i]);
+        #                 gOut[i] = beta * c + alpha * acc[i];
+        #             }
+        #         }
+        #     }
+        # }
+        # ```
+        # But wait, `threadIdx.y * 4 + 3` might exceed TILE_M-1 (63). threadIdx.y ranges 0..15. 15*4+3 = 63. Good.
+        # Need to check blockDim: blockDim.x = TILE_N = 32. blockDim.y = TILE_M / 4 = 16. So `nthreads = 512`. That&#x27;s fine.
+        # However, `if (n_idx &lt; N &amp;&amp; m_base &lt; M)` might skip compute for out-of-bounds threads. But we still need `__syncthreads()` before and after loading, which is fine because all threads in block participate. Since `__syncthreads()` is reached by all threads regardless of the condition. The `if` for compute is after syncthreads, so fine. The write is after compute. But what about threads where `n_idx &gt;= N` or `m_base &gt;= M`? They don&#x27;t compute and don&#x27;t write. But they still loaded shared memory. Good.
+        # Wait, the compute block has an `if`. Inside the `if`, we do the k-loop. But then we must ensure that all threads in the block reach the same barriers. There are no barriers after the `if`. But there is an implicit warp-level execution divergence, which is fine.
+        # However, we need to ensure that we don&#x27;t read out-of-bounds shared memory in the compute loop. `sA[threadIdx.y*4 + i][kk]` where `threadIdx.y` max 15, `i` max 3 =&gt; 63. `m_end` might be less than 64 for the last tile. But we set `sA[row][col] = 0` for `row &gt;= m_end`. So reading those rows gives 0, which is fine.
+        # Similarly `sB[threadIdx.x][kk]`: threadIdx.x up to 31. `n_end` might be less than 32. But we set `sB[row&gt;=n_end][col] = 0`. So safe.
+        # So we can remove the `if` around the compute loop entirely and compute for all threads. Then just mask writes. This avoids divergence.
+        # Great.
+        # One issue: `__syncthreads()` inside loops? No, only after loads. Since we load the entire K dimension, only one syncthreads needed.
+        # Let&#x27;s refine the kernel.
+        #
+        # Actually, we can also increase tile size for M to 128? M=520, 128*4=512, 128*5=640. TILE_M=128 -&gt; m_tiles=5. TILE_N=32 -&gt; n_tiles=7. Blocks=5*7*17=595. blockDim.x=32, blockDim.y=32 (since TILE_M/4=32) =&gt; 1024 threads per block. sA = 128*129*4 = 66KB. sB = 32*129*4 = 16.5KB. Total 82.5KB. Still under 227KB. But registers per thread: 4 accumulators + loop + etc. If each block has 1024 threads, registers per SM might limit occupancy. Max 255 per thread. 1024*255 = 261K regs per block. But each SM has 64K regs. So max blocks per SM for 1024 threads is floor(65536 / (1024 * reg_usage)). If each thread uses 40 regs, 1024*40=40K, so 1 block per SM. Occupancy might be low. Better to have smaller blocks. 256 or 512 threads is better.
+        # Let&#x27;s keep TILE_M=64, TILE_N=32, blockDim=(32,16)=512 threads. sA=33KB, sB=16.5KB. Total 50KB. 512 threads * ~32 regs = 16K regs. So 4 blocks per SM. Good.
+        # Alternatively, TILE_N=16, blockDim=(16,16)=256 threads. sA=33KB, sB=8KB. Total 41KB. 256 threads * 32 regs = 8K regs. 8 blocks per SM. Even better occupancy. Might be faster due to more parallelism across SMs.
+        # H100 has ~132 SMs (depending on variant). With 2142 blocks and 8 blocks per SM, we have ~16 waves. Good.
+        # Let&#x27;s use blockDim=(16,16) = 256 threads. TILE_N=16, TILE_M=64.
+        # Wait, blockDim.x = TILE_N = 16. blockDim.y = TILE_M / 4 = 16. Yes, 256 threads.
+        # Let&#x27;s double-check: threadIdx.x in [0,15] maps to n in tile. threadIdx.y in [0,15] maps to m group of 4.
+        # Compute loop: 129 iterations * 4 MACs per thread = 516 FMAs. At 1TB/s or whatever, fine.
+        # Let&#x27;s write it out.
+        #
+        # Actually, we should also consider using `float2` loads for A. Since A is float and contiguous in K, for each row we can load float2 (2 floats) for K=129 (64 float2 + 1 float). This doubles load bandwidth. In the scalar loop above, each thread does many scalar loads. For 256 threads and total_A=8256, each thread loads 32 floats. With float2, 16 loads. Since K is contiguous, using float2 is easy if we tile K as well? Or just use a loop with float2.
+        # To keep code simple and correct, I will use scalar loads but rely on L2 cache. For 41KB shared memory and 8256 elements, it&#x27;s fine.
+        # However, to be &quot;optimized for H100&quot;, we should vectorize global memory loads. Let&#x27;s try to do `float2` for A and `half2` for B.
+        # For A loading:
+        # `float2* gA2 = reinterpret_cast&lt;const float2*&gt;(gA);`
+        # But gA is offset by `m_start*K`. Since float2 requires 8-byte alignment, and `m_start*K*4` may not be 8-byte aligned if `m_start*K` is odd. K=129, so m_start*129 is odd for odd m_start. We need to ensure alignment. A is allocated with `torch.randn`, which aligns to at least 16 bytes. The first element is aligned. So offset `m_start*K*4` = m_start*516 bytes. 516 mod 8 = 4 if m_start is odd. So not aligned for float2! So we cannot safely cast to float2 unless m_start is even. Hmm.
+        # Similarly for B: B is half, half2 requires 4-byte alignment. Offset `n_start * (BATCH*K) * 2 + batch*K*2`. `batch*K` could be odd. BATCH=17, K=129. `batch*K` = batch*129. For odd batch, offset is 258 bytes, mod 4 = 2. Not aligned! So half2 loads are also risky.
+        # Therefore, scalar loads are safer.
+        # We can use `__ldg` (load global with cache) for read-only data. `float a = __ldg(gA + ...);` This might help.
+        # Let&#x27;s add `__restrict__` and `const` to allow compiler to optimize.
+        #
+        # Another optimization: use `__launch_bounds__(256)` to hint register count.
+        # `#define TILE_M 64`
+        # `#define TILE_N 16`
+        #
+        # Let&#x27;s finalize the kernel design and write the Python code.
+        #
+        # Actually, we can make TILE_M and TILE_N template parameters or macros. Since M,N,K are fixed, macros are fine.
+        # Wait, can we make K a compile-time constant and unroll the inner loop? `pragma unroll` on a loop with constant upper bound should unroll it. But 129 is large; unrolling fully might increase code size. `pragma unroll 8` or just `pragma unroll` might be okay. Let&#x27;s use `#pragma unroll` and trust the compiler. Actually for K=129, maybe partial unroll is better. We can do `#pragma unroll 8` inside a while loop:
+        # `int kk = 0;`
+        # `for (; kk + 8 &lt;= K; kk += 8) { #pragma unroll for (int k = 0; k &lt; 8; ++k) ... }`
+        # `for (; kk &lt; K; ++kk) ...`
+        # This ensures the main body is unrolled by 8.
+        # Let&#x27;s add this.
+        #
+        # Let&#x27;s write the kernel:
+        #
+        # ```cpp
+        #include &lt;torch/extension.h&gt;
+        #include &lt;cuda_runtime.h&gt;
+        #include &lt;cuda_fp16.h&gt;
+        #
+        #define BATCH 17
+        #define M 520
+        #define N 219
+        #define K 129
+        #define TM 64
+        #define TN 16
+        #
+        # __global__ void __launch_bounds__(256) gemm_kernel(
+        #     const float* __restrict__ A,
+        #     const half* __restrict__ B,
+        #     const half* __restrict__ C,
+        #     float* __restrict__ out,
+        #     float alpha,
+        #     float beta)
+        # {
+        #     const int batch = blockIdx.z;
+        #     const int n_tile = blockIdx.y;
+        #     const int m_tile = blockIdx.x;
+        #
+        #     const int n_start = n_tile * TN;
+        #     const int m_start = m_tile * TM;
+        #
+        #     const int tx = threadIdx.x; // 0..TN-1
+        #     const int ty = threadIdx.y; // 0..TM/4-1
+        #
+        #     const int n = n_start + tx;
+        #     const int m0 = m_start + ty * 4;
+        #
+        #     const int m_end = min(TM, M - m_start);
+        #     const int n_end = min(TN, N - n_start);
+        #
+        #     __shared__ float sA[TM][K];
+        #     __shared__ float sB[TN][K];
+        #
+        #     const int tid = tx + ty * blockDim.x;
+        #     const int nthreads = blockDim.x * blockDim.y;
+        #
+        #     const float* gA = A + batch * M * K + m_start * K;
+        #     const int total_A = TM * K;
+        #     for (int i = tid; i &lt; total_A; i += nthreads) {
+        #         int row = i / K;
+        #         int col = i % K;
+        #         sA[row][col] = (row &lt; m_end) ? gA[row * K + col] : 0.0f;
+        #     }
+        #
+        #     const half* gB = B + n_start * (BATCH * K) + batch * K;
+        #     const int total_B = TN * K;
+        #     for (int i = tid; i &lt; total_B; i += nthreads) {
+        #         int row = i / K;
+        #         int col = i % K;
+        #         sB[row][col] = (row &lt; n_end) ? __half2float(gB[row * (BATCH * K) + col]) : 0.0f;
+        #     }
+        #
+        #     __syncthreads();
+        #
+        #     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+        #
+        #     int kk = 0;
+        #     #pragma unroll
+        #     for (; kk + 4 &lt;= K; kk += 4) {
+        #         float b0 = sB[tx][kk + 0];
+        #         float b1 = sB[tx][kk + 1];
+        #         float b2 = sB[tx][kk + 2];
+        #         float b3 = sB[tx][kk + 3];
+        #
+        #         float a0_0 = sA[ty*4 + 0][kk + 0];
+        #         float a0_1 = sA[ty*4 + 0][kk + 1];
+        #         float a0_2 = sA[ty*4 + 0][kk + 2];
+        #         float a0_3 = sA[ty*4 + 0][kk + 3];
+        #
+        #         float a1_0 = sA[ty*4 + 1][kk + 0];
+        #         float a1_1 = sA[ty*4 + 1][kk + 1];
+        #         float a1_2 = sA[ty*4 + 1][kk + 2];
+        #         float a1_3 = sA[ty*4 + 1][kk + 3];
+        #
+        #         float a2_0 = sA[ty*4 + 2][kk + 0];
+        #         float a2_1 = sA[ty*4 + 2][kk + 1];
+        #         float a2_2 = sA[ty*4 + 2][kk + 2];
+        #         float a2_3 = sA[ty*4 + 2][kk + 3];
+        #
+        #         float a3_0 = sA[ty*4 + 3][kk + 0];
+        #         float a3_1 = sA[ty*4 + 3][kk + 1];
+        #         float a3_2 = sA[ty*4 + 3][kk + 2];
+        #         float a3_3 = sA[ty*4 + 3][kk + 3];
+        #
+        #         acc0 += a0_0 * b0 + a0_1 * b1 + a0_2 * b2 + a0_3 * b3;
+        #         acc1 += a1_0 * b0 + a1_1 * b1 + a1_2 * b2 + a1_3 * b3;
+        #         acc2 += a2_0 * b0 + a2_1 * b1 + a2_2 * b2 + a2_3 * b3;
+        #         acc3 += a3_0 * b0 + a3_1 * b1 + a3_2 * b2 + a3_3 * b3;
+        #     }
+        #     #pragma unroll
+        #     for (; kk &lt; K; ++kk) {
+        #         float b = sB[tx][kk];
+        #         acc0 += sA[ty*4 + 0][kk] * b;
+        #         acc1 += sA[ty*4 + 1][kk] * b;
+        #         acc2 += sA[ty*4 + 2][kk] * b;
+        #         acc3 += sA[ty*4 + 3][kk] * b;
+        #     }
+        #
+        #     float* gOut = out + batch * N * M + n * M + m0;
+        #     const half* gC = C + batch * N * M + n * M + m0;
+        #
+        #     if (n &lt; N) {
+        #         if (m0 + 0 &lt; M) {
+        #             gOut[0] = beta * __half2float(gC[0]) + alpha * acc0;
+        #         }
+        #         if (m0 + 1 &lt; M) {
+        #             gOut[1] = beta * __half2float(gC[1]) + alpha * acc1;
+        #         }
+        #         if (m0 + 2 &lt; M) {
+        #             gOut[2] = beta * __half2float(gC[2]) + alpha * acc2;
+        #         }
+        #         if (m0 + 3 &lt; M) {
+        #             gOut[3] = beta * __half2float(gC[3]) + alpha * acc3;
+        #         }
+        #     }
+        # }
+        # ```
+        # Wait, I used `#pragma unroll` for the loop with variable `kk`. Since K is a macro (129), the loop bounds are compile-time known. The compiler should unroll automatically? But explicit unroll by 4 might be better.
+        # Let&#x27;s check the shared memory indexing: `sA[ty*4 + 3][kk + 3]`. Since TM=64, ty max 15, ty*4+3 = 63. kk+3 max 128. So sA[63][128] is within bounds [64][129]. Good.
+        # sB[tx][kk+3]. tx max 15. sB[15][128] within [16][129]. Good.
+        # One important thing: shared memory arrays with dimensions [TM][K] and [TN][K] might consume more shared memory than needed due to padding, but it&#x27;s okay. To be safe, we can declare as 1D and manually index: `sA[row*K + col]`. But 2D array is fine; compiler handles it. However, sometimes compiler adds padding at the end of rows. For `float sA[TM][K]`, the K dimension is the fast dimension (contiguous in memory). Actually in C/C++, arrays are row-major: `sA[row][col]` has stride `K`. So `sA[row][col+1]` is adjacent. That&#x27;s exactly what we want for `sA[ty*4 + i][kk]`: contiguous in kk. Good.
+        #
+        # But wait: in the compute loop, `sB[tx][kk + 0..3]` is contiguous in kk. Good. `sA[ty*4 + i][kk + 0..3]` is contiguous. Good.
+        #
+        # Let&#x27;s double-check the write addresses. `gOut = out + batch * N * M + n * M + m0`. `out` shape is [B, N, M]. So `batch*N*M` is batch offset. `n*M` is row offset. `m0` is column offset. This is correct.
+        # The `gC` pointer is same layout. `gC[i]` is C element at offset `batch*N*M + n*M + m0 + i`. Since C is [B,N,M], contiguous, this is correct.
+        #
+        # Let&#x27;s double-check B pointer: `gB = B + n_start * (BATCH * K) + batch * K;`. B shape [N, B, K]. Offset for n_start, batch, 0 is `n_start * (BATCH*K) + batch*K`. For row in tile (0..TN-1), element at col is `gB[row * (BATCH*K) + col]`. Correct.
+        # A pointer: `gA = A + batch * M * K + m_start * K;`. A shape [B, M, K]. Offset for batch, m_start, 0 is `batch*M*K + m_start*K`. For row in tile (0..TM-1), element at col is `gA[row*K + col]`. Correct.
+        #
+        # Now, what about alpha and beta? They are passed as float.
+        #
+        # One more optimization: instead of `__half2float` in the write path, we could load C into shared memory too. But C is only read once per output element, so it&#x27;s fine.
+        #
+        # Let&#x27;s verify numerics with the reference. We need to create B and C exactly.
+        # In Python:
+        # ```python
+        # def __init__(self, BATCH, K, N, ALPHA, BETA):
+        #     super().__init__()
+        #     self.BATCH = BATCH
+        #     self.K = K
+        #     self.N = N
+        #     self.ALPHA = ALPHA
+        #     self.BETA = BETA
+        #     M = 520
+        #     ldb = K * BATCH
+        #     constant = N + K * ldb + BATCH * K
+        #     offsets = torch.arange(N * BATCH * K, dtype=torch.int64)
+        #     v = constant - offsets
+        #     # C++ style modulo (sign of dividend)
+        #     vals = v - torch.div(v, 8, rounding_mode=&#x27;trunc&#x27;) * 8
+        #     self.B = vals.view(N, BATCH, K).float().half().cuda()
+        #     self.C = torch.ones(BATCH, N, M, dtype=torch.float16, device=&#x27;cuda&#x27;)
+        # ```
+        # Wait, `B` values need to be float. We cast to `.float().half().cuda()`. Actually `.half().cuda()` converts to half on GPU. `.to(torch.float16).cuda()` is fine.
+        # But `torch.div(v, 8, rounding_mode=&#x27;trunc&#x27;)` returns integer division truncating toward zero. For `v` tensor of type int64, this works. `v - ... * 8` gives int64 tensor.
+        # Let&#x27;s double-check C++ mod for negative numbers.
+        # Example: v = -1. C++: -1 / 8 = 0 (trunc toward zero). -1 % 8 = -1.
+        # `torch.div(-1, 8, rounding_mode=&#x27;trunc&#x27;)` = 0. `0*8=0`. `v - 0 = -1`. Correct.
+        # v = -14691. `trunc_div` = -1836. `-1836*8 = -14688`. `v - (-14688) = -3`. Correct.
+        # v = 285309. `trunc_div` = 35663. `35663*8 = 285304`. `285309-285304=5`. Correct.
+        # Good.
+        #
+        # Now, what about C++ filling: `host_C[...] = 1.f`. So self.C is all ones.
+        #
+        # The kernel output is out = alpha * (A_t @ B_t) + beta * C.
+        # In C++, alpha=1.0, beta=2.0. So output = A@B + 2*C. Since C is ones, output = A@B + 2.
+        # Wait, C is initialized to 1 and beta=2, so beta*C = 2. Yes.
+        # We need to match the reference shape. Output shape is [BATCH, N, M].
+        #
+        # But what if the hidden reference outputs a different shape? The C++ reference outputs C of shape [B, N, M] effectively. There is no final transpose in the C++ code. So output should be [BATCH, N, M].
+        # However, the I/O contract doesn&#x27;t specify output shape explicitly, but it must match reference. So we output [BATCH, N, M].
+        #
+        # One more thing: The original C++ code had both array and strided versions. The I/O contract only gives one tensor input, so it&#x27;s the strided version.
+        #
+        # Let&#x27;s consider if we need to handle non-contiguous tensors. The input from `get_inputs()` is contiguous. Our internal buffers are contiguous. So we can assume contiguous.
+        #
+        # Let&#x27;s think about FP16 optimization. We are storing B and C as half, computing in float. This saves bandwidth but compute is float. Since the problem is small and likely memory latency bound, saving bandwidth helps. But could we compute in half using tensor cores? That would require a different approach. But it&#x27;s risky for accuracy and code complexity.
+        # Actually, for 0.5 GFLOPs in FP16, H100 tensor cores could do it in &lt;1 microsecond. But overhead of data movement and kernel launch dominates. So a simple kernel is likely okay.
+        # However, if the reference uses cuBLAS (which does use tensor cores when allowed), the reference might be very fast. For 0.5 GFLOPs, cuBLAS might take e.g., 10 microseconds. Our kernel might take 20 microseconds. That would be slower. To beat cuBLAS, we might need to use tensor cores.
+        # Wait, cuBLAS for FP32 batched gemm of these sizes might take ~30-50 microseconds. A simple kernel might also be in that range. It&#x27;s unclear.
+        # But the prompt says the source kernel was hand-tuned for A100. Perhaps the reference is a custom CUTLASS kernel that is not as optimized as it could be on H100. Or maybe the reference is the Python CPU loop? In that case, our kernel will easily win.
+        # The user says: &quot;Write a custom CUDA kernel that replaces a PyTorch reference, producing numerically equivalent output faster than the reference.&quot; The reference is hidden and likely some PyTorch operation (maybe `torch.baddbmm` or a custom Python implementation). `torch.baddbmm` for these sizes on H100 in FP16 might be very fast. To be safe, we should make our kernel as fast as possible.
+        # Can we add support for FP16 tensor cores via `mma.sync`? Let&#x27;s see if we can quickly incorporate it.
+        # The instruction `mma.sync.aligned.m16n8k16.row.col.f32.tf32.tf32.f32` or `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16` is available on Ampere and Hopper.
+        # But we need to reorganize data into fragments. For A [B, K, M] and B [B, N, K], we can think of the operation as C = B @ A. M=520, N=219, K=129.
+        # We could use each warp to compute an m16xn8 tile using mma. But K=129 means 9 k16 iterations (since 129/16 = 8 with remainder 1). We need to pad K to multiple of 16 and handle accumulator type.
+        # This is quite involved: need to load A and B into registers in the specific fragment layout. The layout for mma.sync is not trivial. For example, A operand in `mma.sync.aligned.m16n8k16.row.col` has a specific thread-to-data mapping.
+        # Without CUTLASS, writing correct mma.sync code from scratch is error-prone.
+        # Another H100-specific feature: `cp.async.bulk` for faster global-&gt;shared copies. We can try using `cp.async` (Ampere+) for A and B loads. This could improve performance by pipelining.
+        # But for simplicity, I will stick to the shared memory tiled kernel with scalar loads. It should be reasonably fast and definitely faster than a CPU reference or a naive kernel.
+        # Let&#x27;s refine the kernel to make sure it compiles with `load_inline`.
+        # We need to wrap it in a `torch.utils.cpp_extension.load_inline` call inside `ModelNew` or at module level. The model code must be self-contained.
+        # Standard pattern:
+        # ```python
+        # import torch
+        # import torch.nn as nn
+        # from torch.utils.cpp_extension import load_inline
+        #
+        # cpp_source = &quot;&quot;&quot;
+        # ... CUDA code ...
+        # torch::Tensor gemm_forward(torch::Tensor A, torch::Tensor B, torch::Tensor C, float alpha, float beta) {
+        #   auto out = torch::empty_like(C, torch::kFloat32); // Wait C is half, out should be float?
+        #   // Actually C is half. We want out float.
+        #   auto out = torch::empty({BATCH, N, M}, torch::dtype(torch::kFloat32).device(A.device()));
+        #   dim3 grid(...);
+        #   dim3 block(...);
+        #   gemm_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(A.data_ptr&lt;float&gt;(), ...);
+        #   return out;
+        # }
+        # &quot;&quot;&quot;
+        #
+        # gemm = load_inline(
+        #     name=&quot;gemm&quot;,
+        #     cpp_sources=[cpp_source],
+        #     functions=[&quot;gemm_forward&quot;],
+        #     extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+        #     verbose=False,
+        # )
+        # ```
+        #
+        # But `load_inline` compiles at import time. We need to put the `load_inline` call somewhere. It can be at module level or inside `__init__`. Module level is fine.
+        # We need to ensure the code compiles. The CUDA source string needs escaping in Python.
+        #
+        # One issue: `torch::empty` with `{BATCH, N, M}` in C++ needs to be constructed correctly. Since BATCH, N, M are macros, we can use `torch::empty({BATCH, N, M}, ...)` or `at::empty({BATCH, N, M}, ...)`.
+        #
+        # Let&#x27;s verify C++ API:
+        # `auto out = torch::empty({BATCH, N, M}, torch::TensorOptions().dtype(torch::kFloat32).device(A.device()));`
+        #
+        # Alternatively, we can allocate in Python and pass to C++:
+        # `out = torch.empty(BATCH, N, M, dtype=torch.float32, device=A.device)`
+        # Then call kernel.
+        #
+        # Let&#x27;s write the C++ function signature:
+        # ```cpp
+        # torch::Tensor gemm_forward(torch::Tensor A, torch::Tensor B, torch::Tensor C, float alpha, float beta) {
+        #     TORCH_CHECK(A.is_cuda(), &quot;A must be CUDA&quot;);
+        #     TORCH_CHECK(B.is_cuda(), &quot;B must be CUDA&quot;);
+        #     TORCH_CHECK(C.is_cuda(), &quot;C must be CUDA&quot;);
+        #     auto out = torch::empty({BATCH, N, M}, torch::TensorOptions().dtype(torch::kFloat32).device(A.device()));
+        #     dim3 grid((M + TM - 1) / TM, (N + TN - 1) / TN, BATCH);
+        #     dim3 block(TN, TM / 4);
+        #     gemm_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(
+        #         A.data_ptr&lt;float&gt;(),
+        #         reinterpret_cast&lt;const half*&gt;(B.data_ptr&lt;at::Half&gt;()),
+        #         reinterpret_cast&lt;const half*&gt;(C.data_ptr&lt;at::Half&gt;()),
+        #         out.data_ptr&lt;float&gt;(),
+        #         alpha,
+        #         beta);
+        #     return out;
+        # }
+        # ```
+        # But we need to be careful: A is [BATCH, M, K] float. B is [N, BATCH, K] half. C is [BATCH, N, M] half. So in Python we ensure these shapes and dtypes.
+        #
+        # Now, let&#x27;s code the Python class.
+        #
+        # ```python
+        # class ModelNew(nn.Module):
+        #     def __init__(self, BATCH, K, N, ALPHA, BETA):
+        #         super().__init__()
+        #         self.BATCH = BATCH
+        #         self.K = K
+        #         self.N = N
+        #         self.ALPHA = ALPHA
+        #         self.BETA = BETA
+        #         M = 520
+        #         ldb = K * BATCH
+        #         constant = N + K * ldb + BATCH * K
+        #         offsets = torch.arange(N * BATCH * K, dtype=torch.int64)
+        #         v = constant - offsets
+        #         vals = v - torch.div(v, 8, rounding_mode=&#x27;trunc&#x27;) * 8
+        #         self.register_buffer(&#x27;B&#x27;, vals.view(N, BATCH, K).to(torch.float16).cuda())
+        #         self.register_buffer(&#x27;C&#x27;, torch.ones(BATCH, N, M, dtype=torch.float16, device=&#x27;cuda&#x27;))
+        #         
+        #     def forward(self, A):
+        #         return gemm(A, self.B, self.C, self.ALPHA, self.BETA)
+        # ```
+        #
+        # Wait, we need to make sure `B` and `C` are on the same device as `A`. Since `get_inputs()` returns `.cuda()`, we can just put them on cuda in `__init__`. But what if the model is moved to CPU? These challenges usually use CUDA. If we use `register_buffer`, they move with `.to(device)`. But we initialized to cuda. If the model is later moved, buffers will move. However, `get_inputs()` is cuda, and model is not moved. So fine.
+        #
+        # Let&#x27;s verify the shapes again with the kernel.
+        # A input: [BATCH, M, K] = [17, 520, 129]. Good.
+        # self.B: [N, BATCH, K] = [219, 17, 129]. Good.
+        # self.C: [BATCH, N, M] = [17, 219, 520]. Good.
+        #
+        # Now let&#x27;s write the final code.
+        #
+        # One more check: `torch.div(v, 8, rounding_mode=&#x27;trunc&#x27;)` for integer tensors. Does this exist? Yes, `torch.div(int_tensor, 8, rounding_mode=&#x27;trunc&#x27;)` returns integer division truncating toward zero. This is supported.
+        # Alternatively, we can compute `vals = v.int() % 8`? No, Python mod. We can do: `sign = torch.sign(v); vals = sign * (torch.abs(v) % 8)`. For v negative, sign=-1, abs(v)%8 = 3, result=-3. For v positive, sign=1, result=5. This matches C++ mod! And avoids `trunc` mode which might have dtype issues.
+        # Let&#x27;s verify: v=0 -&gt; sign=0, result=0? `0 * (0 % 8) = 0`. But C++ `0 % 8 = 0`. Good.
+        # v=-1 -&gt; sign=-1, abs(-1)%8=1, result=-1. Correct.
+        # v=5 -&gt; sign=1, 5%8=5, result=5. Correct.
+        # This is simpler and doesn&#x27;t require `rounding_mode`. Let&#x27;s use this.
+        # `vals = torch.sign(v).long() * (torch.abs(v) % 8)`
+        # Wait, v is int64. `torch.sign(v)` returns same dtype. `torch.abs(v) % 8` returns int64. Multiplying gives int64. Good.
+        #
+        # But what about v=0? sign=0 -&gt; 0. Good.
+        #
+        # Let&#x27;s be careful: In C++, if v is negative and divisible by 8, e.g., v=-8. C++: -8 / 8 = -1 (trunc toward zero), -8 % 8 = 0. Our formula: sign=-1, abs(-8)%8=0, result=0. Good.
+        #
+        # So `vals = torch.sign(v) * (torch.abs(v) % 8)`. Use `.long()`.
+        #
+        # Hmm, but `torch.sign(v)` returns -1, 0, 1. If v=-0? v is integer, no -0. Fine.
+        #
+        # However, `torch.abs(v)` for `v = torch.iinfo(torch.int64).min` would overflow. But our range is -195k to 285k. Fine.
+        #
+        # Let&#x27;s write the code.
+        #
+        # I will write a clean code block.
+        #
+        # Extra details: The `cpp_extension.load_inline` function signature: `load_inline(name, cpp_sources, cuda_sources=None, functions=None, extra_cuda_cflags=None, extra_cflags=None, verbose=False, with_cuda=True)`.
+        # We can put everything in `cuda_sources`. But since we have a host function (`gemm_forward`) that calls the kernel, we need both C++ and CUDA. `cpp_sources` is for host, `cuda_sources` for device. Actually `load_inline` requires `cpp_sources` or `cuda_sources`. We can put the kernel and forward in `cuda_sources` as a `.cu` file.
+        # Let&#x27;s do:
+        # ```python
+        # cuda_source = &quot;&quot;&quot;
+        # #include &lt;torch/extension.h&gt;
+        # #include &lt;cuda_runtime.h&gt;
+        # #include &lt;cuda_fp16.h&gt;
+        #
+        # #define BATCH 17
+        # #define M 520
+        # #define N 219
+        # #define K 129
+        # #define TM 64
+        # #define TN 16
+        #
+        # __global__ void __launch_bounds__(256) gemm_kernel(...) { ... }
+        #
+        # torch::Tensor gemm_forward(...) { ... }
+        # &quot;&quot;&quot;
+        # gemm = load_inline(name=&quot;gemm&quot;, cuda_sources=cuda_source, functions=[&quot;gemm_forward&quot;], extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;], verbose=False)
+        # ```
+        # Wait, `load_inline` in some versions needs `with_cuda=True` if there are CUDA sources. It should automatically detect. The `functions` list are the exposed functions.
+        # Need to include `&lt;torch/extension.h&gt;`. `at::Half` is available.
+        #
+        # Let&#x27;s double check the pointer casts.
+        # In the kernel call inside `gemm_forward`:
+        # `A.data_ptr&lt;float&gt;()` is fine because A is float32.
+        # For B and C, we can use `reinterpret_cast&lt;const half*&gt;(B.data_ptr&lt;at::Half&gt;())`. `at::Half` is the PyTorch half type. On CUDA, `at::Half` is `__half`. Actually `at::Half` might be `c10::Half` which is a struct wrapping `__half`. But `sizeof(at::Half)` is 2. `reinterpret_cast` to `half*` should be safe because `at::Half` has conversion operators and the underlying storage is 16-bit.
+        # Alternatively, we can just use `at::Half*` in the kernel signature and do `static_cast&lt;float&gt;(B[index])` which invokes the conversion operator. This avoids `reinterpret_cast` and `&lt;cuda_fp16.h&gt;`.
+        # Let&#x27;s do that: kernel signature uses `const at::Half* B`. Then load: `float b = static_cast&lt;float&gt;(B[idx]);`. This is simpler and doesn&#x27;t require `__half2float`. However, `static_cast&lt;float&gt;(at::Half)` works in device code because `at::Half` defines `__device__ operator float()`. Yes.
+        # So we can skip `&lt;cuda_fp16.h&gt;`.
+        # Let&#x27;s adjust:
+        # `const at::Half* __restrict__ B`
+        # In load: `float val = (row &lt; n_end) ? static_cast&lt;float&gt;(gB[row * (BATCH * K) + col]) : 0.0f;`
+        # In write: `float c = static_cast&lt;float&gt;(gC[i]);`
+        # This is clean.
+        #
+        # Final check: does `at::Half` have a `operator float()` on device? According to PyTorch source, `c10::Half` has `C10_HOST_DEVICE inline operator float() const noexcept`. Yes.
+        # So we can use it.
+        #
+        # Let&#x27;s write the code.
+        #
+        # One more optimization: we can use `constexpr int BATCH = 17;` etc. But macros are fine.
+        # Actually using `constexpr` is better C++ style. Let&#x27;s use `constexpr int BATCH = 17;` etc. But `__launch_bounds__` needs compile-time constants. `TM` and `TN` can be `constexpr int`. Yes.
+        # The shared memory size must be compile-time constant: `__shared__ float sA[TM][K];` requires TM and K to be compile-time constants. `constexpr int` qualifies. Good.
+        # In grid compute: `(M + TM - 1) / TM` etc.
+        #
+        # Are there any issues with `blockDim.x` etc. not matching TILE sizes? We set `dim3 block(TN, TM/4)`. blockDim.x = TN = 16. blockDim.y = 16. So nthreads = 256. `tx` ranges 0..15. `ty` ranges 0..15. `n = n_start + tx`. `m0 = m_start + ty*4`. Since TM=64, ty*4 up to 60. Good.
+        #
+        # Need to ensure that `M - m_start` and `N - n_start` are computed correctly. For last tiles: m_start=512 (tile 8), M-m_start=8. m_end=8. n_start=208 (tile 13), N-n_start=11. n_end=11. Good.
+        #
+        # Let&#x27;s do a quick mental run for boundary conditions.
+        # For tile m=8, m_start=512. thread with ty=0-&gt;m0=512, ty=1-&gt;516, ty=2-&gt;520 (&gt;=M). The accumulators for m0&gt;=M will be computed but later masked in write. However, in A loading, m_end = 8. So rows 8..63 in sA are zero. So accumulators for m0 &gt;= 520 are zero. In write, `m0+0 &lt; M` is false for m0&gt;=520. So no write. Correct.
+        # For B loading, n_end = 11 for last tile. rows 11..15 in sB are zero. For thread tx=15, n=208+15=223 &gt;= N=219. sB[15][*] is zero. acc=0. Write is masked. Correct.
+        #
+        # All good.
+        #
+        # Let&#x27;s think if using shared memory for A and B is the best we can do. Could we also store C in shared memory? No, each output is written once. Could we fuse the beta*C load into the write? We already do that.
+        #
+        # Another optimization: instead of loading B into shared memory as float, we could keep it in registers for each thread, since each thread only needs one column of B (tx) across all K. That&#x27;s exactly what we do: `sB[tx][kk]`. Loading into shared memory allows reuse across the warp but each thread only reads its own tx. So shared memory for B is actually overkill. Each thread could load B directly from global memory into a register array of size K (129 floats = 516 bytes). That&#x27;s a lot of registers (129 registers per thread). Not feasible.
+        # But we can process K in chunks. For each chunk of K (e.g., 16), load B chunk into registers (16 floats) and A chunk into shared memory. This is classic tiling. Since K is only 129, loading B into shared memory is fine.
+        #
+        # Wait, 129 floats per thread in registers is too many. But we don&#x27;t do that. We load B tile of TN x K into shared memory. That&#x27;s shared memory.
+        #
+        # Another thought: since each thread computes 4 outputs, and K=129, total temporary registers: 4 accumulators + a few temps. Around 16-24 registers. Very low. Occupancy will be high.
+        #
+        # Let me check if using `__ldg` for C read helps. Probably not needed. But we can add `__ldg` for read-only pointers: A, B, C. Actually `__ldg` only works for certain types and simple indexing. Since C is used once per thread, it doesn&#x27;t matter.
+        #
+        # Actually, we can pass alpha and beta as float to kernel. In PyTorch, we pass them as Python floats.
+        #
+        # Let&#x27;s write the final code.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+constexpr int BATCH = 17;
+constexpr int M     = 520;
+constexpr int N     = 219;
+constexpr int K     = 129;
+constexpr int TM    = 64;
+constexpr int TN    = 16;
+
+__global__ void __launch_bounds__(256) gemm_kernel(
+    const float* __restrict__ A,
+    const at::Half* __restrict__ B,
+    const at::Half* __restrict__ C,
+    float* __restrict__ out,
+    float alpha,
+    float beta)
+{
+    const int batch  = blockIdx.z;
+    const int n_tile = blockIdx.y;
+    const int m_tile = blockIdx.x;
+
+    const int n_start = n_tile * TN;
+    const int m_start = m_tile * TM;
+
+    const int tx = threadIdx.x;               // 0..TN-1   (n offset)
+    const int ty = threadIdx.y;               // 0..TM/4-1 (m group)
+
+    const int n  = n_start + tx;
+    const int m0 = m_start + ty * 4;
+
+    const int m_end = min(TM, M - m_start);
+    const int n_end = min(TN, N - n_start);
+
+    __shared__ float sA[TM][K];
+    __shared__ float sB[TN][K];
+
+    const int tid = tx + ty * blockDim.x;
+    const int nthreads = blockDim.x * blockDim.y;
+
+    // Cooperative load of A tile: shape [TM, K], global A is [B, M, K]
+    const float* gA = A + batch * M * K + m_start * K;
+    #pragma unroll
+    for (int i = tid; i &lt; TM * K; i += nthreads) {
+        int row = i / K;
+        int col = i % K;
+        sA[row][col] = (row &lt; m_end) ? gA[row * K + col] : 0.0f;
+    }
+
+    // Cooperative load of B tile: shape [TN, K], global B is [N, B, K]
+    const at::Half* gB = B + n_start * (BATCH * K) + batch * K;
+    #pragma unroll
+    for (int i = tid; i &lt; TN * K; i += nthreads) {
+        int row = i / K;
+        int col = i % K;
+        sB[row][col] = (row &lt; n_end)
+                           ? static_cast&lt;float&gt;(gB[row * (BATCH * K) + col])
+                           : 0.0f;
+    }
+
+    __syncthreads();
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    int kk = 0;
+    #pragma unroll
+    for (; kk + 4 &lt;= K; kk += 4) {
+        float b0 = sB[tx][kk + 0];
+        float b1 = sB[tx][kk + 1];
+        float b2 = sB[tx][kk + 2];
+        float b3 = sB[tx][kk + 3];
+
+        acc0 += sA[ty*4 + 0][kk + 0] * b0
+              + sA[ty*4 + 0][kk + 1] * b1
+              + sA[ty*4 + 0][kk + 2] * b2
+              + sA[ty*4 + 0][kk + 3] * b3;
+
+        acc1 += sA[ty*4 + 1][kk + 0] * b0
+              + sA[ty*4 + 1][kk + 1] * b1
+              + sA[ty*4 + 1][kk + 2] * b2
+              + sA[ty*4 + 1][kk + 3] * b3;
+
+        acc2 += sA[ty*4 + 2][kk + 0] * b0
+              + sA[ty*4 + 2][kk + 1] * b1
+              + sA[ty*4 + 2][kk + 2] * b2
+              + sA[ty*4 + 2][kk + 3] * b3;
+
+        acc3 += sA[ty*4 + 3][kk + 0] * b0
+              + sA[ty*4 + 3][kk + 1] * b1
+              + sA[ty*4 + 3][kk + 2] * b2
+              + sA[ty*4 + 3][kk + 3] * b3;
+    }
+    #pragma unroll
+    for (; kk &lt; K; ++kk) {
+        float b = sB[tx][kk];
+        acc0 += sA[ty*4 + 0][kk] * b;
+        acc1 += sA[ty*4 + 1][kk] * b;
+        acc2 += sA[ty*4 + 2][kk] * b;
+        acc3 += sA[ty*4 + 3][kk] * b;
+    }
+
+    float* gOut = out + batch * N * M + n * M + m0;
+    const at::Half* gC = C + batch * N * M + n * M + m0;
+
+    if (n &lt; N) {
+        if (m0 + 0 &lt; M) gOut[0] = beta * static_cast&lt;float&gt;(gC[0]) + alpha * acc0;
+        if (m0 + 1 &lt; M) gOut[1] = beta * static_cast&lt;float&gt;(gC[1]) + alpha * acc1;
+        if (m0 + 2 &lt; M) gOut[2] = beta * static_cast&lt;float&gt;(gC[2]) + alpha * acc2;
+        if (m0 + 3 &lt; M) gOut[3] = beta * static_cast&lt;float&gt;(gC[3]) + alpha * acc3;
+    }
+}
+
+torch::Tensor gemm_forward(torch::Tensor A, torch::Tensor B, torch::Tensor C,
+                           float alpha, float beta)
+{
+    auto out = torch::empty({BATCH, N, M},
+                            torch::TensorOptions()
+                                .dtype(torch::kFloat32)
+                                .device(A.device()));
+    dim3 grid((M + TM - 1) / TM, (N + TN - 1) / TN, BATCH);
+    dim3 block(TN, TM / 4);
+    gemm_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(
+        A.data_ptr&lt;float&gt;(),
+        B.data_ptr&lt;at::Half&gt;(),
+        C.data_ptr&lt;at::Half&gt;(),
+        out.data_ptr&lt;float&gt;(),
+        alpha,
+        beta);
+    return out;
+}
+&quot;&quot;&quot;
+
+gemm = load_inline(
+    name=&quot;h100_gemm&quot;,
+    cuda_sources=cuda_source,
+    functions=[&quot;gemm_forward&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, BATCH, K, N, ALPHA, BETA):
+        super().__init__()
+        self.ALPHA = ALPHA
+        self.BETA = BETA
+
+        M = 520
+        ldb = K * BATCH
+        constant = N + K * ldb + BATCH * K
+
+        offsets = torch.arange(N * BATCH * K, dtype=torch.int64)
+        v = constant - offsets
+        # C++ style integer modulo (sign follows dividend)
+        vals = torch.sign(v) * (torch.abs(v) % 8)
+
+        self.register_buffer(
+            &quot;B&quot;,
+            vals.view(N, BATCH, K).to(torch.float16).cuda(),
+            persistent=False,
+        )
+        self.register_buffer(
+            &quot;C&quot;,
+            torch.ones(BATCH, N, M, dtype=torch.float16, device=&quot;cuda&quot;),
+            persistent=False,
+        )
+
+    def forward(self, A):
+        return gemm.gemm_forward(A, self.B, self.C, self.ALPHA, self.BETA)
+```
+</div></div></details></div>
 </body></html>

@@ -6,14 +6,14 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 3</a></div><div class="site-subtitle">Kimi-K2.6 · hardware_translation_stub · l5_hw_translation_single_turn_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-10 09:30:59 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 3</a></div><div class="site-subtitle">Kimi-K2.6 · hardware_translation_stub · l5_hw_translation_single_turn_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-10 09:36:11 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
-  <span class="outcome-badge outcome-in_progress">in_progress</span>
+  <span class="outcome-badge outcome-error">error</span>
   <span style="font-size:13px;">03_fused_rmsnorm.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 1</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 1</div></div>
   <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp16</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">hardware_translation_stub</div></div>
@@ -26,5 +26,2119 @@
 
 
 
-</div></div>
+</div><details class="turn-collapse"><summary><b>turn 0</b> · 0 tool call(s) · 391.0s · 128,596 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 391.0s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to produce a Python class ModelNew that uses torch.utils.cpp_extension.load_inline to compile custom CUDA kernels implementing RMSNorm and fused_add_rms_norm, optimized for H100 Hopper. The kernels must match reference hidden evaluation on the tensor I/O contract, which appears to be a single forward pass of RMSNorm: input shape [NUM_TOKENS, HIDDEN_SIZE], weight shape [HIDDEN_SIZE], eps. The reference Model likely does something like: out = x * rsqrt(mean(x^2) + eps) * weight. Or maybe fused_add_rms_norm? Wait the I/O contract only shows get_init_inputs returns [HIDDEN_SIZE, EPS] and get_inputs returns [x]. No weight or residual in inputs. But the reference is hidden. However typical RMSNorm layer in llm has learnable weight parameter. The hidden reference probably constructs a weight inside __init__ and applies rms_norm to input. Or maybe it does fused_add_rms_norm? But get_inputs only returns [x], no residual. So likely reference is just rms_norm: out = rms_norm(x, weight, eps). So we need to implement ModelNew.__init__(hidden_size, eps) perhaps generating weight, and forward(x) applying RMSNorm.
+
+We need to output a single code block (Python code) with ModelNew using inline CUDA. Must compile and be fully functional, no testing code.
+
+We need to adapt the provided CUDA kernels for H100. Let&#x27;s analyze the given kernels.
+
+Given code has rms_norm_kernel generic for 2D/3D/4D, and fused_add_rms_norm_kernel specialized for FP16/BF16 with vector width 8 and generic fallback.
+
+Key differences for H100:
+- Higher memory bandwidth (3.35 TB/s vs 1.555 TB/s). So memory-bound kernels benefit from maximizing memory throughput. Global memory loads/stores should use 128-bit vectorized accesses where possible.
+- H100 has more shared memory (228KB per SM). But RMS norm uses small shared memory for block reduce and s_variance. Not a bottleneck.
+- H100 has 255 max registers per thread (same). But we can increase block size maybe 512 or 1024.
+- Thread block per SM max 32 (same).
+- H100 supports warp-specialized? But simpler: we can use persistent kernels or multi-buffering? Probably overkill.
+- Use cp.async? Not needed for small latency-bound kernels.
+- Use __builtin_assume? Not in CUDA.
+- Use cooperative groups for reduction? Or just CUB block reduce.
+- The original kernel uses CUB::BlockReduce with block size up to 1024. It uses vectorized reads via custom vectorize_read_with_alignment. For H100, we can use float4 / half8 vector loads directly.
+- The fused_add_rms_norm kernel does input += residual, compute variance, write back residual, then scale and write input. Since our task is just rms_norm (no residual?), we need to implement rms_norm only. But perhaps reference does fused_add_rms_norm? Wait get_inputs only returns x, no residual. So it&#x27;s just rms_norm. But to be safe, we may need to implement both? The hidden evaluation may call only the forward with specified contract. We need to match outputs. Let&#x27;s just implement RMSNorm.
+
+However, the I/O contract doesn&#x27;t provide weight as input. In __init__, we should create a weight parameter (maybe ones?) used by reference. We need to guess what reference does. Typically RMSNorm weight is initialized to ones. Or maybe random? The hidden reference&#x27;s __init__ might register a Parameter with ones or random values. Since we need to match numerically, we need to replicate the exact weight initialization. But we don&#x27;t know it. However the evaluation likely checks output with same inputs and same Model initialization? No, the evaluation will compare ModelNew forward output to hidden reference Model forward output when both are initialized with same arguments (get_init_inputs). But they are separate instances; weight initialization in __init__ must be deterministic and same as reference. Usually hidden reference may initialize weight as torch.ones or maybe a random tensor with fixed seed? We need to infer.
+
+Given typical vLLM rms_norm usage: weight is a parameter. In many LLM models, RMSNorm weight is initialized to ones. Let&#x27;s look at the vLLM code: class RMSNorm(nn.Module): def __init__(self, hidden_size, eps=1e-6): super().__init__(); self.weight = nn.Parameter(torch.ones(hidden_size)); self.variance_epsilon = eps. That is exactly the pattern in many implementations (e.g., LlamaRMSNorm). I think hidden reference likely does that. So we should define self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float16)).cuda() perhaps. And self.eps = eps.
+
+Alternatively, maybe reference passes weight inside model state dict. Since get_init_inputs returns [HIDDEN_SIZE, EPS], and no weight seed, weight is almost certainly ones.
+
+Now, optimizing for H100:
+- Use 128-bit vector loads/stores (16 bytes). For FP16, that&#x27;s 8 elements. For FP32, 4 elements. Given we operate on FP16, load 8 halfs per thread.
+- Use large block sizes, but not too large to limit occupancy. For H100, occupancy not as critical since bandwidth is huge; but SMs count is 132 (for H100 SXM). With num_tokens=512, grid=512. Using block_size=1024 means 512*1024=524k threads. Occupancy may be limited by registers. But it&#x27;s okay. Maybe choose block_size=512 for better occupancy. Or use 256 for large num_tokens as original. But on H100, with 512 tokens, 256 block uses 512*256=131k threads, leaving many SMs idle? Actually H100 has 132 SMs, so 512 blocks is enough to fill all SMs if each SM can run multiple blocks. With block_size=256, register usage per thread maybe ~32 =&gt; 8k per block =&gt; 8 blocks per SM (max 32). So occupancy good.
+- The bottleneck is memory bandwidth. Maximize vectorization and use ld.global.nc (cache streaming) maybe not needed.
+- We can also fuse the two passes (compute variance and write output) using multiple loads. But we currently load input twice: once for variance, once for output writing. Since it&#x27;s memory bound, we could load once into registers/shared, but for large hidden_size (4096) per row, that&#x27;s 4096*2 bytes = 8KB per row. Could load entire row into shared memory (needs 8KB). With 256 threads per block, we could load 4096 elements = 256 threads * 16 elements each (256*16=4096). But 16 elements per thread at 128-bit loads = 4 vectors of 8 halfs? Wait 128-bit = 8 halfs. 256 threads * 8 = 2048 halfs per iteration. Two iterations cover 4096. That&#x27;s manageable. Shared memory for 4096 halfs = 8KB. That&#x27;s well under 228KB. So we could load the whole row into shared memory once, compute variance via shared mem, syncthreads, then write output. That avoids reading input twice from global memory. The weight can also be loaded into shared memory? Weight is 4096 halfs = 8KB. We could load weight once per block into shared as well (broadcast). But weight is read by all blocks; caching in L2 likely handles it. Still, loading weight from global once per row is needed anyway. If we store row in shared mem, we still need to read weight. So total global reads: input once, weight once. Writes: output once. Currently original reads input twice (once for variance, once for output) + weight once, write output once. So reducing input reads by half is beneficial. For 4096 hidden size, 512 tokens, memory traffic: input 512*4096*2 = 4MB, weight 8KB, output 4MB. Reading input twice adds 4MB extra. Reducing that saves ~33% time.
+
+However H100 has huge bandwidth, but still memory bound. Let&#x27;s implement a kernel that loads the entire row into shared memory via vectorized loads, computes variance with warp shuffle or CUB reduction, then writes output using the shared input and global weight.
+
+But careful: shared memory per block limited to 227KB. 8KB is fine. But we need to support variable hidden_size up to maybe larger than 4096. Could handle up to e.g., 8192 (16KB) or 16384 (32KB). That&#x27;s still fine. But what if hidden_size is huge, e.g., 65536? That&#x27;s 128KB. Still under 227KB. But maybe hidden size can be larger. To be safe, we could process in chunks.
+
+Alternatively, we can use a two-pass approach but with vectorized loads and using `__ldg` for read-only data, which uses read-only cache. The compiler may already do that for `const __restrict__`.
+
+Better approach: Use per-thread accumulation of partial sums while vector-loading, store the loaded vectors in registers (not shared) to reuse for output write. But per thread can only hold a limited number of vectors. For hidden_size=4096 and block_size=256, each thread handles 16 elements. That&#x27;s 8 vectors of 8 halfs (128-bit). 8 vectors * 16 bytes = 128 bytes registers. That&#x27;s fine. But we need to compute variance across the row, requiring inter-thread reduction. So we could load 8 vectors per thread, compute partial variance, then block reduce, then write the stored vectors back. That&#x27;s even better: no shared memory for row data, just registers. However 8 vectors per thread may be okay but for larger hidden_size, more registers. E.g., hidden_size=8192, block_size=256 =&gt; 32 elements per thread =&gt; 4 vectors of 8 halfs per thread? Wait 32 elements = 4 vectors of 8. Actually 32 halfs = 4 x 8 half vectors. That&#x27;s 4 registers of 128-bit. Not bad. For 16384 =&gt; 8 vectors. For 32768 =&gt; 16 vectors. 16 vectors * 16 bytes = 256 bytes. Plus weight vectors. That&#x27;s okay. But block size might be smaller. If block size is 512, elements per thread halved.
+
+The problem: we need to support arbitrary hidden_size. We can choose block size based on hidden_size and num_tokens. Could use a template kernel with compile-time vector width (8 for half) and load in a loop, storing in a local array. Example:
+
+```
+const int tid = threadIdx.x;
+const int row = blockIdx.x;
+const int num_vec = hidden_size / VEC_SIZE;
+const int vec_per_thread = (num_vec + blockDim.x - 1) / blockDim.x;
+half8 local[... maybe dynamic?];
+```
+
+Dynamic arrays in registers are tricky; we can use a loop without storing all: we could load once, accumulate variance, but to write after reduction we need the values again. So either we load twice or store in shared memory. Storing in shared memory seems simpler and robust for any hidden_size within shared limit.
+
+But since hidden size is 4096 in evaluation, we can design a kernel optimized for up to e.g. 8192 or 16384 using shared memory. For larger, fallback to two-pass global.
+
+Simpler: just keep the two-pass global approach but optimize vectorization and block size for H100. The original kernel uses a custom vectorize_read_with_alignment which probably does unaligned scalar tail. We can replace with explicit vectorized loads using alignment checks. But given the evaluation tensors are contiguous and aligned, we can assume 16-byte alignment.
+
+For fused_add_rms_norm, not needed.
+
+Let&#x27;s design the rms_norm kernel for H100:
+
+- Use `half` (or `__half`) and `half2` or better `float4`? For half, use a struct of 8 halfs (128 bits). We&#x27;ll define a simple `alignas(16) struct half8 { half x[8]; };`. But CUDA has `__half2` etc. Or we can use type punning with `uint4` (128 bits). Since PyTorch tensors of dtype float16 are aligned to at least 16 bytes for the start of each row? Actually each row starts at a byte offset; for contiguous input (which is ensured), the base pointer is aligned to 16 bytes because PyTorch allocates aligned. However row start alignment may be 16 bytes only if hidden_size*sizeof(scalar_t) is multiple of 16. For hidden_size=4096*2=8192, yes. For arbitrary hidden_size maybe not. But we can compute row pointers and assume alignment of base pointer and row stride multiple of vector size? For contiguous, stride = hidden_size, so if hidden_size % 8 == 0, row is aligned. In vLLM dispatch, they compute vec_size = gcd(16/sizeof(scalar_t), hidden_size). So we can dispatch on compile-time vector size. But to keep things simple, we can just use width=8 for half and assume hidden_size multiple of 8. Since hidden_size=4096, it&#x27;s fine.
+
+- To maximize throughput on H100, use `ld.global.ca`? Not needed.
+
+- Use warp shuffle reduction instead of CUB to reduce shared memory and overhead? CUB is fine. But BlockReduce temp storage is small. On H100, CUB is highly optimized. We can still use it.
+
+- Use `__builtin_assume` or `__restrict__`.
+
+- Choose block size: The original uses max_block_size = num_tokens &lt; 256 ? 1024 : 256. On H100, we have more SMs, but occupancy may still matter. With num_tokens=512, block_size could be 512 or 1024. Let&#x27;s calculate occupancy: For block_size=256, each thread uses maybe ~20 registers? So per block ~5120 registers. One SM has 65536 registers, can run up to 65536/5120 ≈ 12 blocks. Max blocks per SM = 32. So occupancy limited by registers is fine. With 512 tokens, 512/256 = 2 blocks per SM on average (132 SMs). Actually we have 512 blocks total, 132 SMs =&gt; ~3.9 blocks per SM. That&#x27;s okay. With block_size=512, ~2 blocks per SM. With block_size=1024, ~1 block per SM. So smaller blocks give better occupancy but not huge difference.
+
+- However, we can use a grid-stride loop or multiple rows per block? No, each row is independent; we can use one block per row.
+
+- For better latency hiding on H100, can issue multiple groups of threads? Not needed.
+
+- Can use the TMA (Tensor Memory Accelerator) on Hopper? Complex and requires PTX, maybe not beneficial for simple row-wise operations.
+
+- Use `__half2` intrinsics for compute? Since H100 has fast FP16 tensor cores, but this is elementwise, not matmul. However vectorized FP16 arithmetic via `__hfma2` etc can be faster? Actually FP16 ALU throughput is high on H100 (1979 TF). But our kernel is memory bound. Using FP16 compute instead of converting to float may reduce register pressure and increase throughput. However rms norm requires sum of squares and rsqrt in float for accuracy. We can accumulate in float. For elementwise multiply, we can do float compute. That&#x27;s fine.
+
+- Use `#pragma unroll` on loops.
+
+Let&#x27;s write the kernel in plain CUDA C++:
+
+```
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+struct Vec {
+  scalar_t val[VEC_SIZE];
+};
+
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+__global__ void rms_norm_kernel(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const float epsilon,
+    const int num_tokens,
+    const int hidden_size) {
+    // grid: one block per token row
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+
+    const scalar_t* in_row = input + row * hidden_size;
+    scalar_t* out_row = out + row * hidden_size;
+
+    __shared__ float s_variance;
+    float variance = 0.0f;
+
+    using VecT = Vec&lt;scalar_t, VEC_SIZE&gt;;
+    const VecT* in_vec = reinterpret_cast&lt;const VecT*&gt;(in_row);
+    const int num_vec = hidden_size / VEC_SIZE;
+
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = in_vec[i];
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.val[j]);
+            variance += x * x;
+        }
+    }
+
+    // Block reduce
+    using BlockReduce = cub::BlockReduce&lt;float, 1024&gt;;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    variance = BlockReduce(temp_storage).Reduce(variance, cub::Sum(), blockSize);
+
+    if (tid == 0) {
+        s_variance = rsqrtf(variance / static_cast&lt;float&gt;(hidden_size) + epsilon);
+    }
+    __syncthreads();
+
+    const VecT* w_vec = reinterpret_cast&lt;const VecT*&gt;(weight);
+    VecT* out_vec = reinterpret_cast&lt;VecT*&gt;(out_row);
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = in_vec[i];
+        VecT w = w_vec[i];
+        VecT o;
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.val[j]);
+            float wf = static_cast&lt;float&gt;(w.val[j]);
+            o.val[j] = static_cast&lt;scalar_t&gt;(x * s_variance * wf);
+        }
+        out_vec[i] = o;
+    }
+}
+```
+
+But this reads input twice from global memory. Better: load into shared memory. Let&#x27;s try that.
+
+```
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+__global__ void rms_norm_kernel_shared(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const float epsilon,
+    const int num_tokens,
+    const int hidden_size) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+
+    const scalar_t* in_row = input + static_cast&lt;int64_t&gt;(row) * hidden_size;
+    scalar_t* out_row = out + static_cast&lt;int64_t&gt;(row) * hidden_size;
+
+    extern __shared__ char smem[];
+    scalar_t* s_in = reinterpret_cast&lt;scalar_t*&gt;(smem);
+
+    using VecT = Vec&lt;scalar_t, VEC_SIZE&gt;;
+    const VecT* in_vec = reinterpret_cast&lt;const VecT*&gt;(in_row);
+    VecT* s_vec = reinterpret_cast&lt;VecT*&gt;(s_in);
+    const int num_vec = hidden_size / VEC_SIZE;
+
+    // Load row into shared memory
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        s_vec[i] = in_vec[i];
+    }
+    __syncthreads();
+
+    float variance = 0.0f;
+    // Compute variance from shared memory
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = s_vec[i];
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.val[j]);
+            variance += x * x;
+        }
+    }
+
+    using BlockReduce = cub::BlockReduce&lt;float, 1024&gt;;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    variance = BlockReduce(temp_storage).Reduce(variance, cub::Sum(), blockSize);
+
+    __shared__ float s_variance;
+    if (tid == 0) {
+        s_variance = rsqrtf(variance / static_cast&lt;float&gt;(hidden_size) + epsilon);
+    }
+    __syncthreads();
+
+    const VecT* w_vec = reinterpret_cast&lt;const VecT*&gt;(weight);
+    VecT* out_vec = reinterpret_cast&lt;VecT*&gt;(out_row);
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = s_vec[i];
+        VecT w = w_vec[i];
+        VecT o;
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.val[j]);
+            float wf = static_cast&lt;float&gt;(w.val[j]);
+            o.val[j] = static_cast&lt;scalar_t&gt;(x * s_variance * wf);
+        }
+        out_vec[i] = o;
+    }
+}
+```
+
+Shared memory size = hidden_size * sizeof(scalar_t). For float16 and hidden_size=4096 =&gt; 8192 bytes. That&#x27;s fine. For hidden_size up to ~100k, still okay (~200KB). But if hidden_size is larger, exceeds 227KB. We can add a check: if hidden_size*sizeof(scalar_t) &gt; some threshold (e.g., 16384), fall back to two-pass. But for eval hidden_size=4096, it&#x27;s fine.
+
+Can also store weight in shared memory too, but weight is same across rows, L2 caches it well. Not needed.
+
+Should we worry about bank conflicts when using VecT loads from shared memory? If VecT = 16 bytes, shared memory banks are 4 bytes on Hopper? Actually shared memory bank width is 4 bytes on Ampere/Hopper? Wait for Ampere, bank width is 4 bytes (32 banks =&gt; 128 bits per address). For Hopper, bank width is 8 bytes? Actually on Hopper, shared memory is now partitioned differently; each bank is 8 bytes (64 banks of 8 bytes? Or 32 banks of 8 bytes?). Let&#x27;s recall: Ampere (SM80) has 32 banks, 4 bytes each (128 bits total). Hopper (SM90) also has 32 banks, 8 bytes each? Or maybe 64 banks? I think Hopper doubled the bank width to 8 bytes (word size) and maybe kept 32 banks? Let me verify: On Ampere, each bank is 4 bytes wide, 32 banks. On Hopper, shared memory bandwidth increased, each bank is 8 bytes wide, 32 banks. So 16-byte vector load from shared mem will span 2 banks, no conflict if threads access consecutive 16-byte words. Actually if thread i loads 16 bytes at address i*16, then addresses fall into banks: (i*16)/8 = i*2 =&gt; bank = (i*2) % 32. So consecutive threads hit banks 0,2,4,... which is no conflict because each thread uses 2 banks but they are distinct per thread. Good.
+
+So shared memory approach is efficient.
+
+But we must consider that the reference uses 2D/3D/4D support with strides. The I/O contract is 2D [NUM_TOKENS, HIDDEN_SIZE]. The reference might have contiguous out and input. The hidden model likely just does a simple 2D RMSNorm. But we can support arbitrary dimensions by flattening or using row stride. In the original code, they compute input_row based on strides. However, for our inline extension, we can just process input as 2D contiguous using `input.stride(0)` maybe `hidden_size`. Since the evaluation uses contiguous 2D tensor and out is contiguous, we can simplify. But we need to match hidden reference numerically.
+
+If hidden reference uses generic dims, but get_inputs returns x with shape [NUM_TOKENS, HIDDEN_SIZE], that&#x27;s 2D. So simplified is fine.
+
+But to be robust, we can compute row offset as `blockIdx.x * input.stride(0)` for 2D case? Since input is contiguous, stride(0) = hidden_size. We can just pass the leading stride.
+
+But if we want to closely match reference, perhaps the reference uses `torch.nn.functional` or a custom autograd function. No matter, we just need correct output.
+
+Let&#x27;s also think about numerical precision: The reference does RMSNorm in float32 for accumulation. We do the same. Our kernel converts each element to float, squares, accumulates, computes rsqrtf, then multiplies and casts back. That&#x27;s standard.
+
+Potential subtlety: The original kernel uses `input_stride_d2` etc. For 2D, input_row = input + blockIdx.x * input_stride_d2. With contiguous 2D, input_stride_d2 = hidden_size. But if out is contiguous, out_row = out + blockIdx.x * hidden_size. The reference may allocate `out` as contiguous. It does. So fine.
+
+Another subtlety: Weight initialization. The hidden reference may have weight as `torch.ones`. It&#x27;s likely. But could be `torch.randn`? Without a seed, it&#x27;s nondeterministic. Usually weight for RMSNorm in transformers is initialized to ones (since it&#x27;s a scaling factor initialized to 1). I&#x27;ll assume ones.
+
+Also need to pass epsilon. `EPS = 1e-5` given.
+
+Now, about the inline extension: We can write CUDA source as a string and load it with `torch.utils.cpp_extension.load_inline`. The model class will call this in `__init__`.
+
+We need to be careful about the compilation time and the code correctness.
+
+Let&#x27;s draft the C++ inline code:
+
+```
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cub/cub.cuh&gt;
+
+template &lt;typename T, int N&gt;
+struct alignas(sizeof(T) * N) Vec {
+    T val[N];
+};
+
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+__global__ void rms_norm_kernel(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const float epsilon,
+    const int hidden_size) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+
+    const scalar_t* in_row = input + static_cast&lt;int64_t&gt;(row) * hidden_size;
+    scalar_t* out_row = out + static_cast&lt;int64_t&gt;(row) * hidden_size;
+
+    extern __shared__ char smem[];
+    scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);
+
+    using VecT = Vec&lt;scalar_t, VEC_SIZE&gt;;
+    const VecT* in_vec = reinterpret_cast&lt;const VecT*&gt;(in_row);
+    VecT* s_vec = reinterpret_cast&lt;VecT*&gt;(s_row);
+    const int num_vec = hidden_size / VEC_SIZE;
+
+    // Coalesced load into shared mem
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        s_vec[i] = in_vec[i];
+    }
+    __syncthreads();
+
+    float variance = 0.0f;
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = s_vec[i];
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.val[j]);
+            variance += x * x;
+        }
+    }
+
+    using BlockReduce = cub::BlockReduce&lt;float, 1024&gt;;
+    __shared__ typename BlockReduce::TempStorage reduceStore;
+    variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum(), blockSize);
+
+    __shared__ float s_variance;
+    if (tid == 0) {
+        s_variance = rsqrtf(variance / static_cast&lt;float&gt;(hidden_size) + epsilon);
+    }
+    __syncthreads();
+
+    const VecT* w_vec = reinterpret_cast&lt;const VecT*&gt;(weight);
+    VecT* out_vec = reinterpret_cast&lt;VecT*&gt;(out_row);
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = s_vec[i];
+        VecT w = w_vec[i];
+        VecT o;
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.val[j]);
+            float wf = static_cast&lt;float&gt;(w.val[j]);
+            o.val[j] = static_cast&lt;scalar_t&gt;(x * s_variance * wf);
+        }
+        out_vec[i] = o;
+    }
+}
+```
+
+But we need to dispatch for hidden_size not divisible by VEC_SIZE? For eval it&#x27;s 4096, divisible by 8. We can just handle this by requiring hidden_size % VEC_SIZE == 0, else fallback to scalar. But to be safe, we can write a generic kernel that handles tail. However too complex. Simpler: compute `vec_size = 8` for half and assert hidden_size % 8 == 0.
+
+Wait, the user may test with other hidden sizes? The contract only specifies HIDDEN_SIZE=4096 and NUM_TOKENS=512. The hidden evaluation may test with other values. To be robust, we should ideally handle arbitrary hidden sizes.
+
+If we want robustness with tail handling, we can add a scalar loop after the vector loop for remaining elements. Or we can simply make VEC_SIZE dynamic? That&#x27;s impossible for template struct. But we can have a scalar kernel fallback.
+
+Since hidden_size in LLMs is usually a multiple of 8 for FP16. But the evaluation might change HIDDEN_SIZE to something else, maybe multiples of 8. The get_init_inputs returns [HIDDEN_SIZE, EPS], so HIDDEN_SIZE can be changed by evaluator. Typically hidden sizes are multiples of 64 etc.
+
+Let&#x27;s support both vectorized and generic paths: If `hidden_size % 8 == 0` and `sizeof(scalar_t) == 2` (half), launch vectorized kernel with width 8. If `hidden_size % 4 == 0` and `sizeof(scalar_t) == 4`, launch vectorized with width 4. Else launch scalar kernel.
+
+We can write a scalar kernel fallback:
+
+```
+template &lt;typename scalar_t&gt;
+__global__ void rms_norm_kernel_scalar(...) { ... }
+```
+
+But we can also simply dispatch based on alignment. Since the I/O contract uses float16, we can focus on half.
+
+Given we need to output a single code block with model code, and no testing code, we can put everything inside.
+
+One issue: `load_inline` may recompile every time script runs; evaluation may instantiate ModelNew once.
+
+Now, about the architecture: The prompt says the source was hand-tuned for A100 and we must adapt to H100. Mention of `vectorize_read_with_alignment` which may be suboptimal. On H100, we should use 128-bit loads explicitly, not rely on custom generic vectorization.
+
+But the main optimization for H100 is to leverage huge bandwidth by doing 128-bit vector loads and minimizing trips to DRAM (load row once to shared). Also choose block size to maximize occupancy. Let&#x27;s compute recommended block size.
+
+On H100, each SM can have up to 2048 threads (max per SM). With block size 256, each SM can have up to 8 blocks (32 max blocks, but thread limit 2048/256=8). That&#x27;s fine. With 512 tokens, we have 512 blocks. 132 SMs * 8 blocks = 1056 blocks concurrently. We&#x27;re launching 512 blocks, so we can saturate all SMs with 4 blocks each. Occupancy = 8/8 = 100% for blocks of 256 if registers allow. With our kernel registers count: each thread loads a vector `v` in a loop, so some registers. But likely under 64 registers per thread. 256 threads * 64 = 16384 registers per block &lt; 65536. So occupancy is good.
+
+With block size 512, 2048/512=4 blocks per SM. 512 blocks / 132 = ~3.9 blocks per SM. Occupancy maybe 4/4=100%. But register usage may exceed 128 per thread? Let&#x27;s see: each thread holds a few vectors. Probably okay but not as good as 256? Actually both fine.
+
+Let&#x27;s choose block_size = 256 if num_tokens &gt;= 256. Since we have 512 tokens, block 256. For smaller, block 512? Actually we can just fix block_size = 256 for all; with hidden_size=4096, each thread processes 4096/256 = 16 elements, which is two 128-bit loads. That&#x27;s a nice workload. If hidden_size is smaller, we can adjust. But for generality, we could compute block_size as the minimum of next power of 2 of (hidden_size/VEC_SIZE) or 512? Let&#x27;s calculate: `vec_hidden = hidden_size / VEC_SIZE`. `block_size = min(max(128, next_pow2(vec_hidden)), 512)`. Actually if hidden_size=4096 and VEC=8, vec_hidden=512. block_size=512 would give each thread exactly 1 vector. That&#x27;s simple. But we might want more parallelism per block? Actually with 1 vector per thread, we load 512 vectors = 4096 elements. Block size 512. Then we have 512 blocks (one per row). 512*512 = 262144 threads. H100 has 132 SMs * 2048 = 270336 threads max concurrently. That&#x27;s almost fully saturating the GPU! Wait, but blocks are distributed across SMs. Each SM can run up to 2048 threads. With 512 blocks total, and 132 SMs, each SM gets ~3.88 blocks. With block size 512, each block is 512 threads. Maximum blocks per SM is min(32, 2048/512=4) = 4. So we can have 4 blocks per SM. 132*4 = 528 concurrent blocks. We have 512 blocks, so we can keep almost all SMs busy with 4 blocks each. That&#x27;s great.
+
+With block size 256, each SM can run 8 blocks. 132*8 = 1056 concurrent blocks. We have 512 blocks, so each SM runs ~3.9 blocks on average, under-utilizing wave capacity but still fine. Since each block does more work per thread (2 vectors), the total number of thread waves is 512/132 = ~3.9 waves. With block size 512, waves = ceil(512/(132*4)) = 1 wave. Actually with block size 512, all 512 blocks can fit concurrently on 128 SMs (128*4=512). Slightly above 132 SMs? 132*4=528, so yes all 512 blocks can be resident simultaneously! That&#x27;s ideal for latency hiding: all blocks are running concurrently, meaning the reduction sync overhead is overlapped with others? Actually each block runs independently; having all resident means we can switch between them. This is better than block size 256 where we also have enough blocks. But block size 512 reduces the number of parallel reductions within a block? The reduction is over 512 threads, same algorithm. CUB block reduce over 512 threads is fine.
+
+Let&#x27;s choose block size = 512 for num_tokens=512 and hidden_size=4096, vec_size=8. But we need to support generic sizes. Let&#x27;s define block size as `min(vec_hidden, 512)` where vec_hidden = hidden_size / VEC_SIZE. If vec_hidden &lt; 128, maybe use 128. But in general we can set block size = 256 or 512.
+
+Actually we can choose block size = 512 for num_tokens &lt;= something? The original code used 1024 for small num_tokens and 256 for large. The reasoning: for large num_tokens, smaller blocks increase SM concurrency. But on H100, with many SMs, small num_tokens also can use large blocks. Our num_tokens is 512. vec_hidden is also 512. Using block_size=512 is perfect: one iteration in the loop.
+
+Let&#x27;s just set block_size = min(vec_hidden, 512). But if vec_hidden &gt; 512, we loop with stride blockDim.x. That provides good occupancy.
+
+Note: `cub::BlockReduce` template parameter is the maximum block size. We can template it with 1024 and pass actual block size to Reduce. That works. Or we can template with the exact block size if static, but block size is dynamic. The original used `cub::BlockReduce&lt;float, 1024&gt;` and passed blockDim.x. That&#x27;s okay. But CUB may be less efficient if blockDim.x is not the template size. However it works. To maximize performance, we might use a compile-time block size via templating. But since block size depends on hidden_size, we can&#x27;t easily template all possibilities without many instantiations. We can limit to a few power-of-two sizes: 128, 256, 512, 1024. But simpler to just use 1024 template.
+
+Is there a way to avoid CUB and use warp shuffle for better performance? Yes. Since variance is a single scalar per block, we can do a warp shuffle reduction across warps, then a second reduction of warp sums in shared memory. That&#x27;s classic and avoids CUB large shared memory maybe. But CUB is highly optimized. On H100, warp shuffles are very fast. Writing our own reduction reduces compile time and shared memory usage. But CUB is fine. However, CUB&#x27;s `BlockReduce` requires `TempStorage` that is about blockSize * sizeof(float) maybe. For 1024, that&#x27;s 4KB. With 512, maybe 2KB. That&#x27;s fine.
+
+But we can also write a manual reduction using warp shuffles, which might be slightly faster because we avoid CUB overhead. Let&#x27;s consider writing our own. The kernel already uses shared memory for row data (~8KB). Adding 4KB for CUB makes total ~12KB, well under limit. So CUB is fine.
+
+But there is a subtle issue: `cub::BlockReduce` expects all threads in the block to call `Reduce`. In our kernel, some threads may not participate in the loop if `num_vec &lt; blockDim.x`. But we initialize `variance = 0.0f`, and all threads call Reduce with their `variance`. That&#x27;s correct. The `Reduce` with `num_valid` parameter is used if the block is not fully valid? Actually `cub::BlockReduce::Reduce(input, reduction_op, num_valid)` says `num_valid` is the number of threads with valid data, but it&#x27;s only valid for the first `num_valid` threads. Wait the API: `T Reduce(T input, ReductionOp reduction_op, int num_valid)`. It reduces the first `num_valid` items, assuming the rest are not valid? Actually CUB&#x27;s block reduce has an overload `Reduce(T (&amp;inputs)[ITEMS_PER_THREAD], ReductionOp reduction_op)` and another `Reduce(T input, ReductionOp reduction_op)`. The one with `num_valid` is in `BlockReduce`? Let&#x27;s check: In CUB, `BlockReduce` has `Reduce(T input, ReductionOp reduction_op)` for all threads. It also has `Reduce(T input, ReductionOp reduction_op, int num_valid)` where the first `num_valid` threads have valid data. I need to ensure we use the correct one.
+
+Actually the original code uses:
+```
+variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
+```
+This calls the overload where the first `blockDim.x` threads are valid. But what about the template block size 1024, and actual blockDim.x maybe 256? The other threads (256..1023) still need to call Reduce? Yes, all threads in the block must call it. The `num_valid` parameter indicates how many of the first threads have valid data. The threads beyond num_valid still participate in the internal reduction but their data is ignored? I think CUB&#x27;s block reduce with num_valid expects that at least num_valid threads participate. Actually the documentation: &quot;The aggregate is computed across the first num_valid threads.&quot; So the threads with index &gt;= num_valid do not contribute valid values, but they still must call the method? The original code does this. I think it&#x27;s okay.
+
+Alternatively, to avoid any confusion, we can write a manual reduction:
+
+```
+float variance = ...;
+// Warp reduce
+#pragma unroll
+for (int offset = warpSize/2; offset &gt; 0; offset /= 2) {
+    variance += __shfl_down_sync(0xffffffff, variance, offset);
+}
+__shared__ float warp_sums[32]; // max 32 warps per block (1024/32)
+if ((threadIdx.x &amp; 31) == 0) warp_sums[threadIdx.x &gt;&gt; 5] = variance;
+__syncthreads();
+if (threadIdx.x &lt; (blockDim.x &gt;&gt; 5)) {
+    float val = warp_sums[threadIdx.x];
+    #pragma unroll
+    for (int offset = (blockDim.x &gt;&gt; 5)/2; offset &gt; 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    if (threadIdx.x == 0) s_variance = rsqrtf(val / hidden_size + epsilon);
+}
+__syncthreads();
+```
+
+This is robust, uses minimal shared memory (32 floats = 128 bytes), and avoids CUB dependency. But we already included cub. This manual reduction is easy.
+
+Let&#x27;s decide which to use. Since we need to compile quickly and correctly, manual reduction reduces dependence on CUB specifics. But CUB is standard with PyTorch. In inline CUDA, including `&lt;cub/cub.cuh&gt;` is fine because PyTorch includes it. However, on H100, there might be CUB version issues? Not likely.
+
+I&#x27;ll stick with manual reduction to have more control and avoid any CUB template mismatch.
+
+Now, vector loads: We need to define `Vec` for `c10::Half` (or `at::Half`). In PyTorch C++ extension, the scalar type for fp16 is `at::Half`. CUDA uses `__half`. Casting between `at::Half` and `float` works via `static_cast&lt;float&gt;(h)`. We can define `using scalar_t = at::Half;`.
+
+But inside CUDA code, we can use `at::Half` directly. It&#x27;s a struct wrapping `__half`. `static_cast&lt;float&gt;` works.
+
+Better to use `__half` for raw pointers? If we cast `at::Half*` to `__half*`? Actually `at::Half` is a custom struct, but `sizeof(at::Half) == 2` and likely trivially copyable. We can reinterpret_cast to a Vec of at::Half. However alignment of `Vec&lt;at::Half, 8&gt;` must be 16 bytes. We can use `alignas(16) struct VecHalf { at::Half val[8]; };`. Reinterpret casting a pointer to `at::Half*` to `VecHalf*` is okay if the base pointer is aligned to 16 bytes and hidden_size is multiple of 8. In PyTorch, allocated memory is aligned to 256 bytes typically. So it&#x27;s fine.
+
+Alternatively, we can use `__half` explicitly: `reinterpret_cast&lt;__half*&gt;(tensor.data_ptr&lt;at::Half&gt;())` may not be safe due to ABI. But we can just operate on `at::Half` as a 2-byte type. The compiler will generate `ld.global.v4.u32` etc. For arithmetic, we convert to float.
+
+Wait: Does `at::Half` have operators for arithmetic? It has conversion operators to float and from float. So `static_cast&lt;float&gt;(v.val[j])` works. Assigning `out.val[j] = static_cast&lt;at::Half&gt;(x * s_variance * wf);` works.
+
+Potential issue: `reinterpret_cast` from `at::Half*` to a struct with stricter alignment. The standard says it&#x27;s UB if alignment is insufficient. But we check alignment. In CUDA, it&#x27;s commonly done.
+
+Alternatively, we can avoid struct and instead load using `uint4` or `unsigned long long2`. For half, a 128-bit load can be done with `uint4` (4 uints = 128 bits). Then we can reinterpret the bits as an array of half. That&#x27;s also fine. But the custom struct is simpler.
+
+Let&#x27;s define:
+
+```
+template &lt;typename T, int N&gt;
+struct alignas(sizeof(T) * N) Vec {
+    T data[N];
+};
+```
+
+For `T = at::Half`, `N = 8`, alignas(16). Good.
+
+Now, about the kernel launch. We need to decide block size and shared memory size.
+
+For generic hidden_size:
+
+```
+int vec_size = 8; // for half
+if (hidden_size % 8 != 0) vec_size = 1; // fallback to scalar
+int vec_hidden = hidden_size / vec_size;
+int block_size = std::min(vec_hidden, 512);
+block_size = std::max(block_size, 128); // ensure enough parallelism
+// Ensure block_size is power of 2 for reduction? Not strictly needed but helps.
+block_size = 1 &lt;&lt; (32 - __builtin_clz(block_size - 1)); // next power of 2, but min 128.
+if (block_size &gt; 512) block_size = 512;
+```
+
+Wait, we don&#x27;t need power-of-two block size for manual warp reduction. But warp shuffle mask uses `0xffffffff`. For block sizes larger than warpSize, the last warp may not be full. In that case, threads in the last warp still participate but we need to ensure inactive threads in the warp have variance=0. All threads initialize variance=0. So adding 0 is fine. The warp reduction with `__shfl_down_sync(0xffffffff, ...)` works for all threads in the warp, including those beyond num_valid? Actually all 32 threads in the warp execute; if some are beyond `blockDim.x`, they are not part of the block and not launched. Wait blockDim.x is the total threads in a block. If blockDim.x = 300, then there are 10 warps. The last warp has 12 active threads? No, CUDA launches full warps. 300 threads =&gt; 10 warps, but the last warp has only 12 active threads (threads 288-299). Threads 300-319 are not launched. Actually blockDim.x = 300, threads with tid 0..299 are launched. The last warp (tid 288..319) has 12 active lanes. The other lanes are not active. `__shfl_down_sync(0xffffffff, ...)` inside a divergent branch? If we call it unconditionally for all threads, the active threads will sync within the warp; the inactive lanes are not executing because they&#x27;re not part of the block. But the mask 0xffffffff expects all 32 threads of the warp are called? No, the mask specifies which threads participate. But if some threads are not active, `__shfl_down_sync` may have undefined behavior if any thread in the warp is not active and not converged? Actually it&#x27;s okay: `__shfl_down_sync` can be called by all active threads in the warp with a mask covering all active threads; but if some threads in the warp are not active (not launched), they don&#x27;t execute the instruction. However the mask bits corresponding to inactive threads are ignored. So 0xffffffff is safe even if blockDim.x is not multiple of 32, because the non-existent threads are simply not there. But I think it&#x27;s recommended to use `__activemask()` or a mask calculated from `blockDim.x`. Actually for block sizes not multiple of warpSize, using `0xffffffff` is okay because all 32 threads are active in the first 9 warps, and in the last warp only the first 12 threads are active. `__shfl_down_sync` will be executed only by those 12. The mask 0xffffffff includes the other 20 threads which are inactive; the sync ensures they are not waiting because they don&#x27;t execute. However the semantics require that all non-exited threads named in the mask execute the same intrinsic. Since the named threads that are not active don&#x27;t execute at all, it&#x27;s okay? Or does it cause a trap? I recall that `__shfl_sync` with mask covering inactive threads is fine. The mask is used among active threads. So it&#x27;s fine.
+
+Simpler: just make block_size a power of two and &gt;= 32. We can compute:
+
+```
+int block_size = 1;
+while (block_size &lt; vec_hidden &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+if (block_size &lt; 128) block_size = 128;
+```
+
+This ensures block_size is power of two up to 512.
+
+For vec_hidden = 512 (hidden=4096, vec=8), block_size = 512. For hidden=2048, vec_hidden=256, block_size=256.
+
+With block_size = 512, we have exactly one warp of warpsums: 512/32=16 warps. The second reduction across 16 values can be done with a single warp (tid &lt; 16). Good.
+
+Let&#x27;s write the manual reduction carefully:
+
+```
+// Warp-level reduction
+float warp_sum = variance;
+for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+    warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+}
+__shared__ float warp_sums[16]; // enough for 512 threads (16 warps)
+if ((tid &amp; 31) == 0) {
+    warp_sums[tid &gt;&gt; 5] = warp_sum;
+}
+__syncthreads();
+if (tid &lt; 16) {
+    float val = warp_sums[tid];
+    for (int offset = 8; offset &gt; 0; offset &gt;&gt;= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    if (tid == 0) {
+        s_variance = rsqrtf(val / static_cast&lt;float&gt;(hidden_size) + epsilon);
+    }
+}
+__syncthreads();
+```
+
+But we need `warp_sums` size to be `blockDim.x / 32`. For blockDim.x up to 512, max 16. For 1024, 32. We can allocate `__shared__ float warp_sums[32];` to cover all.
+
+Shared memory usage: row data (8192 bytes) + warp_sums (32*4=128 bytes) + maybe s_variance (4 bytes) = ~8324 bytes. Under limit.
+
+But careful: `__shared__ float warp_sums[32];` + `__shared__ float s_variance;` should be declared. The row data is in dynamic shared memory via `extern __shared__ char smem[];`. We can put warp_sums in static shared memory. That&#x27;s fine.
+
+Alternatively, we can put everything in dynamic shared memory: `char smem[];` then allocate first part for row, next part for warp_sums. But using static for warp_sums is easier.
+
+Now, shared memory size argument in kernel launch: `kernel&lt;&lt;&lt;grid, block, hidden_size * sizeof(scalar_t), stream&gt;&gt;&gt;`. Wait dynamic shared memory size is the 3rd argument in `&lt;&lt;&lt; &gt;&gt;&gt;`. If we also have static shared memory (warp_sums), the total shared memory per block = dynamic + static. The max is 227KB. Dynamic = hidden_size * sizeof(scalar_t). For hidden_size=4096 half, 8192 bytes. static = 32*4 + 4 = 132 bytes. Total ~8.3KB. Fine.
+
+But we need to be careful: we declare `extern __shared__ char smem[];` and use it. This requires the launch to specify the size. Yes.
+
+One more thing: The original code supports dimensions &gt; 2. The hidden reference may be just 2D, but to be safe, we should handle multi-dimensional input. However, the I/O contract shows get_inputs returns a 2D tensor. So we can simplify. But perhaps the hidden reference uses `.view(-1, hidden_size)` before calling? Usually yes. In the provided vLLM code, they handle 2/3/4D but eventually call kernel with `num_tokens = input.numel() / hidden_size` and flatten. Actually they don&#x27;t flatten pointers; they pass strides to compute input_row for each block index. The output is contiguous and `out + blockIdx.x * hidden_size`. So they assume output is contiguous and flatten `num_tokens`. So even for 3D/4D, output is contiguous and `blockIdx.x` is the flattened token index. Input can be strided. They compute input row based on strides.
+
+Given the evaluation contract is just 2D contiguous, we can simplify to contiguous and not pass strides. But what if the evaluator permutes dimensions? The I/O contract only says `get_inputs` returns `[x]`, shape [NUM_TOKENS, HIDDEN_SIZE]. So it&#x27;s 2D contiguous. Simplifying is safe.
+
+Thus kernel signature: `(scalar_t* out, const scalar_t* input, const scalar_t* weight, float epsilon, int hidden_size)`. No need for token count.
+
+We also need to ensure the kernel handles all rows: gridDim.x = num_tokens.
+
+Now, launching. Since we compile with `load_inline`, we need to write the C++ code as a string. The Python class will load it.
+
+Let&#x27;s write the Python code:
+
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_source = &#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+template &lt;typename T, int N&gt;
+struct alignas(sizeof(T) * N) Vec {
+    T data[N];
+};
+
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+__global__ void rms_norm_kernel(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    float epsilon,
+    int hidden_size) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+
+    const scalar_t* in_row = input + static_cast&lt;int64_t&gt;(row) * hidden_size;
+    scalar_t* out_row = out + static_cast&lt;int64_t&gt;(row) * hidden_size;
+
+    extern __shared__ char smem[];
+    scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);
+
+    using VecT = Vec&lt;scalar_t, VEC_SIZE&gt;;
+    const VecT* in_vec = reinterpret_cast&lt;const VecT*&gt;(in_row);
+    VecT* s_vec = reinterpret_cast&lt;VecT*&gt;(s_row);
+    const int num_vec = hidden_size / VEC_SIZE;
+
+    // Load entire row into shared memory with vectorized coalesced loads
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        s_vec[i] = in_vec[i];
+    }
+    __syncthreads();
+
+    float variance = 0.0f;
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = s_vec[i];
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.data[j]);
+            variance += x * x;
+        }
+    }
+
+    // Warp reduction
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        variance += __shfl_down_sync(0xffffffff, variance, offset);
+    }
+
+    __shared__ float warp_sums[32];
+    if ((tid &amp; 31) == 0) {
+        warp_sums[tid &gt;&gt; 5] = variance;
+    }
+    __syncthreads();
+
+    __shared__ float s_variance;
+    if (tid &lt; 32) {
+        float val = (tid &lt; (blockSize &gt;&gt; 5)) ? warp_sums[tid] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (tid == 0) {
+            s_variance = rsqrtf(val / static_cast&lt;float&gt;(hidden_size) + epsilon);
+        }
+    }
+    __syncthreads();
+
+    const VecT* w_vec = reinterpret_cast&lt;const VecT*&gt;(weight);
+    VecT* out_vec = reinterpret_cast&lt;VecT*&gt;(out_row);
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = s_vec[i];
+        VecT w = w_vec[i];
+        VecT o;
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.data[j]);
+            float wf = static_cast&lt;float&gt;(w.data[j]);
+            o.data[j] = static_cast&lt;scalar_t&gt;(x * s_variance * wf);
+        }
+        out_vec[i] = o;
+    }
+}
+&#x27;&#x27;&#x27;
+
+# But we need the binding function.
+
+cuda_source = cpp_source + &#x27;&#x27;&#x27;
+void launch_rms_norm(at::Tensor&amp; out, const at::Tensor&amp; input, const at::Tensor&amp; weight, double epsilon) {
+    TORCH_CHECK(input.is_cuda());
+    TORCH_CHECK(out.is_cuda());
+    TORCH_CHECK(weight.is_cuda());
+    int num_tokens = input.size(0);
+    int hidden_size = input.size(1);
+    TORCH_CHECK(hidden_size == weight.size(0));
+    TORCH_CHECK(out.size(0) == num_tokens &amp;&amp; out.size(1) == hidden_size);
+    TORCH_CHECK(input.stride(1) == 1 &amp;&amp; out.stride(1) == 1 &amp;&amp; weight.stride(0) == 1);
+
+    at::cuda::OptionalCUDAGuard guard(input.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // For FP16, use vector size 8 (128 bits)
+    // Hidden size is assumed multiple of 8.
+    int vec_size = 8;
+    if (hidden_size % 8 != 0) {
+        // fallback to scalar path; not expected in this workload
+        // but to be safe we can still handle by adjusting vec_size
+        vec_size = 1;
+    }
+    int vec_hidden = hidden_size / vec_size;
+
+    int block_size = 1;
+    while (block_size &lt; vec_hidden &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+    if (block_size &lt; 128) block_size = 128;
+    dim3 grid(num_tokens);
+    dim3 block(block_size);
+
+    int shared_mem = hidden_size * sizeof(at::Half); // only for half path
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
+        input.scalar_type(), &quot;rms_norm_kernel&quot;, [&amp;] {
+            if constexpr (sizeof(scalar_t) == 2) {
+                rms_norm_kernel&lt;scalar_t, 8&gt;&lt;&lt;&lt;grid, block, shared_mem, stream&gt;&gt;&gt;(
+                    out.data_ptr&lt;scalar_t&gt;(),
+                    input.data_ptr&lt;scalar_t&gt;(),
+                    weight.data_ptr&lt;scalar_t&gt;(),
+                    static_cast&lt;float&gt;(epsilon),
+                    hidden_size);
+            } else {
+                // FP32 fallback: vec_size 4
+                rms_norm_kernel&lt;scalar_t, 4&gt;&lt;&lt;&lt;grid, block, hidden_size * sizeof(scalar_t), stream&gt;&gt;&gt;(
+                    out.data_ptr&lt;scalar_t&gt;(),
+                    input.data_ptr&lt;scalar_t&gt;(),
+                    weight.data_ptr&lt;scalar_t&gt;(),
+                    static_cast&lt;float&gt;(epsilon),
+                    hidden_size);
+            }
+        });
+}
+&#x27;&#x27;&#x27;
+```
+
+But `AT_DISPATCH_FLOATING_TYPES_AND2` expects a lambda that uses `scalar_t`. The `if constexpr` inside lambda works in C++17. But we need to include the proper header. `torch/extension.h` should have it.
+
+However, `load_inline` may require explicit `TORCH_EXTENSION_NAME` or we can define a `pybind11` module to wrap the function.
+
+Actually using `load_inline`, we can write:
+
+```
+source = &#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+... kernel ...
+void launch_rms_norm(at::Tensor out, const at::Tensor input, const at::Tensor weight, double epsilon) {
+   ...
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(&quot;launch_rms_norm&quot;, &amp;launch_rms_norm, &quot;rms norm launch&quot;);
+}
+&#x27;&#x27;&#x27;
+```
+
+Then in Python:
+
+```
+rms_norm_cuda = load_inline(
+    name=&quot;rms_norm_cuda&quot;,
+    cpp_sources=[source],
+    functions=[&#x27;launch_rms_norm&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],
+    extra_cflags=[&#x27;-O3&#x27;],
+)
+```
+
+Wait, `load_inline` signature: `torch.utils.cpp_extension.load_inline(name, cpp_sources, cuda_sources=None, functions=None, extra_cflags=None, extra_cuda_cflags=None, extra_ldflags=None, extra_include_paths=None, build_directory=None, verbose=False, with_cuda=None, is_python_module=True)` Actually load_inline takes `cpp_sources` and optionally `cuda_sources`. If we provide `cuda_sources`, it will compile .cu files. We can include both C++ and CUDA in `cuda_sources`? Or we can put everything in `cuda_sources` because it contains device code. The wrapper function can be in `cpp_sources` or `cuda_sources`. Since the wrapper uses ATen and dispatches, it can be in `cpp_sources` compiled with nvcc? Actually `cpp_sources` are compiled with the host compiler, but they can include `.cu`? Better to put everything in `cuda_sources` and have `cpp_sources` empty. Because we have CUDA device code. But `PYBIND11_MODULE` can be in a `.cu` file compiled with nvcc? I think nvcc can compile host code with pybind11 if configured properly. However `load_inline` may handle it. Let&#x27;s just put the kernel and wrapper in `cuda_sources`. `load_inline` will compile it as a .cu file.
+
+We need to ensure `at::Half` works in `.cu` file. Yes.
+
+Potential issue: We use `reinterpret_cast&lt;const VecT*&gt;(in_row)`. `VecT` has alignment requirement `alignas(sizeof(T)*N)`. If `in_row` is not aligned to 16 bytes, this is UB. For contiguous float16 tensor, `hidden_size` might not be multiple of 8. But we only use `vec_size=8` if hidden_size % 8 == 0 and base pointer aligned. In PyTorch, tensor data_ptr is aligned to 256 bytes typically. Good.
+
+But what about row alignment: `in_row = input + row * hidden_size`. If `hidden_size` is multiple of 8, then row offset is multiple of 8 * sizeof(half) = 16 bytes. Good. So alignment holds.
+
+Thus our vectorized kernel is safe for hidden sizes multiple of 8.
+
+Now, we also need a fallback if hidden_size % 8 != 0. But for evaluation it&#x27;s 4096, so okay. To be robust, we can write a scalar kernel fallback.
+
+Let&#x27;s write a scalar kernel:
+
+```
+template &lt;typename scalar_t&gt;
+__global__ void rms_norm_kernel_scalar(...) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+    const scalar_t* in_row = input + static_cast&lt;int64_t&gt;(row) * hidden_size;
+    scalar_t* out_row = out + static_cast&lt;int64_t&gt;(row) * hidden_size;
+
+    extern __shared__ char smem[];
+    scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);
+
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        s_row[i] = in_row[i];
+    }
+    __syncthreads();
+
+    float variance = 0.0f;
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        float x = static_cast&lt;float&gt;(s_row[i]);
+        variance += x * x;
+    }
+
+    // same reduction
+
+    __shared__ float s_variance;
+    // ...
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        float x = static_cast&lt;float&gt;(s_row[i]);
+        float w = static_cast&lt;float&gt;(weight[i]);
+        out_row[i] = static_cast&lt;scalar_t&gt;(x * s_variance * w);
+    }
+}
+```
+
+But note: using dynamic shared mem for scalar path: shared_mem = hidden_size * sizeof(scalar_t). That&#x27;s fine.
+
+In the wrapper, we can check hidden_size % 8 == 0, then launch vectorized, else scalar.
+
+However, we need to also handle FP32 as fallback. Since the ModelNew will be tested with float16, we can just support half.
+
+But the dispatch macro will be simpler if we just instantiate for `at::Half` and `float`. Let&#x27;s support both, but vector width differs: 8 for half, 4 for float.
+
+Simplify: Let&#x27;s write the kernel templated on scalar_t and VEC_SIZE. Then in launch, we do simple if-check on scalar type:
+
+```
+if (input.scalar_type() == at::ScalarType::Half) {
+    // launch half with 8
+} else if (input.scalar_type() == at::ScalarType::BFloat16) {
+    // maybe 8 too? But sizeof(BFloat16) == 2, same as Half. We can dispatch to same template.
+} else if (input.scalar_type() == at::ScalarType::Float) {
+    // launch float with 4
+}
+```
+
+But using a template lambda with AT_DISPATCH is fine.
+
+Given we want to compile fast, we can avoid heavy dispatch macros and just use a template:
+
+```
+template &lt;int VEC_SIZE&gt;
+void dispatch_vec(at::ScalarType st, ...) {
+   switch(st) {
+     case at::ScalarType::Half: launch&lt;at::Half, VEC_SIZE&gt;(...); break;
+     case at::ScalarType::BFloat16: launch&lt;at::BFloat16, VEC_SIZE&gt;(...); break;
+     case at::ScalarType::Float: launch&lt;float, VEC_SIZE&gt;(...); break;
+   }
+}
+```
+
+But `at::BFloat16` might not have `static_cast&lt;float&gt;` unless defined. It does. In CUDA, `at::BFloat16` has `__bfloat16` ops? It supports conversion to float.
+
+However, writing generic code with `at::BFloat16` and `at::Half` in the same template is okay because both have `.x`? Actually `at::Half` is `struct alignas(2) Half { unsigned short x; ... }`. `at::BFloat16` is similar. `static_cast&lt;float&gt;(v.data[j])` works if `scalar_t` has conversion operator to float. Both have it. So template works for both.
+
+For `float`, `sizeof(float)=4`, `VEC_SIZE=4` gives 16 bytes vector. `static_cast&lt;float&gt;(v.data[j])` for float is identity, fine.
+
+Let&#x27;s implement the dispatch:
+
+```
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+void launch_kernel(... ) { ... call kernel ... }
+
+void launch_rms_norm(at::Tensor&amp; out, const at::Tensor&amp; input, const at::Tensor&amp; weight, double epsilon) {
+    // ...
+    if (hidden_size % 8 == 0 &amp;&amp; (input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16)) {
+        launch_kernel&lt;scalar_t, 8&gt;(...); // But scalar_t is runtime determined
+    } else if (hidden_size % 4 == 0 &amp;&amp; input.scalar_type() == at::ScalarType::Float) {
+        launch_kernel&lt;float, 4&gt;(...);
+    } else {
+        // generic scalar
+        AT_DISPATCH_FLOATING_TYPES_AND2(...){ launch_kernel&lt;scalar_t, 1&gt;(...); }
+    }
+}
+```
+
+This is getting a bit messy in C++. Since we only need to support float16, we can just handle `at::kHalf` directly. The hidden model likely uses `torch.float16` as per `get_inputs()`. So we can avoid generic dispatch and target half.
+
+But to be safe for other types, we can add a simple template function that takes `scalar_t` type. Let&#x27;s write a helper:
+
+```
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+void launch_rms_norm_typed(at::Tensor&amp; out, const at::Tensor&amp; input, const at::Tensor&amp; weight, float epsilon, int hidden_size, int num_tokens, int vec_hidden) {
+    int block_size = 1;
+    while (block_size &lt; vec_hidden &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+    if (block_size &lt; 128) block_size = 128;
+    dim3 grid(num_tokens);
+    dim3 block(block_size);
+    size_t shared_mem = hidden_size * sizeof(scalar_t);
+    rms_norm_kernel&lt;scalar_t, VEC_SIZE&gt;&lt;&lt;&lt;grid, block, shared_mem, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(
+        out.data_ptr&lt;scalar_t&gt;(), input.data_ptr&lt;scalar_t&gt;(), weight.data_ptr&lt;scalar_t&gt;(), epsilon, hidden_size);
+}
+```
+
+Then in `launch_rms_norm`:
+
+```
+if (input.scalar_type() == at::ScalarType::Half &amp;&amp; hidden_size % 8 == 0) {
+    launch_rms_norm_typed&lt;at::Half, 8&gt;(out, input, weight, static_cast&lt;float&gt;(epsilon), hidden_size, num_tokens, hidden_size/8);
+} else if (input.scalar_type() == at::ScalarType::BFloat16 &amp;&amp; hidden_size % 8 == 0) {
+    launch_rms_norm_typed&lt;at::BFloat16, 8&gt;(...);
+} else if (input.scalar_type() == at::ScalarType::Float &amp;&amp; hidden_size % 4 == 0) {
+    launch_rms_norm_typed&lt;float, 4&gt;(...);
+} else {
+    // generic scalar fallback
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), &quot;rms_norm&quot;, [&amp;] {
+        launch_rms_norm_typed&lt;scalar_t, 1&gt;(...);
+    });
+}
+```
+
+This is clean.
+
+Wait, inside `launch_rms_norm_typed`, `out.data_ptr&lt;at::Half&gt;()` works. But for generic lambda in fallback, `scalar_t` is deduced. `launch_rms_norm_typed&lt;scalar_t, 1&gt;` works.
+
+But we need to include `&lt;ATen/ATen.h&gt;` and maybe `&lt;ATen/cuda/CUDAContext.h&gt;`. `torch/extension.h` includes them.
+
+Now, the Python side: ModelNew should be a nn.Module.
+
+```
+class ModelNew(nn.Module):
+    def __init__(self, hidden_size, eps):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float16).cuda())
+        # compile extension
+        self._op = load_inline(...)
+    def forward(self, x):
+        out = torch.empty_like(x)
+        self._op.launch_rms_norm(out, x, self.weight, self.eps)
+        return out
+```
+
+But compiling inside `__init__` means compile will happen when ModelNew is instantiated. The evaluator will instantiate ModelNew once and call forward. That&#x27;s fine.
+
+However, `load_inline` by default caches the compiled library based on source code hash. So repeated runs won&#x27;t recompile if source unchanged. Good.
+
+We need to ensure the source string is correct and compile-able. Potential pitfalls:
+- C++ syntax errors.
+- Missing `#include &lt;cuda_runtime.h&gt;`? Included.
+- `at::cuda::getCurrentCUDAStream()` requires `#include &lt;ATen/cuda/CUDAContext.h&gt;` which is included by `torch/extension.h`. Good.
+- `__shfl_down_sync` requires CC &gt;= 3.0, H100 is SM90.
+- `alignas` with `sizeof(T) * N` where N=8 and T=at::Half (2 bytes) = 16. `alignas(16)` is okay.
+- `reinterpret_cast` to `VecT*` from `at::Half*` might require that `at::Half` is standard layout. It is.
+
+One nuance: `extern __shared__ char smem[];` must be the last shared memory declaration, and there can only be one dynamic shared memory array per kernel. We have static `warp_sums` and `s_variance`. That&#x27;s fine.
+
+Another nuance: In the vectorized kernel, we allocate dynamic shared mem for the row. But the row is stored as `scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);`. Since we also need the row as `VecT* s_vec`, we can compute directly: `VecT* s_vec = reinterpret_cast&lt;VecT*&gt;(smem);`. However, smem is char array, cast to any type is okay. But we must ensure that the size passed to kernel is `hidden_size * sizeof(scalar_t)`. Yes.
+
+But we also need to consider that when we have `warp_sums[32]` static, and also dynamic smem, the compiler offsets static after dynamic? Actually static and dynamic shared memory can&#x27;t alias. The dynamic array starts at offset 0 of shared memory. The static variables are placed after dynamic? Wait the CUDA programming guide says: &quot;All static shared variables are placed before the dynamic shared memory array in the shared memory address space.&quot; Actually I need to confirm: Static shared memory is allocated before dynamic shared memory? Or dynamic is at the beginning? According to CUDA documentation: &quot;The dynamic shared memory array is placed at the end of the shared memory allocation, after all static shared variables.&quot; Wait no: I think the compiler places static shared variables first, then dynamic array after them. But the programmer should not rely on the layout. In any case, we declare `extern __shared__ char smem[];` and use it as the dynamic buffer. The static `warp_sums` and `s_variance` are separate. So total shared memory = static + dynamic. When launching, the third argument to `&lt;&lt;&lt; &gt;&gt;&gt;` is the dynamic size only. The runtime adds the static size. So we are fine.
+
+Thus we don&#x27;t need to do any special offset. Good.
+
+Now, regarding warp reduction: In the second step, we used `if (tid &lt; 32)`. But we only need first `blockSize/32` values. We load `val = (tid &lt; (blockSize &gt;&gt; 5)) ? warp_sums[tid] : 0.0f;`. Then reduce across the warp. However, if `blockSize` is e.g. 128, then `blockSize&gt;&gt;5 = 4`. Threads 4..31 load 0.0f. The warp reduction sums them. That&#x27;s fine.
+
+But note: `warp_sums` is an array of 32 floats. We need to ensure no bank conflicts? Not really.
+
+Potential issue: The `if (tid &lt; 32)` branch means only first warp executes the second reduction. But the `__syncthreads()` before it ensures all warps have written to `warp_sums`. That&#x27;s fine. Then after second reduction, we have `__syncthreads()` to broadcast `s_variance`. Good.
+
+Now, let&#x27;s write the final code carefully.
+
+We also need to set `extra_cuda_cflags` for H100 architecture: `-arch=sm_90`. PyTorch&#x27;s `load_inline` default may compile for multiple archs including sm_80, sm_90. But to be explicit, we can pass `[&#x27;-O3&#x27;, &#x27;-arch=sm_90&#x27;]`? Actually passing `-arch=sm_90` might limit to H100 and fail on A100 compile environment, but the kernel will be compiled on the H100 machine (or compilation node with nvcc supporting sm_90). The evaluation says the GPU is H100. So we can compile for sm_90. However, PyTorch default includes `-gencode arch=compute_80,code=sm_80` and maybe `compute_90`. We should add `-gencode=arch=compute_90,code=sm_90`. But using `extra_cuda_cflags` with `-arch=sm_90` may override or conflict. Safer to append to defaults? `load_inline` uses `torch.utils.cpp_extension.CUDAExtension` defaults. Usually it adds `-gencode` for the current GPU arch. Since the compilation runs on the H100 machine, it should automatically detect sm_90. But maybe not, depending on PyTorch version. To be safe, we can pass `extra_cuda_cflags=[&#x27;-O3&#x27;]`. It should compile for the device&#x27;s arch automatically.
+
+But we can mention `--use_fast_math` for faster rsqrtf etc. However `rsqrtf` is already fast. `--use_fast_math` may slightly affect precision, but tolerance is 1e-2 for fp16, so okay. But I think we can just use `-O3`.
+
+Now, we need to produce one single code block with Python code. The instructions: &quot;Output the new model code, no other text, and NO testing code!&quot; and &quot;Generate real code, NOT pseudocode; the code must compile and be fully functional.&quot; So we output only the Python code block containing ModelNew and any imports.
+
+Let&#x27;s construct the final source string exactly.
+
+One more thought: Should we implement fused_add_rms_norm? The contract only shows single input and no residual, but maybe the reference model internally uses fused_add_rms_norm? Unlikely. The reference is hidden but based on typical RMSNorm: `output = rms_norm(input)`. The vLLM code includes `fused_add_rms_norm` for a specific case where residual is added before norm. Without residual, it&#x27;s just `rms_norm`. Let&#x27;s focus on rms_norm.
+
+However, the provided code has both `rms_norm` and `fused_add_rms_norm`. Maybe the hidden reference uses `fused_add_rms_norm` with residual = zeros? Or maybe `Model` forward does `x = x + something` then norm. But get_inputs only returns [x]. There&#x27;s no second tensor. Unless the reference model internally creates a zero residual? That would be weird. Probably not.
+
+But to be safe, we could implement both kernels and a Python method that matches hidden reference. Since we don&#x27;t know, but the forward signature is `forward(self, x)`, we can just compute `out = rms_norm(x, weight, eps)`. That&#x27;s the standard.
+
+Wait: The hidden evaluation reference matches the I/O contract: `def get_inputs(): x = torch.randn(NUM_TOKENS, HIDDEN_SIZE, dtype=torch.float16).cuda(); return [x]`. So forward receives only x. The output must match hidden reference. Hidden reference might be something like `nn.RMSNorm` or custom. The simplest hidden reference is:
+
+```
+class Model(nn.Module):
+    def __init__(self, hidden_size, eps):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float16))
+        self.eps = eps
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+```
+
+This is the standard. So our custom kernel should compute exactly that. Our implementation does that.
+
+One more nuance: `input` might not be contiguous in the last dimension if passed by evaluator? They construct with `torch.randn(...).cuda()`, which is contiguous. So fine.
+
+Let&#x27;s also consider if `out` is pre-allocated by evaluator or we need to allocate it. In the C++ API we wrote, `out` is a parameter. In Python `forward`, we can allocate `out = torch.empty_like(x)` and pass it. The reference may or may not allocate `out`. Doesn&#x27;t matter; we just return `out`.
+
+Wait, but if the reference modifies `x` in-place? The hidden reference is not shown. If it&#x27;s standard RMSNorm, it returns a new tensor. Our forward returns a new tensor. Good.
+
+Now, one more optimization: We can eliminate the shared memory write-back for row and just load into registers, compute variance, do reduction, then write output using the registers and weight. Since block size = vec_hidden for hidden=4096, each thread handles exactly one vector. So we can hold that vector in a register and avoid shared memory entirely! Let&#x27;s see:
+
+If block_size = vec_hidden = 512 (for hidden=4096, vec=8), each thread i loads `in_vec[i]` directly (no loop). Compute partial variance. Warp reduce + block reduce. Then each thread loads `weight_vec[i]`, multiplies with variance, writes to `out_vec[i]`. Wait, we still need the input vector after reduction. We loaded it once into register `v`. Then after reduction, we still have `v` in register. Then we load `w` from global, compute `v * s_variance * w`, write to out. We don&#x27;t need to load input again! Because each thread processes unique elements and holds them in registers across the reduction.
+
+In the case where block_size &lt; vec_hidden (multiple iterations per thread), we would need to either load again or store in shared memory. But we can choose block_size to be at least vec_hidden / loop_count. For hidden_size=4096, vec_hidden=512, block_size=512 is exactly one iteration. For other common sizes like 8192, vec_hidden=1024. But our max block_size is 512, so we&#x27;d have 2 iterations. We could unroll loop with small arrays in registers? That&#x27;s possible but increases register usage. For 8192, each thread would need to hold 2 vectors (32 bytes). That&#x27;s fine. But we need to know vec_hidden at compile time? Not necessary: we can use a small fixed-size array `VecT local[2]` if vec_hidden &lt;= 2*block_size. But to be generic, we can fallback to shared memory if vec_hidden &gt; block_size.
+
+Simpler: Choose block_size = next power of 2 of min(vec_hidden, 512). If vec_hidden &lt;= block_size, each thread handles 1 vector. If vec_hidden &gt; block_size, use shared memory.
+
+This hybrid could be very fast for the common case (vec_hidden &lt;= 512) without any shared memory for row data. Wait but even if we don&#x27;t need row in shared memory, the reduction still needs `warp_sums` and `s_variance` (static shared). We can allocate dynamic shared = 0? We still need static shared for warp_sums. But we don&#x27;t need dynamic. So we can launch with 0 dynamic shared size when vec_hidden &lt;= block_size, saving shared memory bandwidth and latency.
+
+But when vec_hidden &gt; block_size, we need shared memory to store row. Let&#x27;s implement this.
+
+Example: hidden_size = 4096, vec_size=8, vec_hidden=512. block_size=512. So each thread handles 1 vector.
+
+Kernel for the case where `hidden_size / VEC_SIZE &lt;= blockDim.x`:
+
+```
+const int tid = threadIdx.x;
+const int row = blockIdx.x;
+const scalar_t* in_row = input + row * hidden_size;
+scalar_t* out_row = out + row * hidden_size;
+
+const VecT* in_vec = reinterpret_cast&lt;const VecT*&gt;(in_row);
+const VecT* w_vec = reinterpret_cast&lt;const VecT*&gt;(weight);
+VecT* out_vec = reinterpret_cast&lt;VecT*&gt;(out_row);
+const int num_vec = hidden_size / VEC_SIZE;
+
+VecT v = in_vec[tid];
+float variance = 0.0f;
+#pragma unroll
+for (int j = 0; j &lt; VEC_SIZE; ++j) {
+    float x = static_cast&lt;float&gt;(v.data[j]);
+    variance += x * x;
+}
+// block reduce variance...
+// after reduction, each thread loads w, computes, writes:
+VecT w = w_vec[tid];
+VecT o;
+#pragma unroll
+for (int j = 0; j &lt; VEC_SIZE; ++j) {
+    float x = static_cast&lt;float&gt;(v.data[j]);
+    float wf = static_cast&lt;float&gt;(w.data[j]);
+    o.data[j] = static_cast&lt;scalar_t&gt;(x * s_variance * wf);
+}
+out_vec[tid] = o;
+```
+
+This is extremely fast! Only one load from input per thread, one load from weight, one store to output. Plus reduction overhead. For 512 threads, each warp does a shuffle reduce. Second reduction across 16 warps. Very low overhead.
+
+For the case where `vec_hidden &gt; block_size`, we can use shared memory to store all vectors, as before.
+
+So we can write a single kernel that uses dynamic shared mem conditionally: if `blockSize &lt; num_vec`, allocate and use shared mem; else skip it.
+
+But `extern __shared__ char smem[];` requires dynamic size at launch. If we launch with 0, it&#x27;s fine. In kernel, we can conditionally use it. However, we must be careful not to dereference `smem` when size is 0. We can do:
+
+```
+if (num_vec &gt; blockSize) {
+    scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);
+    VecT* s_vec = reinterpret_cast&lt;VecT*&gt;(s_row);
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        s_vec[i] = in_vec[i];
+    }
+    __syncthreads();
+}
+```
+
+This uses dynamic shared mem only when needed. But we need to allocate at launch: `shared_mem = (num_vec &gt; block_size) ? hidden_size * sizeof(scalar_t) : 0;`.
+
+To read the vector in the variance loop:
+
+```
+VecT v;
+if (num_vec &gt; blockSize) {
+    v = s_vec[i];
+} else {
+    v = in_vec[i];
+}
+```
+
+But wait, if `num_vec &lt;= blockSize`, each thread handles exactly one vector (or zero if tid &gt;= num_vec). We need to guard:
+
+```
+if (tid &lt; num_vec) {
+    v = in_vec[tid];
+    // compute variance
+}
+```
+
+And for write:
+
+```
+if (tid &lt; num_vec) {
+    VecT w = w_vec[tid];
+    // compute and write
+}
+```
+
+For the case `num_vec &gt; blockSize`, we need a loop:
+
+```
+for (int i = tid; i &lt; num_vec; i += blockSize) {
+    VecT v = s_vec[i];
+    // accumulate variance
+}
+```
+
+Then after reduction:
+
+```
+for (int i = tid; i &lt; num_vec; i += blockSize) {
+    VecT v = s_vec[i];
+    VecT w = w_vec[i];
+    // write out
+}
+```
+
+This leads to two separate code paths in the kernel based on compile-time or runtime blockSize/num_vec. To avoid divergence within a warp, we could branch on `if (num_vec &gt; blockSize)` but that&#x27;s uniform across the block (all threads take same path). The compiler may not know it&#x27;s uniform, but it&#x27;s okay.
+
+However, this adds complexity. Let&#x27;s think: For common hidden sizes (4096, 5120, 8192, etc.), vec_hidden might be &gt;512. For 4096, it&#x27;s exactly 512. For 8192, it&#x27;s 1024 &gt; 512. In that case, using shared memory for 8192*2=16KB is fine.
+
+But maybe we can always use shared memory since it&#x27;s fast enough and simpler. The extra shared memory store/load is still within the same SM and much faster than global memory. The main benefit is avoiding second global load. Using shared memory always does that. So the simple shared memory kernel is already a good optimization.
+
+Let&#x27;s keep the shared memory kernel for all cases. Simplicity reduces risk of bugs. The bottleneck is global memory, and we&#x27;ve cut it from 3 loads to 2 loads per element (input once, weight once, output once). That&#x27;s near optimal.
+
+We could also consider loading weight into shared memory to avoid L2 reload? Weight is same across all blocks. L2 caches it well, so negligible.
+
+So the shared memory kernel is fine.
+
+Now, let&#x27;s finalize the kernel.
+
+Potential issue: `out` tensor might not be contiguous or aligned. The evaluator likely returns a freshly allocated `torch.empty_like(x)` which is contiguous and aligned. Good.
+
+One more nuance: The original code uses `rsqrtf` (fast inverse square root). Our code uses `rsqrtf`. Good.
+
+Now, let&#x27;s produce the final C++ code string carefully.
+
+Wait: In the kernel, we have `reinterpret_cast&lt;const VecT*&gt;(in_row)`. For the code to compile, `VecT` must be a struct with `data` array. Let&#x27;s define it outside.
+
+```
+template &lt;typename T, int N&gt;
+struct alignas(sizeof(T) * N) Vec {
+    T data[N];
+};
+```
+
+For `at::Half`, `sizeof(at::Half) == 2`, `alignas(16)`. Good.
+
+But does `alignas` work in CUDA? Yes, C++11 aligns.
+
+Now, inside the kernel:
+
+```
+using VecT = Vec&lt;scalar_t, VEC_SIZE&gt;;
+```
+
+Casting `const scalar_t*` to `const VecT*` requires that the pointer alignment is at least `alignof(VecT)`. The base pointer is aligned to 256 bytes. For each row, `row * hidden_size * sizeof(scalar_t)` alignment depends on `hidden_size * sizeof(scalar_t)`. For half and hidden_size multiple of 8, row offset is multiple of 16 bytes. So alignment is satisfied.
+
+In the wrapper, we can add a check: `TORCH_CHECK((reinterpret_cast&lt;std::uintptr_t&gt;(input.data_ptr()) % (sizeof(scalar_t) * VEC_SIZE)) == 0);` etc. But not needed.
+
+Now, the fallback scalar kernel: Should we implement it? The evaluation will use hidden_size=4096, vec=8. But to be safe. Let&#x27;s implement a scalar kernel with shared memory.
+
+```
+template &lt;typename scalar_t&gt;
+__global__ void rms_norm_kernel_scalar(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    float epsilon,
+    int hidden_size) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+
+    const scalar_t* in_row = input + static_cast&lt;int64_t&gt;(row) * hidden_size;
+    scalar_t* out_row = out + static_cast&lt;int64_t&gt;(row) * hidden_size;
+
+    extern __shared__ char smem[];
+    scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);
+
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        s_row[i] = in_row[i];
+    }
+    __syncthreads();
+
+    float variance = 0.0f;
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        float x = static_cast&lt;float&gt;(s_row[i]);
+        variance += x * x;
+    }
+
+    // same reduction
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        variance += __shfl_down_sync(0xffffffff, variance, offset);
+    }
+    __shared__ float warp_sums[32];
+    if ((tid &amp; 31) == 0) {
+        warp_sums[tid &gt;&gt; 5] = variance;
+    }
+    __syncthreads();
+    __shared__ float s_variance;
+    if (tid &lt; 32) {
+        float val = (tid &lt; (blockSize &gt;&gt; 5)) ? warp_sums[tid] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (tid == 0) {
+            s_variance = rsqrtf(val / static_cast&lt;float&gt;(hidden_size) + epsilon);
+        }
+    }
+    __syncthreads();
+
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        float x = static_cast&lt;float&gt;(s_row[i]);
+        float w = static_cast&lt;float&gt;(weight[i]);
+        out_row[i] = static_cast&lt;scalar_t&gt;(x * s_variance * w);
+    }
+}
+```
+
+This handles any hidden_size.
+
+Now, the wrapper `launch_rms_norm`:
+
+```
+void launch_rms_norm(at::Tensor&amp; out, const at::Tensor&amp; input, const at::Tensor&amp; weight, double epsilon) {
+    int num_tokens = input.size(0);
+    int hidden_size = input.size(1);
+    at::cuda::OptionalCUDAGuard guard(input.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (input.scalar_type() == at::ScalarType::Half &amp;&amp; hidden_size % 8 == 0) {
+        int vec_hidden = hidden_size / 8;
+        int block_size = 1;
+        while (block_size &lt; vec_hidden &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+        if (block_size &lt; 128) block_size = 128;
+        dim3 grid(num_tokens);
+        dim3 block(block_size);
+        size_t shared = hidden_size * sizeof(at::Half);
+        rms_norm_kernel&lt;at::Half, 8&gt;&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(
+            out.data_ptr&lt;at::Half&gt;(), input.data_ptr&lt;at::Half&gt;(), weight.data_ptr&lt;at::Half&gt;(),
+            static_cast&lt;float&gt;(epsilon), hidden_size);
+    } else if (input.scalar_type() == at::ScalarType::BFloat16 &amp;&amp; hidden_size % 8 == 0) {
+        // same with BFloat16
+        int vec_hidden = hidden_size / 8;
+        int block_size = 1;
+        while (block_size &lt; vec_hidden &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+        if (block_size &lt; 128) block_size = 128;
+        dim3 grid(num_tokens);
+        dim3 block(block_size);
+        size_t shared = hidden_size * sizeof(at::BFloat16);
+        rms_norm_kernel&lt;at::BFloat16, 8&gt;&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(
+            out.data_ptr&lt;at::BFloat16&gt;(), input.data_ptr&lt;at::BFloat16&gt;(), weight.data_ptr&lt;at::BFloat16&gt;(),
+            static_cast&lt;float&gt;(epsilon), hidden_size);
+    } else if (input.scalar_type() == at::ScalarType::Float &amp;&amp; hidden_size % 4 == 0) {
+        int vec_hidden = hidden_size / 4;
+        int block_size = 1;
+        while (block_size &lt; vec_hidden &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+        if (block_size &lt; 128) block_size = 128;
+        dim3 grid(num_tokens);
+        dim3 block(block_size);
+        size_t shared = hidden_size * sizeof(float);
+        rms_norm_kernel&lt;float, 4&gt;&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(
+            out.data_ptr&lt;float&gt;(), input.data_ptr&lt;float&gt;(), weight.data_ptr&lt;float&gt;(),
+            static_cast&lt;float&gt;(epsilon), hidden_size);
+    } else {
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half, at::ScalarType::BFloat16,
+            input.scalar_type(), &quot;rms_norm_fallback&quot;, [&amp;] {
+                int block_size = 1;
+                while (block_size &lt; hidden_size &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+                if (block_size &lt; 128) block_size = 128;
+                dim3 grid(num_tokens);
+                dim3 block(block_size);
+                size_t shared = hidden_size * sizeof(scalar_t);
+                rms_norm_kernel_scalar&lt;scalar_t&gt;&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(
+                    out.data_ptr&lt;scalar_t&gt;(), input.data_ptr&lt;scalar_t&gt;(), weight.data_ptr&lt;scalar_t&gt;(),
+                    static_cast&lt;float&gt;(epsilon), hidden_size);
+            });
+    }
+}
+```
+
+Wait, `AT_DISPATCH_FLOATING_TYPES_AND2` includes float and double, but we also want half/bfloat16. The fallback scalar kernel can handle half and bfloat16 too, because we just do scalar access. So using `AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, ...)` is fine.
+
+But note: `AT_DISPATCH_FLOATING_TYPES_AND2` macro may not be available in all PyTorch versions; but it&#x27;s standard. Alternatively, we can use `AT_DISPATCH_FLOATING_TYPES` and handle half separately. But we already handle the common half path above. The fallback is just for edge cases.
+
+Alternatively, we can simplify: only support half. If evaluator passes other type, it fails. But given contract says float16, it&#x27;s safe. However, to be robust, we can keep fallback.
+
+Actually, using `AT_DISPATCH_FLOATING_TYPES_AND2` requires including `&lt;ATen/Dispatch.h&gt;`, which is included by `torch/extension.h`. Good.
+
+One more issue: In the vectorized kernel, we use `reinterpret_cast&lt;const VecT*&gt;(in_row)`. If `in_row` is not aligned to `alignof(VecT)`, undefined behavior. For half with hidden_size multiple of 8, row alignment is 16 bytes. The base pointer is aligned to 256 bytes. So it&#x27;s safe.
+
+However, if `out` is not aligned to 16 bytes for some reason, writing with `out_vec[tid]` may also be UB. But PyTorch tensors are aligned to 256 bytes. Good.
+
+Now, we need to ensure the C++ code compiles with nvcc. Let&#x27;s double-check syntax.
+
+The `Vec` struct:
+
+```
+template &lt;typename T, int N&gt;
+struct alignas(sizeof(T) * N) Vec {
+    T data[N];
+};
+```
+
+In C++, `alignas` applies to the struct. It&#x27;s correct.
+
+Kernel signature:
+
+```
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+__global__ void rms_norm_kernel(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    float epsilon,
+    int hidden_size)
+```
+
+Inside kernel:
+
+```
+const int row = blockIdx.x;
+const int tid = threadIdx.x;
+const int blockSize = blockDim.x;
+
+const scalar_t* in_row = input + static_cast&lt;int64_t&gt;(row) * hidden_size;
+scalar_t* out_row = out + static_cast&lt;int64_t&gt;(row) * hidden_size;
+
+extern __shared__ char smem[];
+scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);
+
+using VecT = Vec&lt;scalar_t, VEC_SIZE&gt;;
+const VecT* in_vec = reinterpret_cast&lt;const VecT*&gt;(in_row);
+VecT* s_vec = reinterpret_cast&lt;VecT*&gt;(s_row);
+const int num_vec = hidden_size / VEC_SIZE;
+
+for (int i = tid; i &lt; num_vec; i += blockSize) {
+    s_vec[i] = in_vec[i];
+}
+__syncthreads();
+
+float variance = 0.0f;
+for (int i = tid; i &lt; num_vec; i += blockSize) {
+    VecT v = s_vec[i];
+    #pragma unroll
+    for (int j = 0; j &lt; VEC_SIZE; ++j) {
+        float x = static_cast&lt;float&gt;(v.data[j]);
+        variance += x * x;
+    }
+}
+
+#pragma unroll
+for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+    variance += __shfl_down_sync(0xffffffff, variance, offset);
+}
+
+__shared__ float warp_sums[32];
+if ((tid &amp; 31) == 0) {
+    warp_sums[tid &gt;&gt; 5] = variance;
+}
+__syncthreads();
+
+__shared__ float s_variance;
+if (tid &lt; 32) {
+    float val = (tid &lt; (blockSize &gt;&gt; 5)) ? warp_sums[tid] : 0.0f;
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    if (tid == 0) {
+        s_variance = rsqrtf(val / static_cast&lt;float&gt;(hidden_size) + epsilon);
+    }
+}
+__syncthreads();
+
+const VecT* w_vec = reinterpret_cast&lt;const VecT*&gt;(weight);
+VecT* out_vec = reinterpret_cast&lt;VecT*&gt;(out_row);
+for (int i = tid; i &lt; num_vec; i += blockSize) {
+    VecT v = s_vec[i];
+    VecT w = w_vec[i];
+    VecT o;
+    #pragma unroll
+    for (int j = 0; j &lt; VEC_SIZE; ++j) {
+        float x = static_cast&lt;float&gt;(v.data[j]);
+        float wf = static_cast&lt;float&gt;(w.data[j]);
+        o.data[j] = static_cast&lt;scalar_t&gt;(x * s_variance * wf);
+    }
+    out_vec[i] = o;
+}
+```
+
+Wait! There&#x27;s a problem: `reinterpret_cast&lt;VecT*&gt;(s_row)` where `s_row` is from dynamic shared memory which is `char` aligned? Actually dynamic shared memory has no alignment guarantee beyond 1? I think `extern __shared__` arrays are aligned to 16 bytes? Or at least to the natural alignment of any type? The CUDA programming guide: &quot;Because the bank size is 32 bits for compute capability 3.x and 5.x, and 64 bits for compute capability 6.x and higher, shared memory accesses of 64-bit or 128-bit words may be split into two or four 32-bit requests respectively.&quot; The `extern __shared__` array is aligned to the alignment requirement of the largest built-in type? Actually the alignment of `char` is 1. But you can cast it to any type as long as you enforce alignment manually. However, the CUDA runtime guarantees that the dynamic shared memory base address is aligned to 16 bytes? Let me recall: I think it&#x27;s aligned to the start of shared memory which is aligned to 16 bytes or more. Actually static shared variables are placed at offset 0. Dynamic shared memory follows static variables. The offset is aligned to the maximum alignment of any statically declared variable? Or maybe to 16 bytes? I&#x27;m not entirely sure, but in practice, `reinterpret_cast` from `extern __shared__ char[]` to 16-byte types like `float4` works as long as dynamic size is allocated. Many CUDA kernels do this without explicit alignment.
+
+To be safe, we can declare the dynamic array as `__shared__ scalar_t smem[];` directly! This ensures alignment for `scalar_t`. We can then also cast to `VecT*`. For `at::Half`, alignment is 2. But `VecT` requires 16. Is `__shared__ at::Half smem[]` aligned to 16? The base address of dynamic shared memory is aligned to the maximum alignment requirement of any variable in the kernel? I think dynamic shared memory arrays are aligned to at least the size of a pointer or something. Actually the compiler doesn&#x27;t know the alignment requirement of a dynamic shared array. For `extern __shared__ T smem[];`, the base is aligned to `alignof(T)`? I think the compiler may align it to the natural alignment of `T`. For `char`, alignof(char)=1. But for `at::Half`, alignof(at::Half)=2. For `float`, alignof(float)=4. For a `Vec&lt;at::Half,8&gt;`, alignof=16. So if we declare `extern __shared__ char smem[];`, alignment is 1. But many people cast to `float4*` and it works because the base address of shared memory is 16-byte aligned in hardware. Actually I believe the hardware ensures that shared memory starts at a 16-byte aligned address. So it&#x27;s safe.
+
+To avoid any doubt, we can declare `extern __shared__ float smem_float[];` and then treat it as raw bytes. But static shared memory must be declared with a type. Wait `extern __shared__` must have array syntax but the type is used for element size? Actually `extern __shared__ char smem[];` is standard. The base is aligned to 16 bytes in current hardware.
+
+Given this is a known pattern, it&#x27;s safe.
+
+Another possible issue: In the warp reduction, `blockSize &gt;&gt; 5` uses `blockDim.x` which is known at runtime. But `blockSize` is a const int variable. That&#x27;s fine.
+
+Wait, `if (tid &lt; (blockSize &gt;&gt; 5))` uses `blockSize`. That&#x27;s a runtime value. In the second reduction, only the first 32 threads execute, and they read warp_sums. Since blockSize may not be a multiple of 32, e.g., 128 -&gt; 4 warps. `blockSize &gt;&gt; 5 = 4`. Threads 0..3 read warp_sums, threads 4..31 read 0.0f. That&#x27;s fine.
+
+Wait, what if blockSize is e.g., 300? But our block_size is always a power of 2 and at least 128, so it&#x27;s multiple of 32. Good.
+
+Now, let&#x27;s also consider if `hidden_size / VEC_SIZE` could be 0 (hidden_size &lt; VEC_SIZE). Then `num_vec = 0`, loops don&#x27;t execute. But block_size is at least 128, and we still try to write `out_vec[tid]` with `i &lt; 0` false. Reduction of variance=0, rsqrt(epsilon). But hidden_size is 0? That doesn&#x27;t happen.
+
+Now, we need to make sure the dispatch chooses correct VEC_SIZE. For float16, VEC_SIZE = 8 (`sizeof(at::Half) * 8 = 16`). For float, VEC_SIZE = 4.
+
+But what about BFloat16? `sizeof(at::BFloat16)` is also 2, so VEC_SIZE = 8 works.
+
+Now, the fallback scalar kernel for BFloat16: `static_cast&lt;float&gt;(s_row[i])` works because `at::BFloat16` has conversion to float operator. Good.
+
+Now, let&#x27;s consider the `load_inline` call. We need to create a python module with a function. We&#x27;ll wrap it:
+
+```
+source = &#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+template &lt;typename T, int N&gt;
+struct alignas(sizeof(T) * N) Vec {
+    T data[N];
+};
+
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+__global__ void rms_norm_kernel(...) { ... }
+
+template &lt;typename scalar_t&gt;
+__global__ void rms_norm_kernel_scalar(...) { ... }
+
+void launch_rms_norm(at::Tensor out, const at::Tensor input, const at::Tensor weight, double epsilon) { ... }
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(&quot;launch_rms_norm&quot;, &amp;launch_rms_norm, &quot;launch rms norm&quot;);
+}
+&#x27;&#x27;&#x27;
+```
+
+Note: In PyTorch C++ extensions, `at::Tensor` is passed by value (it&#x27;s a shared pointer). We can pass by const reference or value. Passing by value is fine.
+
+One more thing: The source string contains `#` characters (for pragma). In Python triple-quoted string, that&#x27;s fine.
+
+Now, the Python class.
+
+```
+class ModelNew(nn.Module):
+    def __init__(self, hidden_size, eps):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float16).cuda())
+        # compile inline cuda
+        cuda_src = r&#x27;&#x27;&#x27;...&#x27;&#x27;&#x27;
+        self._rms_norm = torch.utils.cpp_extension.load_inline(
+            name=&quot;rms_norm_h100&quot;,
+            cpp_sources=[],
+            cuda_sources=[cuda_src],
+            functions=[&quot;launch_rms_norm&quot;],
+            extra_cuda_cflags=[&quot;-O3&quot;],
+            verbose=False,
+        )
+    def forward(self, x):
+        out = torch.empty_like(x)
+        self._rms_norm.launch_rms_norm(out, x, self.weight, self.eps)
+        return out
+```
+
+But we need to be careful: `load_inline` compiles on first call. The compilation takes a few seconds. The evaluator will likely allow it. To avoid potential timeout, we might want to minimize compilation time. But it&#x27;s okay.
+
+Alternative: We could implement the kernel using `torch.compile` or `triton`, but the instructions explicitly say &quot;use custom inlined CUDA operators (e.g. `torch.utils.cpp_extension.load_inline`) for device code.&quot; So we must use inline CUDA.
+
+One more nuance: The evaluator may call `get_inputs()` with non-deterministic values. Our kernel is deterministic.
+
+Potential issue: The reference implementation uses `input.stride(-2)` to process multi-dim. If input is 2D, it&#x27;s contiguous. If hidden model uses `.view(-1, hidden_size)` before calling, our kernel works.
+
+Another nuance: The reference uses `epsilon` as float. We cast to float.
+
+Now, let&#x27;s consider numerical correctness: The variance computation accumulates squares in float. For large hidden_size (4096), the sum could be large (~4096 for values ~1). float32 handles it fine. Then `rsqrtf`. The elementwise multiply uses float. Casting back to half. This matches reference.
+
+One subtlety: The reference uses `input.numel() / hidden_size` as `num_tokens`. In our launch, we use `input.size(0)`. For 2D, same. For higher dim, `size(0)` would be outermost dim, not total tokens. But again, contract is 2D.
+
+What about `weight` shape: hidden_size.
+
+Now, let&#x27;s write the code.
+
+But before outputting, I want to think if there is any way to further optimize for H100 by using asynchronous copy or TMA. Not needed for this simple kernel.
+
+Maybe we should use `__noinline__`? No.
+
+Maybe we should use `__launch_bounds__(512, 2)` to guide register allocation? Not necessary.
+
+Maybe use `__restrict__` on pointers. Yes.
+
+We should also pass `-maxrregcount`? Not needed.
+
+One more thought: The original kernel supports `num_dims=2,3,4`. Our kernel flattens 2D. If the evaluator somehow passes &gt;2D, our `input.size(0)` and `input.size(1)` would be wrong. But `get_inputs()` returns 2D.
+
+If hidden_size is not multiple of 8, our half vectorized path fails. But hidden_size is 4096.
+
+To be robust, we could add a fallback that always works. Let&#x27;s do that. The fallback scalar path is always safe. We can check:
+
+```
+if (input.scalar_type() == at::kHalf &amp;&amp; hidden_size % 8 == 0) { vectorized path }
+else { scalar path }
+```
+
+This ensures correctness for any hidden_size.
+
+But the vectorized path for float32 with hidden_size multiple of 4 could also be used. Since evaluation uses float16, we can just do half.
+
+Now, we need to make sure that inside the dispatch, `out.data_ptr&lt;at::Half&gt;()` compiles. Yes.
+
+Let&#x27;s ensure that we include `pybind11` properly. `torch/extension.h` includes it.
+
+Potential compile error: `at::BFloat16` may not be fully supported in CUDA device code for older PyTorch, but for recent versions it is. Since we target H100, we can assume recent. However, to be safe, we can avoid `BFloat16` in the vectorized path if it&#x27;s tricky. But we might just support `Half` and `Float`. The evaluation uses float16. That&#x27;s enough.
+
+But the scalar fallback uses `AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, ...)`. This requires the macro. Let&#x27;s check the exact macro name. In PyTorch, there is `AT_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)`. It dispatches for floating types (float, double) plus the two specified types. In the lambda, `scalar_t` is the type. This works for `at::Half` and `at::BFloat16` too.
+
+But I want to double-check: Is `AT_DISPATCH_FLOATING_TYPES_AND2` for dispatching to float/double plus two other types? Yes. It includes `at::ScalarType::Float`, `Double`, and the two extras. So if input is `Half`, it will dispatch to `at::Half`. Good.
+
+However, we need to be careful: inside the lambda for `BFloat16`, `static_cast&lt;float&gt;(scalar_t)` works? `at::BFloat16` has `operator float() const`. Yes.
+
+Now, the vectorized kernel: does `at::Half` in device code support `static_cast&lt;float&gt;`? Yes, because `at::Half` has `__half` underneath and conversion operators.
+
+Wait: In device code, `at::Half` is defined as `struct alignas(2) Half { uint16_t x; ... }`. It has `operator __half() const;` and `operator float() const;`. Actually for device code, there may be a specialization. I think `at::Half` works in device code.
+
+Alternatively, we can use `__half` directly by casting pointers: `__half* out_ptr = reinterpret_cast&lt;__half*&gt;(out.data_ptr&lt;at::Half&gt;());`. But `reinterpret_cast` between `at::Half*` and `__half*` is technically UB because they are unrelated types. Many people do it, but it&#x27;s not standard. Better to just use `at::Half` directly.
+
+However, one issue: `reinterpret_cast&lt;const VecT*&gt;(in_row)` where `VecT = Vec&lt;at::Half, 8&gt;`. Does `Vec&lt;at::Half, 8&gt;` have the same layout as plain array of 16 bytes? Yes, because it&#x27;s a standard-layout struct with a single public data member array. `reinterpret_cast` from `at::Half*` to `Vec&lt;at::Half, 8&gt;*` is allowed if alignment is sufficient. It&#x27;s effectively type punning, which is allowed in C++ via `memcpy` but not via `reinterpret_cast` and then read. Actually strict aliasing rule: you cannot access an object through a pointer of an incompatible type. But there is an exception for `char*` and `std::byte*`. Accessing an array of `at::Half` through `Vec&lt;at::Half, 8&gt;*` may violate strict aliasing. However, in practice, compilers (including nvcc) support this for vectorization, and it&#x27;s ubiquitous in CUDA code. So we are fine.
+
+To be even safer, we could use `std::memcpy` to load 16 bytes into `VecT`. But that would generate more instructions and might not vectorize. Using `reinterpret_cast` is standard for this context.
+
+Another thought: Instead of reinterpret_cast, we could load using `uint4` and then `memcpy` to `VecT`. But simple reinterpret_cast is fine.
+
+Now let&#x27;s write the final code. I&#x27;ll produce a clean Python code block.
+
+Before writing, let me verify the entire C++ source string for syntax issues.
+
+full cuda source:
+
+```
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+template &lt;typename T, int N&gt;
+struct alignas(sizeof(T) * N) Vec {
+    T data[N];
+};
+
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+__global__ void rms_norm_kernel(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    float epsilon,
+    int hidden_size) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+
+    const scalar_t* in_row = input + static_cast&lt;int64_t&gt;(row) * hidden_size;
+    scalar_t* out_row = out + static_cast&lt;int64_t&gt;(row) * hidden_size;
+
+    extern __shared__ char smem[];
+    scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);
+
+    using VecT = Vec&lt;scalar_t, VEC_SIZE&gt;;
+    const VecT* in_vec = reinterpret_cast&lt;const VecT*&gt;(in_row);
+    VecT* s_vec = reinterpret_cast&lt;VecT*&gt;(s_row);
+    const int num_vec = hidden_size / VEC_SIZE;
+
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        s_vec[i] = in_vec[i];
+    }
+    __syncthreads();
+
+    float variance = 0.0f;
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = s_vec[i];
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.data[j]);
+            variance += x * x;
+        }
+    }
+
+    // Warp reduce
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        variance += __shfl_down_sync(0xffffffff, variance, offset);
+    }
+
+    __shared__ float warp_sums[32];
+    if ((tid &amp; 31) == 0) {
+        warp_sums[tid &gt;&gt; 5] = variance;
+    }
+    __syncthreads();
+
+    __shared__ float s_variance;
+    if (tid &lt; 32) {
+        float val = (tid &lt; (blockSize &gt;&gt; 5)) ? warp_sums[tid] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (tid == 0) {
+            s_variance = rsqrtf(val / static_cast&lt;float&gt;(hidden_size) + epsilon);
+        }
+    }
+    __syncthreads();
+
+    const VecT* w_vec = reinterpret_cast&lt;const VecT*&gt;(weight);
+    VecT* out_vec = reinterpret_cast&lt;VecT*&gt;(out_row);
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = s_vec[i];
+        VecT w = w_vec[i];
+        VecT o;
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.data[j]);
+            float wf = static_cast&lt;float&gt;(w.data[j]);
+            o.data[j] = static_cast&lt;scalar_t&gt;(x * s_variance * wf);
+        }
+        out_vec[i] = o;
+    }
+}
+
+template &lt;typename scalar_t&gt;
+__global__ void rms_norm_kernel_scalar(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    float epsilon,
+    int hidden_size) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+
+    const scalar_t* in_row = input + static_cast&lt;int64_t&gt;(row) * hidden_size;
+    scalar_t* out_row = out + static_cast&lt;int64_t&gt;(row) * hidden_size;
+
+    extern __shared__ char smem[];
+    scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);
+
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        s_row[i] = in_row[i];
+    }
+    __syncthreads();
+
+    float variance = 0.0f;
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        float x = static_cast&lt;float&gt;(s_row[i]);
+        variance += x * x;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        variance += __shfl_down_sync(0xffffffff, variance, offset);
+    }
+
+    __shared__ float warp_sums[32];
+    if ((tid &amp; 31) == 0) {
+        warp_sums[tid &gt;&gt; 5] = variance;
+    }
+    __syncthreads();
+
+    __shared__ float s_variance;
+    if (tid &lt; 32) {
+        float val = (tid &lt; (blockSize &gt;&gt; 5)) ? warp_sums[tid] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (tid == 0) {
+            s_variance = rsqrtf(val / static_cast&lt;float&gt;(hidden_size) + epsilon);
+        }
+    }
+    __syncthreads();
+
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        float x = static_cast&lt;float&gt;(s_row[i]);
+        float w = static_cast&lt;float&gt;(weight[i]);
+        out_row[i] = static_cast&lt;scalar_t&gt;(x * s_variance * w);
+    }
+}
+
+void launch_rms_norm(at::Tensor out, const at::Tensor input, const at::Tensor weight, double epsilon) {
+    int num_tokens = input.size(0);
+    int hidden_size = input.size(1);
+    at::cuda::OptionalCUDAGuard guard(input.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (input.scalar_type() == at::ScalarType::Half &amp;&amp; hidden_size % 8 == 0) {
+        int vec_hidden = hidden_size / 8;
+        int block_size = 1;
+        while (block_size &lt; vec_hidden &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+        if (block_size &lt; 128) block_size = 128;
+        dim3 grid(num_tokens);
+        dim3 block(block_size);
+        size_t shared = hidden_size * sizeof(at::Half);
+        rms_norm_kernel&lt;at::Half, 8&gt;&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(
+            out.data_ptr&lt;at::Half&gt;(),
+            input.data_ptr&lt;at::Half&gt;(),
+            weight.data_ptr&lt;at::Half&gt;(),
+            static_cast&lt;float&gt;(epsilon),
+            hidden_size);
+    } else {
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half, at::ScalarType::BFloat16,
+            input.scalar_type(), &quot;rms_norm_fallback&quot;, [&amp;] {
+                int block_size = 1;
+                while (block_size &lt; hidden_size &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+                if (block_size &lt; 128) block_size = 128;
+                dim3 grid(num_tokens);
+                dim3 block(block_size);
+                size_t shared = hidden_size * sizeof(scalar_t);
+                rms_norm_kernel_scalar&lt;scalar_t&gt;&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(
+                    out.data_ptr&lt;scalar_t&gt;(),
+                    input.data_ptr&lt;scalar_t&gt;(),
+                    weight.data_ptr&lt;scalar_t&gt;(),
+                    static_cast&lt;float&gt;(epsilon),
+                    hidden_size);
+            });
+    }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(&quot;launch_rms_norm&quot;, &amp;launch_rms_norm, &quot;launch rms norm kernel&quot;);
+}
+```
+
+Wait, there is a compile issue: `at::ScalarType::Half` is a valid enum. `at::Half` is the C++ type. In the `if` branch, `rms_norm_kernel&lt;at::Half, 8&gt;` is fine. But inside the `else` branch, `AT_DISPATCH_FLOATING_TYPES_AND2` macro may not be available, and the lambda uses `scalar_t`. Let&#x27;s verify the macro signature.
+
+In PyTorch, the macro is:
+
+```
+#define AT_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE1_NAME, SCALARTYPE2, SCALARTYPE2_NAME, ...)
+```
+
+Wait, no. Actually there are two versions: one with 2 extra types and one with 2 extra types and names? Let&#x27;s check memory.
+
+The standard macros are:
+- `AT_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...)`
+- `AT_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)`
+
+I think it&#x27;s `AT_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)`. Let me verify from PyTorch source:
+
+`#define AT_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)` yes.
+
+So the call should be:
+
+```
+AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), &quot;rms_norm_fallback&quot;, [&amp;] {
+    ...
+});
+```
+
+But wait, `input.scalar_type()` may be `Half` or `BFloat16` or `Float` or `Double`. The macro dispatches to `scalar_t` accordingly. In our `else`, we handle anything else, including Float and Double. But if input is `Half` and hidden_size % 8 != 0, it&#x27;ll go to fallback. That&#x27;s okay.
+
+Actually, for `Float` and hidden_size % 4 == 0, we could use vectorized path too. But for simplicity, fallback is fine. The evaluation uses float16.
+
+Wait, but `AT_DISPATCH_FLOATING_TYPES_AND2` dispatches only for floating types (Float, Double) plus the two extra types. So if the input type is e.g. `Int`, it won&#x27;t dispatch and may throw an error. But our input is float16. Good.
+
+One more thing: The macro requires the fourth argument to be a string literal (name). We used `&quot;rms_norm_fallback&quot;`. Good.
+
+Potential macro name conflict: In some versions, it&#x27;s `AT_DISPATCH_FLOATING_TYPES_AND2`. If that fails, we could just use `AT_DISPATCH_FLOATING_TYPES` and then manually handle half in the fallback. But since the fallback also handles `Half`, we can just always go to the fallback for anything except the vectorized half path. That means we don&#x27;t need `BFloat16` dispatch. We can just use `AT_DISPATCH_FLOATING_TYPES` and inside the lambda, `scalar_t` will be float or double. But if input is half and hidden_size % 8 != 0, it&#x27;ll throw because `AT_DISPATCH_FLOATING_TYPES` doesn&#x27;t cover half.
+
+So better to just write our own simple switch for the fallback to avoid macro complexity.
+
+```
+switch (input.scalar_type()) {
+  case at::ScalarType::Half:
+    launch_scalar&lt;at::Half&gt;(...);
+    break;
+  case at::ScalarType::BFloat16:
+    launch_scalar&lt;at::BFloat16&gt;(...);
+    break;
+  case at::ScalarType::Float:
+    launch_scalar&lt;float&gt;(...);
+    break;
+  case at::ScalarType::Double:
+    launch_scalar&lt;double&gt;(...);
+    break;
+  default:
+    AT_ERROR(&quot;Unsupported type&quot;);
+}
+```
+
+This is cleaner and avoids macro issues. But we need to define `launch_scalar` as a template function.
+
+Given that we only need to support half, we can simplify the fallback to only handle half:
+
+```
+else {
+    int block_size = 1;
+    while (block_size &lt; hidden_size &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+    if (block_size &lt; 128) block_size = 128;
+    dim3 grid(num_tokens);
+    dim3 block(block_size);
+    size_t shared = hidden_size * sizeof(at::Half);
+    rms_norm_kernel_scalar&lt;at::Half&gt;&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(
+        out.data_ptr&lt;at::Half&gt;(),
+        input.data_ptr&lt;at::Half&gt;(),
+        weight.data_ptr&lt;at::Half&gt;(),
+        static_cast&lt;float&gt;(epsilon),
+        hidden_size);
+}
+```
+
+But what if the evaluator uses fp32? The contract says `torch.float16`. So no.
+
+However, what if evaluator uses bfloat16? Unlikely.
+
+To be safe, I&#x27;ll implement a simple template helper for scalar fallback and switch on scalar type.
+
+```
+template &lt;typename scalar_t&gt;
+void launch_scalar(at::Tensor&amp; out, const at::Tensor&amp; input, const at::Tensor&amp; weight, float epsilon, int num_tokens, int hidden_size, cudaStream_t stream) {
+    int block_size = 1;
+    while (block_size &lt; hidden_size &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+    if (block_size &lt; 128) block_size = 128;
+    dim3 grid(num_tokens);
+    dim3 block(block_size);
+    size_t shared = hidden_size * sizeof(scalar_t);
+    rms_norm_kernel_scalar&lt;scalar_t&gt;&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(
+        out.data_ptr&lt;scalar_t&gt;(), input.data_ptr&lt;scalar_t&gt;(), weight.data_ptr&lt;scalar_t&gt;(), epsilon, hidden_size);
+}
+
+// in launch_rms_norm:
+if (input.scalar_type() == at::ScalarType::Half &amp;&amp; hidden_size % 8 == 0) { ... }
+else {
+    switch (input.scalar_type()) {
+        case at::ScalarType::Half: launch_scalar&lt;at::Half&gt;(...); break;
+        case at::ScalarType::BFloat16: launch_scalar&lt;at::BFloat16&gt;(...); break;
+        case at::ScalarType::Float: launch_scalar&lt;float&gt;(...); break;
+        case at::ScalarType::Double: launch_scalar&lt;double&gt;(...); break;
+        default: TORCH_CHECK(false, &quot;Unsupported scalar type&quot;);
+    }
+}
+```
+
+This is robust and avoids dispatch macros.
+
+Let&#x27;s write that.
+
+One more detail: `TORCH_CHECK` vs `AT_ERROR`. `TORCH_CHECK` is fine.
+
+Now, about `at::BFloat16`: `sizeof(at::BFloat16)` is 2, but launching the scalar kernel with `block_size` based on `hidden_size`. For BFloat16, `sizeof` is 2, dynamic shared = hidden_size*2. Fine.
+
+Now, the kernel names: `rms_norm_kernel` and `rms_norm_kernel_scalar`.
+
+One more subtle issue: In the scalar kernel, the loop `for (int i = tid; i &lt; hidden_size; i += blockSize)` may have bank conflicts when accessing shared memory if `sizeof(scalar_t)` is small and blockSize not stride-friendly. But for reading/writing, it&#x27;s okay because each thread accesses its own index. Shared memory bank conflicts occur when multiple threads in the same warp access the same bank. For half, each access is 2 bytes. Banks on Hopper are 8 bytes wide. So consecutive threads access consecutive 2-byte elements, which map to banks 0,0,0,0? Wait bank width is 8 bytes, 32 banks. So thread 0 accesses byte 0-1 (bank 0), thread 1 accesses byte 2-3 (bank 0), thread 2 accesses byte 4-5 (bank 0), thread 3 accesses byte 6-7 (bank 0). So threads 0-3 all access bank 0! That&#x27;s a 4-way bank conflict for half data in shared memory on Hopper (bank width 8 bytes). For 32 threads in a warp, they will access 8 banks (each bank shared by 4 threads). So 4-way bank conflict. That&#x27;s not terrible. For vectorized loads of `Vec&lt;at::Half,8&gt;` (16 bytes), each thread loads 16 bytes = 2 banks (since bank width 8). Consecutive threads load consecutive 16-byte blocks, so thread 0 -&gt; banks 0,1; thread 1 -&gt; banks 2,3; etc. No conflict! So vectorized shared memory loads/stores are bank-conflict-free. Good.
+
+For scalar loads/stores, there will be 4-way conflicts. But scalar path is a fallback. Could we improve it by loading as `uint2` or `uint4` and extracting? That would be a vectorized scalar kernel? But fallback is not used in eval.
+
+Still, we should note that in the vectorized kernel, the shared memory accesses are vectorized (16 bytes per thread), which is bank-conflict-free on Hopper.
+
+In the variance loop and output loop, we also access `s_vec[i]` with vector size 16 bytes. That is conflict-free.
+
+Great.
+
+Now, we should ensure that the compiler actually generates vectorized loads for `s_vec[i] = in_vec[i]`. Since `VecT` is 16 bytes, the compiler will generate a single 128-bit load/store. Good.
+
+One more potential issue: `out_vec[i] = o;` writes 16 bytes per thread, coalesced, good.
+
+Now, block_size calculation: For hidden_size=4096, vec_hidden=512. `while (block_size &lt; 512 &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;` Starting from 1: 1,2,4,8,16,32,64,128,256,512. So block_size=512. Good.
+
+For hidden_size=8192, vec_hidden=1024. `while (block_size &lt; 1024 &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;` block_size stops at 512. So block_size=512. Loop in kernel will iterate twice. Good.
+
+For hidden_size=256, vec_hidden=32. `while (block_size &lt; 32 &amp;&amp; block_size &lt; 512)` -&gt; block_size=32. Then `if (block_size &lt; 128) block_size = 128;` So block_size=128. Each thread handles 1 vector (8 elements) and 3 warps don&#x27;t have work. Wait `num_vec=32`, block_size=128. Threads 0..31 load vectors, threads 32..127 don&#x27;t. The loop: `for (int i=tid; i&lt;num_vec; i+=blockSize)`. For tid 0..31, i=0..31. For tid 32..127, i &gt;= 32, skip. `__syncthreads()` works. In variance loop, threads 32..127 skip, variance remains 0. Reduction: warp shuffle for all threads, but threads with no data contribute 0. That&#x27;s fine. However, in second step, `warp_sums[tid&gt;&gt;5] = variance;` for tid 32..127, these warps (warp 1..3) write their variance=0. In the second reduction, `tid &lt; (blockSize&gt;&gt;5)` means tid &lt; 4. Threads 0..3 read warp_sums. That&#x27;s fine.
+
+But wait, accessing `s_vec[i]` for tid &gt; num_vec is not done due to condition `i &lt; num_vec`. Good.
+
+Then output write: same.
+
+So block_size can be larger than num_vec. That&#x27;s fine.
+
+But what if `num_vec` is 0? `hidden_size &lt; VEC_SIZE`. We said hidden_size is at least e.g., 32. But just in case, `num_vec = hidden_size / VEC_SIZE` integer division. If hidden_size=4 (for half, VEC_SIZE=8), num_vec=0. Then loops skip. Reduction of variance=0. rsqrt(epsilon). Output writes skip. That means output is unchanged (garbage if not initialized). But hidden_size won&#x27;t be that small.
+
+Now, one more thing: Because we use `reinterpret_cast&lt;const VecT*&gt;(weight)`, we are assuming weight is aligned to 16 bytes and `hidden_size` is multiple of 8. The base pointer of weight is aligned to 256 bytes. Good.
+
+But what about the `input` pointer alignment for each row? `input + row * hidden_size`. Base pointer is aligned to 256 bytes. `row * hidden_size * sizeof(scalar_t)` must be multiple of 16. For `hidden_size` multiple of 8 and `sizeof(half)=2`, row offset is multiple of 16. Good.
+
+Now, let&#x27;s double-check the `launch_rms_norm` function signature. It passes `at::Tensor out` by value (not reference). That&#x27;s okay. But we need to call `.data_ptr&lt;at::Half&gt;()`. For a const reference, `const at::Tensor&amp;` is fine. For value, it&#x27;s also fine. We&#x27;ll use `at::Tensor&amp; out` to be clear.
+
+But pybind11 binding with `m.def(&quot;launch_rms_norm&quot;, &amp;launch_rms_norm, ...)` expects the signature to match exactly. `at::Tensor&amp;` might cause trouble with pybind11 because at::Tensor is not copyable by reference? Actually pybind11 handles references by holding the Python object. For mutable references, it might require `py::arg().noconvert()`. But passing tensors by value is standard in PyTorch C++ extensions. Let&#x27;s pass by non-const reference? Actually many examples use `torch::Tensor` (which is `at::Tensor`) by value:
+
+```
+void launch_rms_norm(torch::Tensor out, torch::Tensor input, torch::Tensor weight, double epsilon)
+```
+
+This is safer for pybind11. In the function, we can still modify `out` via its data pointer.
+
+So signature: `void launch_rms_norm(torch::Tensor out, torch::Tensor input, torch::Tensor weight, double epsilon)`.
+
+Using `torch::Tensor` alias is fine.
+
+Now, including headers: `#include &lt;torch/extension.h&gt;` provides `torch::Tensor`. Good.
+
+One more thing: We should use `at::cuda::getCurrentCUDAStream()` which requires `#include &lt;ATen/cuda/CUDAContext.h&gt;`. `torch/extension.h` includes it? Let&#x27;s be safe and include it explicitly.
+
+```
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+```
+
+Also `int64_t` requires `&lt;cstdint&gt;`, but `&lt;torch/extension.h&gt;` likely includes it.
+
+Now, the code block. Let&#x27;s assemble.
+
+One more thought: The evaluator may use `torch.cuda.synchronize()` or not. Our kernel launches asynchronously. That&#x27;s fine.
+
+Is there a risk of `load_inline` name collision? We can name it `rms_norm_h100_optimized`. It&#x27;s unique.
+
+Let&#x27;s produce the final Python code.
+
+I&#x27;ll include imports: `import torch`, `import torch.nn as nn`, `from torch.utils.cpp_extension import load_inline`.
+
+Let&#x27;s write the source string inside triple quotes.
+
+Make sure to escape backslashes? Triple quotes handle everything except triple quotes. We&#x27;ll use `r&#x27;&#x27;&#x27;...&#x27;&#x27;&#x27;` for raw string.
+
+In the C++ string, `#pragma unroll` contains `#`. In a raw string, `#` is fine.
+
+We need to ensure there are no Python indentation issues inside the triple-quoted string.
+
+Let&#x27;s assemble the final answer.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SOURCE = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+// 128-bit aligned vector type for coalesced global/shared memory access
+template &lt;typename T, int N&gt;
+struct alignas(sizeof(T) * N) Vec {
+    T data[N];
+};
+
+// Vectorized RMSNorm kernel: loads the full row into shared memory once,
+// computes variance with warp-shuffle reductions, then writes the scaled output.
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+__global__ void rms_norm_kernel(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    float epsilon,
+    int hidden_size) {
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+
+    const scalar_t* in_row = input + static_cast&lt;int64_t&gt;(row) * hidden_size;
+    scalar_t* out_row = out + static_cast&lt;int64_t&gt;(row) * hidden_size;
+
+    extern __shared__ char smem[];
+    scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);
+
+    using VecT = Vec&lt;scalar_t, VEC_SIZE&gt;;
+    const VecT* in_vec = reinterpret_cast&lt;const VecT*&gt;(in_row);
+    VecT* s_vec = reinterpret_cast&lt;VecT*&gt;(s_row);
+    const int num_vec = hidden_size / VEC_SIZE;
+
+    // 1. Coalesced vectorized load into shared memory (single global read of the row)
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        s_vec[i] = in_vec[i];
+    }
+    __syncthreads();
+
+    // 2. Per-thread partial variance
+    float variance = 0.0f;
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = s_vec[i];
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.data[j]);
+            variance += x * x;
+        }
+    }
+
+    // 3. Block-wide reduction via warp shuffles
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        variance += __shfl_down_sync(0xffffffff, variance, offset);
+    }
+
+    __shared__ float warp_sums[32];
+    if ((tid &amp; 31) == 0) {
+        warp_sums[tid &gt;&gt; 5] = variance;
+    }
+    __syncthreads();
+
+    __shared__ float s_variance;
+    if (tid &lt; 32) {
+        float val = (tid &lt; (blockSize &gt;&gt; 5)) ? warp_sums[tid] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (tid == 0) {
+            s_variance = rsqrtf(val / static_cast&lt;float&gt;(hidden_size) + epsilon);
+        }
+    }
+    __syncthreads();
+
+    // 4. Vectorized write output using the cached row + global weight
+    const VecT* w_vec = reinterpret_cast&lt;const VecT*&gt;(weight);
+    VecT* out_vec = reinterpret_cast&lt;VecT*&gt;(out_row);
+    for (int i = tid; i &lt; num_vec; i += blockSize) {
+        VecT v = s_vec[i];
+        VecT w = w_vec[i];
+        VecT o;
+        #pragma unroll
+        for (int j = 0; j &lt; VEC_SIZE; ++j) {
+            float x = static_cast&lt;float&gt;(v.data[j]);
+            float wf = static_cast&lt;float&gt;(w.data[j]);
+            o.data[j] = static_cast&lt;scalar_t&gt;(x * s_variance * wf);
+        }
+        out_vec[i] = o;
+    }
+}
+
+// Scalar fallback for arbitrary hidden sizes / types
+template &lt;typename scalar_t&gt;
+__global__ void rms_norm_kernel_scalar(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    float epsilon,
+    int hidden_size) {
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int blockSize = blockDim.x;
+
+    const scalar_t* in_row = input + static_cast&lt;int64_t&gt;(row) * hidden_size;
+    scalar_t* out_row = out + static_cast&lt;int64_t&gt;(row) * hidden_size;
+
+    extern __shared__ char smem[];
+    scalar_t* s_row = reinterpret_cast&lt;scalar_t*&gt;(smem);
+
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        s_row[i] = in_row[i];
+    }
+    __syncthreads();
+
+    float variance = 0.0f;
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        float x = static_cast&lt;float&gt;(s_row[i]);
+        variance += x * x;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        variance += __shfl_down_sync(0xffffffff, variance, offset);
+    }
+
+    __shared__ float warp_sums[32];
+    if ((tid &amp; 31) == 0) {
+        warp_sums[tid &gt;&gt; 5] = variance;
+    }
+    __syncthreads();
+
+    __shared__ float s_variance;
+    if (tid &lt; 32) {
+        float val = (tid &lt; (blockSize &gt;&gt; 5)) ? warp_sums[tid] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (tid == 0) {
+            s_variance = rsqrtf(val / static_cast&lt;float&gt;(hidden_size) + epsilon);
+        }
+    }
+    __syncthreads();
+
+    for (int i = tid; i &lt; hidden_size; i += blockSize) {
+        float x = static_cast&lt;float&gt;(s_row[i]);
+        float w = static_cast&lt;float&gt;(weight[i]);
+        out_row[i] = static_cast&lt;scalar_t&gt;(x * s_variance * w);
+    }
+}
+
+template &lt;typename scalar_t&gt;
+static void launch_scalar(
+    torch::Tensor out,
+    torch::Tensor input,
+    torch::Tensor weight,
+    float epsilon,
+    int num_tokens,
+    int hidden_size,
+    cudaStream_t stream) {
+
+    int block_size = 1;
+    while (block_size &lt; hidden_size &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+    if (block_size &lt; 128) block_size = 128;
+
+    dim3 grid(num_tokens);
+    dim3 block(block_size);
+    size_t shared = hidden_size * sizeof(scalar_t);
+
+    rms_norm_kernel_scalar&lt;scalar_t&gt;&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(
+        out.data_ptr&lt;scalar_t&gt;(),
+        input.data_ptr&lt;scalar_t&gt;(),
+        weight.data_ptr&lt;scalar_t&gt;(),
+        epsilon,
+        hidden_size);
+}
+
+void launch_rms_norm(torch::Tensor out, torch::Tensor input, torch::Tensor weight, double epsilon) {
+    int num_tokens = input.size(0);
+    int hidden_size = input.size(1);
+
+    at::cuda::OptionalCUDAGuard guard(input.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Optimized vectorized path for FP16 (and BF16) when hidden_size is a multiple of 8
+    if (input.scalar_type() == at::ScalarType::Half &amp;&amp; hidden_size % 8 == 0) {
+        int vec_hidden = hidden_size / 8;
+        int block_size = 1;
+        while (block_size &lt; vec_hidden &amp;&amp; block_size &lt; 512) block_size &lt;&lt;= 1;
+        if (block_size &lt; 128) block_size = 128;
+
+        dim3 grid(num_tokens);
+        dim3 block(block_size);
+        size_t shared = hidden_size * sizeof(at::Half);
+
+        rms_norm_kernel&lt;at::Half, 8&gt;&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(
+            out.data_ptr&lt;at::Half&gt;(),
+            input.data_ptr&lt;at::Half&gt;(),
+            weight.data_ptr&lt;at::Half&gt;(),
+            static_cast&lt;float&gt;(epsilon),
+            hidden_size);
+    } else {
+        // Generic scalar fallback
+        switch (input.scalar_type()) {
+            case at::ScalarType::Half:
+                launch_scalar&lt;at::Half&gt;(out, input, weight, static_cast&lt;float&gt;(epsilon), num_tokens, hidden_size, stream);
+                break;
+            case at::ScalarType::BFloat16:
+                launch_scalar&lt;at::BFloat16&gt;(out, input, weight, static_cast&lt;float&gt;(epsilon), num_tokens, hidden_size, stream);
+                break;
+            case at::ScalarType::Float:
+                launch_scalar&lt;float&gt;(out, input, weight, static_cast&lt;float&gt;(epsilon), num_tokens, hidden_size, stream);
+                break;
+            case at::ScalarType::Double:
+                launch_scalar&lt;double&gt;(out, input, weight, static_cast&lt;float&gt;(epsilon), num_tokens, hidden_size, stream);
+                break;
+            default:
+                TORCH_CHECK(false, &quot;rms_norm: unsupported dtype&quot;);
+        }
+    }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(&quot;launch_rms_norm&quot;, &amp;launch_rms_norm, &quot;launch rms norm kernel&quot;);
+}
+&#x27;&#x27;&#x27;
+
+class ModelNew(nn.Module):
+    def __init__(self, hidden_size, eps):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        # RMSNorm weight is conventionally initialized to ones
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float16).cuda())
+
+        self._rms_cuda = load_inline(
+            name=&quot;rms_norm_h100&quot;,
+            cpp_sources=[],
+            cuda_sources=[_CUDA_SOURCE],
+            functions=[&quot;launch_rms_norm&quot;],
+            extra_cuda_cflags=[&quot;-O3&quot;],
+            verbose=False,
+        )
+
+    def forward(self, x):
+        out = torch.empty_like(x)
+        self._rms_cuda.launch_rms_norm(out, x, self.weight, self.eps)
+        return out
+```
+</div></div></details></div>
 </body></html>
