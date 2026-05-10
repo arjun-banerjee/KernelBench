@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 9</a></div><div class="site-subtitle">Kimi-K2.6 · hardware_translation_stub · l5_hw_translation_default_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-10 10:17:57 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 9</a></div><div class="site-subtitle">Kimi-K2.6 · hardware_translation_stub · l5_hw_translation_default_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-10 10:23:12 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">09_flash_attn2_fwd_hdim128_fp16_sm80.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp16</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">hardware_translation_stub</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -2202,5 +2202,1580 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div></details><details class="turn-collapse"><summary><b>turn 2</b> · 1 tool call(s) · 539.7s · 128,684 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>llm latency: 539.7s</span></div><details open><summary>reasoning</summary><div class="block reasoning">My previous approach tried to use a huge fused kernel with wmma.  A few points:
+
+1. The shared memory size used `D` (an integer variable) inside a `constexpr int smem_size = ...`, which fails to compile because D isn&#x27;t constexpr.
+
+2. I need to rethink the approach. The I/O contract is simple: GQA (grouped query attention) with bfloat16 inputs.
+   - Batch=4, Heads=32, Kv_heads=8, Seq_len=2048, Head_dim=128.
+   - Q shape: (B, Hq, T, D)
+   - K/V shape: (B, Hkv, T, D)
+   - num_heads_per_kv = 4.
+
+3. Because the reference is hidden but based on the description, this is clearly a standard GQA causal/non-causal? Wait, the FlashAttention snippet only had `run_mha_fwd_hdim128&lt;cutlass::half_t, false&gt;`. The second template parameter `false` in FA tends to mean `Is_causal = false`. So standard attention (non-causal) with the full sequence.
+
+4. I need to match the exact numerical outputs. Implementing exact FlashAttention from scratch with wmma and atomic adds is fragile. A simpler but optimized approach is to use a tiling algorithm in shared memory and compute softmax carefully. Since H100 has 227KB SMEM, I can use large tiles.
+
+But building a fully correct FlashAttention kernel manually is error-prone. Perhaps a better path:
+   - Use `torch.nn.functional.scaled_dot_product_attention` in the reference? But the evaluation says &quot;custom CUDA operators&quot; and the reference was FlashAttention.
+   - Wait: &quot;Tensor and constructor contract (the reference Model implementation is hidden from you). Your ModelNew must use custom inlined CUDA operators&quot;. The reference might just be `F.scaled_dot_product_attention` with the GQA inputs. But the prompt also said &quot;The source kernel was optimized for A100, Ampere architecture&quot; and gave a flash_fwd snippet. The hidden reference might just be the PyTorch `scaled_dot_product_attention` function, or it might be a specific hand-written kernel.
+
+However, the evaluation uses a hidden *reference* implementation. The inputs are standard. The tolerance is `1e-2` for bf16. Since the prompt explicitly mentions translating a FlashAttention kernel snippet, the hidden reference might be a full FlashAttention kernel doing standard GQA. But for the purposes of matching outputs, if the operation is just standard attention, any mathematically correct implementation will match within tolerance.
+
+Let me think carefully about what operation is performed.
+Given the inputs Q, K, V with shapes described, and `NUM_HEADS=32, NUM_KV_HEADS=8`, this is Grouped Query Attention (GQA). For each query head, there are 4 query heads sharing the same K/V head.
+
+Since the tolerance is `1e-2` for bf16, I can compute attention in a straightforward tiled way. I don&#x27;t need to replicate FlashAttention&#x27;s exact kernel behavior (tiling strategy), but I do need the numerical output to match standard attention `(Q @ K^T / sqrt(D)).softmax(dim=-1) @ V`.
+
+A simpler robust strategy: write a CUDA kernel that implements standard attention explicitly but efficiently using shared memory and vectorized loads.
+
+Because the sequence length is 2048, head_dim is 128.
+If I use tiles:
+- Load a tile of Q (e.g., 64 x 128) into smem.
+- Loop over K/V tiles (e.g., 128 x 128) in sequence dimension.
+- Compute S = Q * K^T in registers.
+- Keep track of max and sum for softmax online.
+- Accumulate O = P * V.
+
+This is the standard FlashAttention online softmax algorithm. I can implement this carefully.
+
+Let&#x27;s design the kernel:
+
+Grid: (batch, num_q_heads, num_q_tiles) where num_q_tiles = T / TILE_Q
+Block: threads per block, e.g. 256.
+
+I&#x27;ll hardcode D=128, but can make it a template or just rely on D=128 constant.
+Given H100 has 255 regs/thread and 227KB SMEM, I can use generous tiles.
+
+I need to be careful:
+- Use `__nv_bfloat16` for inputs.
+- Use `float` for accumulation.
+- Coalesce global loads using `float4` or similar.
+
+Alternative simpler approach to ensure correctness: use `__nv_bfloat16` data, load into float arrays, do matrix multiplication explicitly with threads computing partial dot products. But H100 has tensor cores. Can I use `wmma`? Yes but manual online softmax with wmma is complex because interleaving wmma and reductions across warps is tricky.
+
+Actually, a simpler approach that might still be fast enough: launch a block per `(batch, head, q_seq)` where one block computes one output token across all `head_dim`. That is, one block per query position.
+- Sequence length 2048, batch 4, heads 32 =&gt; 262144 blocks.
+- Each block computes attention for one query vector.
+- It loads K and V of shape (T, D) into shared memory? No, T*D = 2048*128*2 bytes = 512KB, too big for SMEM.
+- But can tile: load K tile (TILE_K x D) and V tile (TILE_K x D) iteratively.
+- Since one block handles only one query, number of threads can be e.g., 128 or 256.
+- The dot product Q * K_tile^T results in TILE_K scores.
+- Need to aggregate softmax across all tiles.
+
+This is very similar to FlashAttention but with TILE_Q = 1. Occupancy might be low because one block only computes one output. But sequence is long (2048).
+
+Let&#x27;s try block per `q_token`.
+Threads per block = 128.
+Tiles in T dimension = e.g., 128.
+SMEM: K tile (128 * 128 * 2) + V tile (128 * 128 * 2) = 64KB. Plus some other buffers. Very comfortable.
+Register pressure: Each thread computes 1 output element? Wait, if block is 128 threads and D=128, one thread can compute one dimension of the output.
+But the dot product `q @ k^T` for a tile: q is (1, 128), K_tile is (128, 128). The result is (1, 128). This is just a vector-matrix product? Actually for 1 query, the scores for a tile are `q (1,D) @ K_tile^T (D, TILE_K) = (1, TILE_K)`.
+Each thread can compute a partial sum for some score elements? E.g., each thread computes a chunk of the dot product: thread i handles dimension i of head_dim (one element of q and corresponding elements of K_tile columns). But K tile is (TILE_K, D). If I store K in SMEM as (TILE_K, D), then to compute q @ k_j^T, each thread loads its q_smem[i] and k_smem[j][i]. Accumulate via warp shuffle.
+
+Actually, if I make one thread block handle multiple queries (e.g., TILE_Q=8), I can achieve better occupancy and utilization.
+
+Let&#x27;s try the classic FlashAttention style but simplified, with cooperative loading.
+
+TILE_Q = 64, TILE_KV = 64, BLOCK = 256.
+SMEM:
+- Q_smem: 64 * 128 * 2 = 16384 bytes = 16KB
+- K_smem: 64 * 128 * 2 = 16KB
+- V_smem: 64 * 128 * 2 = 16KB
+- S_smem (scores): 64 * 64 * 4 = 16KB (float) -- can avoid storing full S if we do online softmax per warp
+- O_smem: 64 * 128 * 4 = 32KB (float)
+Total: ~96KB. Fine.
+
+However, manually doing online softmax with tensor cores is hard. But I can do it with simpler vector dot products.
+
+Another idea: Since the sequence length is 2048 and head dim is 128, even a decently optimized non-tensor-core kernel might be faster than the baseline if the baseline is a naive PyTorch implementation? But the prompt says the source kernel is FlashAttention tuned for A100. The reference will be that A100-optimized kernel running on H100 (or a PyTorch fallback). I need to beat the reference.
+
+If the reference is just PyTorch `F.scaled_dot_product_attention` on H100, it will be extremely fast because it uses cuDNN/cuBLAS. But the prompt says &quot;source kernel was hand-tuned for A100&quot;. The hidden reference might be just that A100 kernel compiled and run on H100. So if I write something reasonably efficient for H100, I should beat it because the A100 kernel wasn&#x27;t optimized for H100&#x27;s features (though a lot of it translates). But I really need to write a good kernel.
+
+However, if the hidden reference is PyTorch&#x27;s built-in SDPA, I might not beat it easily with a manual kernel unless it&#x27;s using FlashAttention already. Wait: The instructions say &quot;reference runtime&quot; is hidden. The source code given is a snippet of FlashAttention. The task is to re-optimize *that* kernel for H100. Therefore, the reference for timing is likely the original A100-tuned kernel running on H100, not PyTorch SDPA.
+
+To beat it, I should implement a simplified but efficient FlashAttention-like kernel that leverages H100&#x27;s larger SMEM (227KB vs 164KB) to use bigger tiles, reducing loop iterations and memory traffic.
+
+Given the complexity, I will write a careful kernel that:
+1. Uses larger tiles to fit H100 SMEM. TILE_Q=64, TILE_KV=128 is good. TILE_Q=128, TILE_KV=64 also. With D=128.
+   - Q: 64x128 bf16 = 16KB
+   - K: 128x128 bf16 = 32KB
+   - V: 128x128 bf16 = 32KB
+   - O accumulator: 64x128 float = 32KB
+   - row_max, row_sum, etc: negligible
+   Total: ~112KB. Great.
+
+2. Each thread block processes TILE_Q queries.
+3. Each thread computes a sub-tile of the score matrix and output.
+
+Simplification: Instead of using wmma, I&#x27;ll use a simple but coalesced &quot;register tiling&quot; approach.
+- Threads: 256.
+- We need to compute S = Q_sm (64,128) @ K_sm^T (128,128) -&gt; (64,128) scores.
+- Then softmax each row (64 rows).
+- Then O = P_sm (64,128) @ V_sm (128,128) -&gt; (64,128).
+
+Wait, if TILE_KV=128, then K and V tiles are (128,128). The score matrix S for one tile is (64,128).
+Number of elements: 8192. With 256 threads, each thread handles 32 elements. That&#x27;s quite manageable.
+
+Actually, I can structure it as:
+- Divide Q tile (64x128) into 4 warps x rows? Let&#x27;s think in terms of thread responsibilities.
+
+A clean way:
+- Have 256 threads.
+- Each thread is responsible for computing one row of Q tile? No, 64 rows, 256 threads -&gt; 4 threads per row.
+   - Each of the 4 threads computes a stripe of the row for K/V tiles.
+- For output, each thread can accumulate its part of the output vector for its assigned query row.
+
+Let&#x27;s define:
+- `TILE_Q = 64`
+- `THREADS = 256`
+- `VEC = 4` (using float4 or similar for loads)
+- Queries per thread: Each thread handles `TILE_Q / (THREADS / WARP_SIZE) = 64 / 8 = 8`? Not clean.
+
+Another approach:
+- Use 8 warps (256 threads).
+- Warp `w` handles a subset of query rows.
+- Each warp computes scores for its query rows against the K tile.
+- To compute score for one query row against K tile (128 columns):
+   - If warp handles 8 query rows (e.g., warp 0 handles rows 0-7), 32 threads per warp -&gt; 4 threads per query row? Or each thread computes score for one KV index.
+   - A query row has 128 elements. 32 threads can load q elements and broadcast to compute dot products with K columns.
+
+Actually, a very common and relatively easy approach for manual attention kernels is:
+- Each thread block handles `Br` rows of Q.
+- The block is divided into warps, and each warp handles a sub-tile of size `Br x Bc`.
+- Inside the warp, use `mma.sync`? Or do it manually.
+
+Given H100 has `mma.sync` for bf16 (new PTX instruction), but using inline PTX is advanced and error-prone. Alternatively, just doing manual FMA might actually be fine if we&#x27;re memory bound. But with bf16 tensor cores doing 1979 TFLOPS, it&#x27;s likely the reference kernel is compute-bound if using Tensor Cores.
+
+Wait, let&#x27;s do the arithmetic:
+- FLOPs for attention: `2 * B * Hq * T * T * D` for Q@K^T and P@V. For our sizes:
+- B=4, Hq=32, T=2048, D=128.
+- Total FLOPs = 2 * 4 * 32 * 2048 * 2048 * 128 = ~137 GFLOPs? Let&#x27;s calculate:
+  4*32=128. 128 * 2048 * 2048 = 536,870,912. *128 = 68,719,476,736. *2 = 137,438,953,472. Yes ~137 GFLOPs.
+- Memory traffic: Read Q, K, V, Write O. But in FlashAttention, we re-read K and V multiple times.
+  Actually standard FlashAttention reads Q once, K and V each O(T/Tile_K) times. If tile is 64, then 32 passes.
+- For our sizes: Q bytes = 4*32*2048*128*2 = 67MB. K/V = 4*8*2048*128*2 = 16.7MB each. O = 67MB.
+- If using a naive matmul (materializing S and P): S/P are 4*32*2048*2048*2 = 1GB each. That&#x27;s a lot of memory traffic.
+- FlashAttention avoids writing S and P to HBM. So its memory footprint is proportional to the HBM reads of Q,K,V.
+- A baseline that materializes the full S and P would be extremely memory-bound and slow. But FlashAttention only reads K and V ~32 times. Total memory traffic ~ Q + KV_tile_iters*(K+V) + O = 67 + 32*(16.7+16.7) + 67 = ~1.14 GB.
+- At 3.35 TB/s, 1.14 GB takes ~0.34 ms. At 2 PFLOPS, 137 GFLOPs takes ~0.068 ms. So with perfect FlashAttention, we&#x27;re likely compute-bound? Actually 0.068ms compute vs 0.34ms memory -&gt; actually memory bound! Wait, no: 137 GFLOPs / 1979 TFLOPS = 0.069 ms. Memory traffic is tricky because SMEM bandwidth is much higher than HBM. FlashAttention trades HBM bandwidth for compute and SMEM bandwidth.
+- On H100, with 3.35 TB/s HBM bandwidth, 1.14 GB is ~0.34 ms. So a memory-optimized kernel might be limited by HBM bandwidth.
+- With 137 GFLOPs and 1.14 GB, arithmetic intensity is ~120 FLOPs/byte. At 3.35 TB/s, we need ~400 TFLOPS to not be bandwidth bound. H100 bf16 TC does 1979 TFLOPS with sparsity, ~989 dense? Actually 1979 with sparsity, so maybe 989 dense? Wait, H100 specs: &quot;1979 with sparsity of BFLOAT16 Tensore Core TFLOPS&quot;. That means dense is ~989 TFLOPS (half of sparsity). So we have 989 TFLOPS dense bf16 tensor core throughput.
+- 137 GFLOPs in 0.34ms requires only ~400 TFLOPS. So we are likely limited by HBM bandwidth, not tensor core compute. This means tensor core usage isn&#x27;t the bottleneck; memory access pattern and occupancy matter more.
+
+Therefore, a simpler kernel with good occupancy and memory coalescing could be competitive or even faster than a poorly-occupying A100-specific kernel if it better hides latency and avoids spilling.
+
+However, the A100 kernel is FlashAttention, which is already very HBM-optimal. To beat it on H100, I need to leverage H100&#x27;s key differences:
+1. Larger SMEM (227KB vs 164KB). This allows larger tile sizes. Larger tiles reduce KV tile iterations (e.g., TILE_KV=128 on A100 requires using 96KB K + 96KB V = 192KB which barely fits or doesn&#x27;t fit with other SMEM, but on H100 128x128x2 = 32KB each is comfortable). Wait, 128x128 bf16 = 32KB. On A100 with 164KB SMEM, TILE_KV=128 and TILE_Q=64 easily fits (Q=16KB, K=32KB, V=32KB, O=32KB, S=32KB = 144KB). So A100 FlashAttention probably already uses TILE_KV=128. What about TILE_KV=256? 256*128*2 = 64KB. K+V+... = 64+64+16+32+64 = 240KB. Only fits on H100. So I can increase TILE_KV to 256!
+
+If I use TILE_Q=64, TILE_KV=256:
+- Q: 16KB
+- K: 64KB
+- V: 64KB
+- O: 32KB (float)
+- S: 64KB (float)
+Total: 240KB. Still under 227KB? Wait, 240KB &gt; 227KB. That&#x27;s too much.
+If I don&#x27;t store S as float in SMEM for the whole tile, but compute/accumulate online:
+- Actually in standard FlashAttention, you don&#x27;t need S in SMEM. You compute a chunk of S and immediately reduce it. But with naive thread cooperation, it&#x27;s easier to store S.
+Let&#x27;s see if I can fit TILE_Q=64, TILE_KV=256 with reduced S storage.
+- Q: 64*128*2 = 16KB
+- K: 256*128*2 = 64KB
+- V: 256*128*2 = 64KB
+- O: 64*128*4 = 32KB
+Total essential: 176KB.
+- Add row buffers (row_max, row_sum) = 64*2*4 = 512B.
+- If I need a temporary workspace for P (to feed into O=PV), that would be 64*256*2 = 32KB. Or I can keep P in registers/shared across warps.
+176+32 = 208KB. That fits in 227KB!
+So I could use TILE_Q=64, TILE_KV=256 and store P in SMEM as bf16. Or even store S as float (64KB) and P as bf16 (32KB): 176+64+32 = 272KB, too much.
+So I need to be careful.
+
+Alternatively, TILE_Q=128, TILE_KV=128:
+- Q: 32KB
+- K: 32KB
+- V: 32KB
+- O: 64KB
+- S or P: 32KB for P (128*128*2)
+Total: 192KB. Fits nicely.
+This doubles the number of queries per block compared to TILE_Q=64, reducing block count from `(4*32*32)=4096` to `(4*32*16)=2048`. But with 132 SMs on H100, 2048 blocks is still plenty (15 blocks/SM, 32 max).
+
+TILE_Q=128, TILE_KV=128 means iterations over T=2048 are 16 for KV. So only 16 passes over K and V. This is great for HBM traffic reduction.
+
+What about TILE_Q=64, TILE_KV=256 with TILE_Q only 64? Iterations: 8.
+- Q: 16KB, K:64KB, V:64KB, O:32KB, P:32KB. Total = 208KB. Fits perfectly.
+This is even better: only 8 passes over K/V.
+- Block count: 4*32*32 = 4096 blocks.
+- Threads: 256.
+- 4096 blocks / 132 SMs = ~31 blocks/SM, which is near the 32 max thread blocks per SM limit. Occupancy might be limited by block count rather than threads.
+- With 256 threads/block, that&#x27;s 31*256=7936 threads/SM. Max threads/SM on H100 is 2048? Wait, actually H100 has max 2048 threads/SM. 31 blocks * 256 threads = 7936 threads/SM, which exceeds 2048. So occupancy is limited to 8 blocks/SM (8*256=2048) or less depending on registers/SMEM. But 4096 blocks total means each SM gets ~31 blocks over time. The max concurrent blocks is 32. The max concurrent warps is 64? Actually Hopper has 2048 threads/SM. 256 threads = 8 warps. 2048/256 = 8 blocks concurrently per SM if no other limits.
+- If SMEM per block is 208KB, and SMEM per SM is 228KB, then only 1 block can fit per SM concurrently! That&#x27;s a problem. `208KB &gt; 228KB / 2` (114KB). So only 1 block per SM can run at a time. That means only 1 out of 32 blocks concurrently. Occupancy would be terrible: 256 threads out of 2048 = 12.5% occupancy. But 256 threads is just 8 warps. If max warps per SM is 64 (actually threads/32 = 64), occupancy is 8/64 = 12.5%.
+- H100 handles low occupancy better than A100 due to improved latency hiding? Reduced occupancy means fewer warps to hide memory latency. This is bad.
+
+Wait, SMEM per SM is 228KB. If my block uses 208KB, indeed only 1 block fits. But maybe I can reduce SMEM usage to fit 2 blocks.
+- 228/2 = 114KB per block max for 2 blocks.
+Can I fit TILE_Q=64, TILE_KV=128 in 114KB?
+- Q: 16KB
+- K: 32KB
+- V: 32KB
+- O-like reduction: ?
+Total without O persistence: 80KB. Plus row buffers and some workspace. That&#x27;s under 114KB.
+So with 96KB-ish usage, I can get 2 blocks per SM -&gt; 512 threads concurrently. Still not great but better.
+
+Actually, why persist O in SMEM? I can keep O in registers or accumulate and write back at the end.
+FlashAttention keeps O in registers/shared to rescale iteratively. If I keep O in registers:
+- Each thread handles one query row? 64 rows / 256 threads = 0.25 rows/thread. Not clean.
+- If each thread handles one column of O for some rows... Let&#x27;s think.
+
+Alternative design to minimize SMEM and increase occupancy:
+- Use a &quot;warp-specialized&quot; or simple 1D block design where each warp handles one query.
+- Warp per query, 32 warps per block -&gt; 32 queries per block. But max warps per block is limited by threads. 32 warps = 1024 threads. This is legal.
+- If each warp computes attention for one query against all K/V, we can keep the query in registers (128 elements, each thread holds 4).
+- Load K/V tiles into SMEM. Since 32 warps can access SMEM simultaneously.
+- SMEM: K tile (Bc x 128 x 2) + V tile (Bc x 128 x 2). If Bc = 128: 32KB + 32KB = 64KB.
+- Plus some score buffer per warp? Scores for one query against Bc keys = Bc elements = 128 * 4 bytes = 512B. This can be in registers or distributed among threads. Each thread in the warp can hold 4 scores? 32 threads * 4 = 128. Perfect.
+- So each warp loads K/V tile, computes 128 scores (each thread does 4 partial dot products, then warp reduce), does softmax partial updates (online softmax), and accumulates output.
+- O accumulation: each thread holds 4 elements of the output vector (128/32=4). It can update them in registers as it processes each KV tile.
+- This design uses very little SMEM: just K and V tiles (64KB for Bc=128). With 228KB SMEM, we can run 3 blocks per SM concurrently (3*64=192KB), or 3 blocks = 3072 threads, very high occupancy. Wait, max threads is 2048. So 2 blocks per SM = 2048 threads. Perfect! Exactly fills the SM.
+
+Wait, if block size is 1024 threads (32 warps), 2 blocks = 2048 threads. SMEM per block = 64KB. 2 blocks = 128KB. Fits.
+So concurrency: 2 blocks per SM.
+Grid size: B * Hq * (T / TILE_Q). With TILE_Q = 32 (one block handles 32 queries).
+T=2048, so 64 tiles.
+Grid = 4 * 32 * 64 = 8192 blocks.
+8192 blocks / 132 SMs = ~62 blocks/SM. With 2 concurrent, that&#x27;s 31 waves. Very good.
+
+This &quot;one warp per query&quot; design is classic and maps perfectly to tensor cores OR simple warp shuffles.
+
+But doing warp-level dot product for Q@K:
+- Query vector q is (1, 128). Each thread holds 4 elements.
+- K tile is (Bc, 128), stored in SMEM as (Bc, 128). Bc=128.
+- For each key j in 0..Bc-1, the score s_j = sum_{d=0}^{127} q[d] * K[j][d].
+- Each thread computes partial sum over its 4 dimensions: `sum_qk = dot(q_regs, K[j][lane*4 : lane*4+4])`.
+- Then `__reduce_add_sync` across the warp to get full dot product.
+- This is very efficient and avoids tensor cores entirely. But is it fast enough?
+- Each warp does 128 keys * 128 dims = 16K FMAs per tile. In bf16, but we should accumulate in float.
+- A warp has 32 threads. Each thread does 4 FMAs per key, so 512 FMAs per key. For 128 keys: 65536 FMAs per warp per tile.
+- At ~100 TFLOPS per SM (roughly), a warp (1/4 of an SM&#x27;s thread capacity?) can do this fairly quickly.
+- Memory: K tile is 32KB. Loaded from HBM once. 128 keys * 128 dims * 2 bytes = 32KB. With 2 blocks per SM, memory bandwidth is 3.35TB/s / 132 SMs = ~25 GB/s per SM. Actually shared. But each block reads 32KB K + 32KB V per tile. Total 64KB per block per tile. Time to load 64KB at 25GB/s is 2.5 microseconds. That&#x27;s a lot relative to compute? Actually 2.5us per tile. For 16 tiles (2048/128) = 40us per block. For 8192 blocks on 264 concurrent blocks = 31 waves = 1.2ms. That&#x27;s plausible.
+- But the original FlashAttention likely runs in &lt; 0.5ms for this problem size. A100 FlashAttention for 4x32x2048x128 is around 0.2-0.3ms? I&#x27;m not sure. Let&#x27;s say reference is 0.5ms. 1.2ms is slower.
+
+However, H100 has much higher memory bandwidth and compute than A100. If the A100 kernel was written with small tiles (e.g., 64x64) and uses extra HBM traffic due to occupancy issues or not leveraging the larger SMEM, our kernel with larger tiles and high occupancy might still win.
+
+Can I optimize the warp-level dot product further?
+- Instead of one key at a time, process multiple keys to amortize the warp shuffle? Actually, can&#x27;t easily do that with the reduction. But we can process 4 keys per step: load K for 4 consecutive rows into registers (or rely on SMEM broadcast).
+- Actually H100 has `ldmatrix` for tensor cores but we aren&#x27;t using them.
+
+What if I use `bf16` arithmetic in registers for the dot product? No, accumulate in float for accuracy.
+
+Another optimization: since 4 threads work on 4 dimensions, and K is in SMEM, I can load K[j][d] as `__nv_bfloat162` or `float2` to do 2 FMAs per instruction. This increases throughput.
+
+Let&#x27;s refine the &quot;warp per query&quot; kernel with `__nv_bfloat162`.
+- D=128. Threads per warp = 32.
+- Each thread handles 4 dimensions (since 128/32 = 4).
+- But we can pair them into 2 `__nv_bfloat162` operations.
+- For one key `j`, thread `t` loads `K[j][t*4]` and `K[j][t*4+1]` as a `__nv_bfloat162`, and `K[j][t*4+2]` and `K[j][t*4+3]` as another.
+- q vector is the same for all keys in the block. Load q into registers at start: 2 `__nv_bfloat162` per thread.
+- Compute partial dot: `q01 * k01 + q23 * k23` (using `__nv_bfloat162` dot or manual FMA). Wait, `__nv_bfloat162` doesn&#x27;t have automatic FMA for dot product? We can do `__hfma2(q01, k01, acc1)` etc., but since we need sum across components too, it&#x27;s a bit tricky:
+   - `partial = __bfloat162float(q0*k0) + __bfloat162float(q1*k1) + ...`
+   - Or use `__nv_bfloat162` multiply: `prod = q01 * k01` -&gt; gives x and y components. Then sum x+y manually.
+Actually there is no direct dot product intrinsic for bf16 vectors on CUDA except via tensor cores. But we can do:
+```
+__nv_bfloat162 q01 = ...;
+__nv_bfloat162 k01 = ...;
+__nv_bfloat162 prod01 = __hmul2(q01, k01);
+float sum01 = __bfloat162float(prod01.x) + __bfloat162float(prod01.y);
+```
+This is roughly 2 FMAs equivalent.
+
+Vectorized SMEM loads:
+- Since K is in SMEM as `__nv_bfloat16 K_smem[Bc][D]`, loads can be done as `*(__nv_bfloat162*)&amp;K_smem[j][t*4]`.
+
+Would using tensor cores be significantly faster? For a 1x128 @ 128x128 problem, tensor cores aren&#x27;t directly applicable because the M dimension is 1. You&#x27;d need to batch multiple queries. So the warp-shuffle approach is actually natural here.
+
+Alternative: use 4 warps per query to compute the dot product via collaborative loading and reduction? That seems worse.
+
+Let&#x27;s stick to the warp-per-query design. It&#x27;s clean, should compile, and easy to get correct.
+
+But wait: if I use 32 warps (1024 threads), 64KB SMEM, then each block handles 32 queries. Is there a way to process more queries per block to increase arithmetic intensity per block? Maybe 64 queries with 64 warps = 2048 threads. But max threads per block is 1024. So no.
+
+Could I process 64 queries with 2 warps per query (64 warps total)? That would require 2048 threads, which is the max threads per block. But 64 warps means 2 warps cooperate on one query, which is possible but more complex. 1024 threads (32 warps) is simpler and block count is still high.
+
+Wait, block count = 4 * 32 * 64 = 8192. With 132 SMs and 2 blocks each = 264 concurrent blocks. 8192/264 = 31 waves. Good utilization.
+
+Now, let&#x27;s write the kernel.
+Parameters:
+- B=4, Hq=32, Hkv=8, T=2048, D=128.
+- TILE_Q = 32 (queries per block).
+- TILE_KV = 128 (keys per tile).
+- WARPS = 32 (one warp per query). Threads = 1024.
+
+SMEM layout:
+- K_smem: TILE_KV * D bf16 = 128 * 128 * 2 = 32768 bytes.
+- V_smem: TILE_KV * D bf16 = 32768 bytes.
+Total SMEM = 65536 bytes.
+That allows 3 blocks per SM (3*64=192KB &lt; 228KB). But threads limit: 1024*2=2048. So 2 blocks max. Perfect.
+
+Actually 3 blocks would be 3072 threads &gt; 2048 limit. So max 2 blocks concurrent per SM. Great.
+
+Register usage per thread:
+- q_vec: 4 bf16 = 8 bytes (or 2 __nv_bfloat162).
+- k_vec: 8 bytes.
+- 4 floats for partial accumulators? Actually we accumulate the output o_vec in 4 floats.
+- scores for the KV tile: we process one key at a time, so only need one float `score` per key, plus reduction. Or to amortize costs, we can compute scores for a sub-tile of keys (e.g., 4 keys) before doing the softmax update? No, online softmax requires processing in order because the global max changes. But we can compute a local max for a sub-tile and then do the two-pass or apply online algorithm per key.
+
+Wait, we can vectorize the softmax updates: compute 4 scores, find local max, update global state, compute exp, update O. This reduces the cost of `__shfl_xor_sync`.
+
+Let&#x27;s design per-thread registers for a query:
+Since one warp handles one query. Warp has 32 threads.
+- Each thread `t` (0..31) handles dimensions `d = t*4 + 0..3`.
+- `q01` and `q23` as 2 `__nv_bfloat162`.
+- `o0, o1, o2, o3` as 4 floats for output accumulator.
+- `m` as float (max so far).
+- `l` as float (sum of exp so far).
+- For each key j in the KV tile:
+   - Compute score_j.
+   - Compare with m. if score_j &gt; m: scale o by exp(old_m - new_m), update l, update m.
+   - Compute p = exp(score_j - m).
+   - Load V[j][d] (2 __nv_bfloat162).
+   - Update o += p * V[j][d].
+
+This processes keys sequentially within the warp. All threads in the warp process the same key `j` simultaneously.
+Because K_smem and V_smem are shared, all warps in the block read the same SMEM addresses (for different keys, but within a warp, all threads access the same key row `j`). This might cause bank conflicts if multiple warps access same row? Actually each warp handles different query, but for a given key `j`, all threads in the warp read K[j][t*4]. Different threads read different columns -&gt; strided access within the row. With bf16, each thread reads 4 elements (8 bytes). If banks are 4 bytes, then threads in a warp access 8 bytes offset by threadIdx. This should be broadcast/one transaction if arranged as a row. SMEM bank conflicts: 32 threads each access 8 bytes -&gt; each accesses 2 banks? Actually each 4-byte bank, so 8 bytes spans 2 banks. Threads access consecutive 8-byte chunks -&gt; banks (t*8/4) mod 32 = (t*2) mod 32. Threads 0..15 map to banks 0..30 even. Threads 16..31 map to 0..30 even again? Wait:
+thread 0: bytes 0..7 -&gt; banks 0,1
+thread 1: bytes 8..15 -&gt; banks 2,3
+...
+thread 15: bytes 120..127 -&gt; banks 30,31
+thread 16: bytes 128..135 -&gt; banks 0,1
+So 2-way bank conflict. That&#x27;s acceptable. Actually `__nv_bfloat162` is 4 bytes, so each thread reading 2 of them (8 bytes) is 2 accesses. The first 16 threads and second 16 threads conflict on banks. 2-way conflict means 2 cycles instead of 1. Okay.
+
+To reduce conflicts, we can transpose K and V in SMEM. If stored as (D/8, TILE_KV, 8) or something? Or just accept 2-way conflict.
+
+Actually for FlashAttention on A100, they store in a swizzled layout. But let&#x27;s not overcomplicate initially. 2-way conflict is minor.
+
+Let&#x27;s calculate FLOPs and throughput for this warp.
+For each key:
+- Load K row: 32 threads * 8 bytes = 256 bytes. Throughput ~ a few cycles.
+- 4 multiplications + 3 additions for dot product per thread (or with __nv_bfloat162, 2 muls + 2 adds + 1 horizontal sum per thread). Then warp reduce (5 shuffles).
+- Softmax update: a few float ops.
+- Load V row: 256 bytes.
+- Update 4 output elements: 4 FMAs.
+- Total per key: ~10-20 FLOPs + 512 bytes memory from SMEM.
+- SMEM bandwidth on H100 is ~10-20 TB/s? Actually SMEM bandwidth is roughly proportional to SMs. H100 shared memory bandwidth is ~10-20 TB/s per SM. At 512 bytes/key, that&#x27;s ~50ns per key. For 128 keys: ~6.4us. Plus global loads. For 16 tiles: ~100us per block. Total time: maybe 0.2-0.3ms. This could indeed be faster than A100 FlashAttention if the A100 kernel had occupancy issues or smaller tiles.
+
+Wait, the global memory load for K and V tiles: each tile is 32KB K + 32KB V = 64KB. At 3.35TB/s, loading 64KB takes ~19ns? No, 64KB / 3.35e12 B/s = 19 microseconds? Wait:
+- 3.35 TB/s = 3.35e12 bytes/s.
+- 64 KB = 65536 bytes.
+- Time = 65536 / 3.35e12 = 1.95e-8 s = 19.5 nanoseconds? No! 65536 / 3.35e12 = 1.9567e-8. That&#x27;s ~19.5 nanoseconds? That&#x27;s incredibly fast. Wait, 1 TB/s = 1e12 bytes/s. 64KB / 1e12 = 64e3 / 1e12 = 64e-9 = 64 nanoseconds per KB? Actually:
+- 1 TB/s = 1e12 B/s.
+- 64 KB = 6.4e4 B.
+- 6.4e4 / 1e12 = 6.4e-8 s = 64 nanoseconds.
+At 3.35 TB/s: 6.4e4 / 3.35e12 = 1.91e-8 s = 19.1 ns.
+Yes, 19 nanoseconds to load 64KB if bandwidth is saturated. For 16 tiles: 305 ns. Plus compute. So compute time dominates? But a warp takes ~6.4us per tile. 16 tiles = ~100us. Global memory latency is hidden across warps.
+
+Wait, I miscalculated. A warp doing 128 keys sequentially with ~a few FLOPs each takes microseconds, not nanoseconds. The global load of one tile (64KB) takes 19ns. So global memory is not the bottleneck if we have enough warps to overlap. With 2 blocks per SM * 32 warps = 64 warps per SM. Each warp on its tile takes ~100us. But the tile loads are staggered. Let&#x27;s not overthink the roofline. This design should be reasonable.
+
+Let&#x27;s code it up. I&#x27;ll write a kernel that uses 1024 threads per block, 32 warps, each warp handles one query.
+Wait, TILE_Q = 32, so block handles 32 queries. Each query gets one warp. Perfect.
+
+One issue: If I have 16 KV tiles (2048/128), the block loops 16 times. Inside the loop:
+1. Cooperative load of K tile: 1024 threads loading 32KB. Each thread loads 32 bytes (e.g., 8 bf16 or 4 float2). Very efficient.
+2. Cooperative load of V tile: same.
+3. __syncthreads()
+4. Each warp loops over j=0..127:
+   - compute score K[j] @ q
+   - update online softmax
+   - update O += p * V[j]
+5. __syncthreads() before loading next tile.
+
+Actually, do I need __syncthreads between step 4 and loading next tile? Yes, because some warps might be faster. But warps in a block execute somewhat independently. __syncthreads ensures all warps are done with SMEM before loading next tile.
+
+Since each warp processes 128 keys sequentially, there is divergence between warps? Not really, all warps loop 128 times. No divergence.
+
+What about `__shfl_xor_sync` across warp? That&#x27;s fast.
+
+Softmax details:
+For each key `j` and score `s_j`:
+- `new_m = max(m, s_j)`
+- `factor = exp(m - new_m)`
+- `l = l * factor + exp(s_j - new_m)`
+- `o = o * factor + exp(s_j - new_m) * v_j`
+This is the standard online softmax update per element.
+But `exp` is expensive. For a tile of 128 keys, doing 128 `expf` calls per warp might be a bottleneck.
+We can batch it: compute scores for the entire tile first into an array, then do a parallel max reduction, then do a parallel sum/exp, then compute output. But storing the scores requires 128 floats per warp = 512 bytes per warp. 32 warps = 16KB. That&#x27;s feasible in registers? 512 bytes per warp * 32 = 16KB total registers for scores. At 255 registers/thread * 1024 threads = ~1MB register file. Wait, max registers per thread is 255 (32-bit). 255 floats per thread * 4 bytes = 1020 bytes per thread. 1024 threads = ~1MB. Total register file per SM is 64K * 4B = 256KB. Wait, 64K 32-bit registers per SM, not per thread. That&#x27;s 256KB per SM. If we use 1024 threads, each can have at most 256 registers (255). So total registers concurrently active = 1024 * 255 * 4 = ~1MB, but wait that&#x27;s 4x more than SM register file capacity! Actually 255 * 1024 = 261120 registers. 64K registers per SM = 65536. So 255 registers/thread * 1024 threads would require 261K registers &gt; 64K. The compiler will spill or reduce occupancy.
+Ah! The spec says &quot;64K 32-bit registers per SM&quot;. Not per thread. Max registers per thread is 255. But with 1024 threads, the total number of registers used cannot exceed 64K. So average registers per thread must be &lt;= 64. If each thread uses 64 registers, that&#x27;s fine. If it uses 128, then only 512 threads can run concurrently. This is a crucial detail.
+
+So if I have 1024 threads, I must ensure register usage per thread is low. If I limit to ~64 registers/thread, all 1024 threads can run. But multi-warp block with per-thread arrays will blow registers.
+
+Wait, actually register allocation works differently: registers are shared among blocks. If a block requests N registers/thread, hardware allows at most floor(64K / (block_size * N)) blocks concurrently. For block_size=1024, if N=64, that&#x27;s exactly 1 block per SM (1024*64=65536). If N=32, we can have 2 blocks per SM. So with 1024 threads, we can have at most 1 block per SM if registers/thread &gt; 63.
+If we want 2 blocks per SM (2048 threads), registers per thread must be &lt;=32. That&#x27;s very tight.
+If we use 256 threads/block, 64 regs/thread allows 4 blocks (256*64=16K, 64K/16K=4). But max blocks per SM is 32. So with 256 threads and 64 regs, occupancy can be up to 4 blocks = 1024 threads. Still leaving room.
+With 256 threads and 128 regs, occupancy is 2 blocks = 512 threads.
+With 128 threads and 128 regs, occupancy is 4 blocks = 512 threads.
+
+This changes the design! We want high thread-level parallelism to hide latency, but registers per SM are very limited on Hopper/Ampere (64K). So 64K / 2048 = 31 registers per thread max to fill all threads.
+A100/H100: 64K registers per SM.
+
+So using 1024 threads per block is a bad idea if each thread needs many registers. We should use smaller blocks (e.g., 128 or 256 threads) but more blocks, so that total active threads can still be high while registers per thread are moderate.
+
+For example:
+- Block: 256 threads.
+- If each uses 64 registers: 256*64 = 16K registers. 64K/16K = 4 blocks per SM concurrently. 4*256=1024 threads active. Good.
+- SMEM per block = 64KB. 228KB / 64KB = 3 blocks max by SMEM. So SMEM is the limiting factor (3 blocks), not registers. 3*256=768 threads active.
+This is a good balance.
+
+So revert to smaller blocks.
+Block: 256 threads.
+Queries per block: Let&#x27;s say `TILE_Q = 32`. But we only have 8 warps. So each warp handles 4 queries? Or 4 warps per query?
+
+Option A: 4 warps per query, 8 queries per block.
+- 4 warps = 128 threads per query.
+- D=128 -&gt; each thread handles 1 dimension.
+- Dot product: thread t computes q[d] * K[j][d] (1 FMA), then `__shfl_xor_sync` across 128 threads? Wait, warp shuffles only across 32 threads. For 128 threads, need reduction across 4 warps. This requires SMEM or cooperative groups. More complex.
+- But 4 warps can compute the score easily: each warp computes partial sum over 32 dims, then warp shuffle to reduce within warp, then one thread writes to SMEM, then block reduction. That&#x27;s a lot of overhead per key.
+
+Option B: 1 warp per query, but block has 8 warps = 8 queries per block.
+- 8 queries per block means grid = 4 * 32 * (2048/8) = 4*32*256 = 32768 blocks.
+- 32768 / 132 = 248 blocks/SM. With 3 concurrent blocks = 744 blocks total active across GPU. Wave count = 44. Good parallelism.
+- SMEM per block = 64KB (K 32KB + V 32KB for Bc=128). Wait, 8 warps is 256 threads. Perfect.
+- Each warp handles 1 query. Each thread handles 4 dimensions.
+- Register usage: q (4 bf16), k (4 bf16), v (4 bf16), o (4 float), m (1 float), l (1 float). Plus loop counters. That&#x27;s maybe 16-20 registers. So well under 32. Wait, but we also need some temporaries. Probably &lt; 32 registers/thread.
+- With 20 registers/thread, 256 threads use 5120 registers. 64K/5120 = 12 blocks possible by registers. But SMEM limits to 3. So 3 blocks = 768 threads active. That&#x27;s okay.
+
+So this seems like a very good configuration.
+Let&#x27;s pick:
+- TILE_Q = 8 (queries per block).
+- TILE_KV = 128 (keys per tile).
+- THREADS = 256 (8 warps).
+- SMEM: K_smem[128][128] bf16, V_smem[128][128] bf16. Total 64KB.
+- Grid: (B * Hq, T / TILE_Q) -&gt; actually 3D grid is fine. I can do (B, Hq, T/TILE_Q).
+- For GQA: each query head `h` maps to kv_head `h / (Hq/Hkv)`. In the kernel, blockIdx.y = head, blockIdx.x = batch.
+- Wait, grid limit: max blocks in z dimension is 65535. T/TILE_Q = 2048/8 = 256. That&#x27;s fine. Or I can use 2D grid (B*Hq, T/TILE_Q).
+
+Let&#x27;s define the kernel:
+```cuda
+__global__ void flash_attn_kernel(
+    const __nv_bfloat16* __restrict__ q, // (B, Hq, T, D)
+    const __nv_bfloat16* __restrict__ k, // (B, Hkv, T, D)
+    const __nv_bfloat16* __restrict__ v, // (B, Hkv, T, D)
+    __nv_bfloat16* __restrict__ o,       // (B, Hq, T, D)
+    int B, int Hq, int Hkv, int T, int D, float scale
+) {
+    extern __shared__ char smem[];
+    __nv_bfloat16* k_smem = reinterpret_cast&lt;__nv_bfloat16*&gt;(smem);
+    __nv_bfloat16* v_smem = k_smem + TILE_KV * D;
+
+    int batch = blockIdx.x / Hq;
+    int head = blockIdx.x % Hq;
+    int q_tile = blockIdx.y;
+    int q_idx = q_tile * TILE_Q + (threadIdx.x / 32); // one query per warp
+    int kv_head = head / (Hq / Hkv);
+    int lane = threadIdx.x % 32;
+
+    if (q_idx &gt;= T) return;
+
+    // Load q for this warp&#x27;s query
+    const __nv_bfloat16* q_ptr = q + ((batch * Hq + head) * T + q_idx) * D + lane * 4;
+    // q registers: 4 elements
+    __nv_bfloat16 q0, q1, q2, q3;
+    q0 = q_ptr[0];
+    q1 = q_ptr[1];
+    q2 = q_ptr[2];
+    q3 = q_ptr[3];
+
+    float m = NEG_INF;
+    float l = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    int num_kv_tiles = (T + TILE_KV - 1) / TILE_KV;
+
+    for (int kv_tile = 0; kv_tile &lt; num_kv_tiles; ++kv_tile) {
+        int kv_start = kv_tile * TILE_KV;
+        const __nv_bfloat16* k_ptr = k + ((batch * Hkv + kv_head) * T + kv_start) * D;
+        const __nv_bfloat16* v_ptr = v + ((batch * Hkv + kv_head) * T + kv_start) * D;
+
+        // Cooperative load of K tile into smem
+        // Total elements: TILE_KV * D = 128 * 128 = 16384
+        // Threads: 256, each loads 64 bytes (32 bf16) -&gt; 256*32 = 8192 bf16 = half. Wait.
+        // 16384 elements / 256 threads = 64 elements per thread.
+        // We can load as float4 (8 bf16) -&gt; 8 loads per thread.
+        // Actually bf16 is 2 bytes. float4 is 16 bytes = 8 bf16. So 16384/8 = 2048 float4 loads.
+        // 2048 / 256 = 8 float4 loads per thread.
+        for (int i = threadIdx.x; i &lt; TILE_KV * D / 8; i += blockDim.x) {
+            // careful: we need to access aligned memory. The pointers are aligned? torch tensors are aligned.
+            // reinterpret q_ptr + i*8 as float4? Actually we need to load into smem.
+            // Since K_smem is TILE_KV x D, we can treat it as 1D array of __nv_bfloat16.
+            // Loading float4 from global to shared requires intermediate register.
+            float4 val = reinterpret_cast&lt;const float4*&gt;(k_ptr)[i];
+            reinterpret_cast&lt;float4*&gt;(k_smem)[i] = val;
+            float4 val2 = reinterpret_cast&lt;const float4*&gt;(v_ptr)[i];
+            reinterpret_cast&lt;float4*&gt;(v_smem)[i] = val2;
+        }
+        __syncthreads();
+
+        // Now each warp processes its query against all keys in the tile
+        int warp_id = threadIdx.x / 32;
+        int query_local = warp_id; // 0..7
+
+        // We need each thread to know which query it belongs to.
+        // My earlier plan: each warp handles exactly one query.
+        // So warp with warp_id handles query q_tile * TILE_Q + warp_id.
+        // However, threadIdx.x includes lane. So threadIdx.x/32 is warp_id.
+        // For this warp, its query index is q_tile * TILE_Q + warp_id.
+```
+
+Wait, I need to be careful. If each warp in the block handles a different query, then warps access different q vectors and accumulate different o vectors. But K_smem and V_smem are shared. That is fine! There is no need for inter-warp communication except at `__syncthreads` for tile loading and at the end before writing back.
+There is no divergence, because each warp has the same loop structure over 128 keys, just different q and o.
+
+The only issue: `__syncthreads()` requires all threads in the block to reach it. Since each warp iterates 128 times, all warps do exactly 128 iterations. So they reach `__syncthreads()` at the same time (roughly). No divergence.
+
+Wait, but if `T` is not a multiple of `TILE_KV`, the last tile might have fewer keys, and some warps might compute fewer iterations if we add conditionals. But T=2048, TILE_KV=128, exactly 16 tiles. So no tail handling needed! Great.
+
+Similarly, if `T` is not a multiple of `TILE_Q`? 2048 / 8 = 256 exactly. No tail.
+
+So the loop is fixed count, no conditionals inside the key loop. This is ideal.
+
+Let&#x27;s refine the per-warp loop.
+Inside the tile loop, for each warp (one query):
+```cuda
+for (int j = 0; j &lt; TILE_KV; ++j) {
+    const __nv_bfloat16* k_row = k_smem + j * D + lane * 4;
+    __nv_bfloat16 k0 = k_row[0];
+    __nv_bfloat16 k1 = k_row[1];
+    __nv_bfloat16 k2 = k_row[2];
+    __nv_bfloat16 k3 = k_row[3];
+
+    // compute dot product q . k
+    // Use float accumulation
+    float qk = __bfloat162float(q0) * __bfloat162float(k0)
+             + __bfloat162float(q1) * __bfloat162float(k1)
+             + __bfloat162float(q2) * __bfloat162float(k2)
+             + __bfloat162float(q3) * __bfloat162float(k3);
+
+    // warp reduce
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        qk += __shfl_xor_sync(0xffffffff, qk, offset);
+    }
+
+    qk *= scale;
+
+    // online softmax
+    float new_m = fmaxf(m, qk);
+    float exp_old = __expf(m - new_m); // exp of difference, optimized
+    float exp_new = __expf(qk - new_m);
+    l = l * exp_old + exp_new;
+    
+    // Load V and update O
+    const __nv_bfloat16* v_row = v_smem + j * D + lane * 4;
+    __nv_bfloat16 v0 = v_row[0];
+    __nv_bfloat16 v1 = v_row[1];
+    __nv_bfloat16 v2 = v_row[2];
+    __nv_bfloat16 v3 = v_row[3];
+
+    o0 = o0 * exp_old + exp_new * __bfloat162float(v0);
+    o1 = o1 * exp_old + exp_new * __bfloat162float(v1);
+    o2 = o2 * exp_old + exp_new * __bfloat162float(v2);
+    o3 = o3 * exp_old + exp_new * __bfloat162float(v3);
+
+    m = new_m;
+}
+```
+
+At the end of all KV tiles, normalize:
+```cuda
+float inv_l = 1.0f / l;
+o0 *= inv_l; o1 *= inv_l; o2 *= inv_l; o3 *= inv_l;
+```
+
+Then write back to global memory:
+```cuda
+__nv_bfloat16* o_ptr = o + ((batch * Hq + head) * T + q_idx) * D + lane * 4;
+o_ptr[0] = __float2bfloat16(o0);
+o_ptr[1] = __float2bfloat16(o1);
+o_ptr[2] = __float2bfloat16(o2);
+o_ptr[3] = __float2bfloat16(o3);
+```
+
+This is extremely clean.
+
+But wait, does 8 warps and 128x128 tile give enough SMEM to allow multiple blocks? Yes, 64KB SMEM per block, 3 blocks per SM. But threads limit: 3*256 = 768 threads &lt; 2048. So SMEM limits us to 3 blocks per SM. That&#x27;s excellent occupancy given the constraints.
+
+Wait, can we load K and V as float4? `__nv_bfloat16` is 16-bit. float4 is 128 bits = 16 bytes = 8 bf16.
+- K has 128*128 = 16384 bf16. 16384/8 = 2048 float4 elements.
+- Threads: 256. Each thread loads 8 float4s. That&#x27;s 8 memory instructions. Good.
+
+But `reinterpret_cast&lt;const float4*&gt;(k_ptr)[i]` on bf16 pointer might require alignment. Since PyTorch tensors are aligned to at least 16 bytes (usually 256 bytes or 512 bytes), and D=128, rows are 256 bytes, which is 16-byte aligned. So `k_ptr + row*D` is 256-byte aligned. Loading float4 from beginning of row is safe. But our cooperative load `i` loops over the whole 2D tile linearly. Is the start of the tile aligned? Yes, because PyTorch allocates contiguous memory and T*D is 2048*128 = 262144, which is a multiple of 8. The start of each `(batch, head, tile_start, 0)` is aligned to `tile_start*D*2` bytes. Since D*2 = 256 bytes, yes, row starts are 256-byte aligned. So float4 loads are safe at row boundaries.
+
+However, if we linearize `i` over the whole tile, `i=0` corresponds to the first 8 bf16 elements. `i=2047` corresponds to last 8. 2048 * 16 = 32768 bytes = 32KB. The pointer `(k_ptr)` points to the start of the tile. Since `tile_start * D * 2` is a multiple of 256 bytes, the tile start is aligned. So all float4 loads within the tile are aligned to 16 bytes? Wait, `i=1` loads bytes 16..31. `tile_start*256 + 16` is a multiple of 16 but not necessarily 256. But `float4` requires 16-byte alignment. It is. So fine.
+
+One security: I should mark pointers as `__restrict__` and use `__ldg` (load global) for read-only data to help caching. With const restrict, the compiler might already use ldg.
+
+Optimization: for the inner key loop, I can prefetch V or K rows? Maybe not necessary. But I can use `__ldcs` (cache streaming) for V and K global loads since they&#x27;re only used once per tile? Actually each KV tile is read once per block, but each block is different. Using `__ldcs` might avoid polluting L2. On H100, L2 is large (50MB). The working set for 4*8*2048*128*2 = 16.7MB for K and same for V = 33MB. This fits in L2 (50MB). So caching is beneficial. Using normal loads is fine.
+
+Another optimization: Transpose K in SMEM. Currently K is stored row-major (key x dim). When threads access `k_smem[j * D + lane*4]`, this is a coalesced access within the warp because all threads access consecutive elements. Good. No transposition needed.
+
+For V: stored row-major. When threads access `v_smem[j * D + lane*4]`, same coalescing. Good.
+
+What about bank conflicts for K and V loads?
+- Each warp loads one row `j`. Threads access `lane*4`, i.e., thread 0: 0..3, thread 1: 4..7, etc.
+- Elements are 2 bytes. `lane*4` means offset `lane * 8` bytes.
+- Thread 0: bytes 0..7 -&gt; banks 0,1.
+- Thread 1: bytes 8..15 -&gt; banks 2,3.
+- ...
+- Thread 15: bytes 120..127 -&gt; banks 30,31.
+- Thread 16: bytes 128..135 -&gt; banks 0,1.
+So 2-way bank conflict. As said, acceptable.
+
+Can I avoid it by storing as `__nv_bfloat162` and having each thread load two `__nv_bfloat162` values? Still 2-way. To get no conflict, I&#x27;d need to pad D to 136 or use swizzling. Not worth it for now.
+
+Actually, if I use `float4` for loads in the cooperative phase, that&#x27;s 16 bytes per thread. There will be 4-way bank conflict (16 bytes / 4 bytes per bank = 4 banks). With 256 threads, the hardware handles this in 4 cycles. Still okay.
+
+Now, correctness: numerical accuracy.
+- `__expf` has lower accuracy than `expf` but within CUDA specs. For bf16 tolerance 1e-2, it&#x27;s fine.
+- Order of operations: In the standard attention formula, we do `softmax((QK^T)*scale)`. Here `qk *= scale` uses `float` scale.
+- Softmax online algorithm is mathematically equivalent to standard softmax.
+- We accumulate output in `float` and cast to bf16 at the end.
+- This should match standard `F.scaled_dot_product_attention` within 1e-2 easily.
+
+Wait, one subtle issue: For GQA, each query head attends to the same K/V head. My mapping `kv_head = head / (Hq / Hkv)` is correct.
+
+Another potential issue: Floating point operations order.
+In my kernel, each warp handles one query. For a given query, it iterates over keys in order of KV tiles. Within a tile, keys `j=0..127` are processed sequentially. The softmax updates are exact under float associativity. The order is exactly the same as standard attention. So output should be very close.
+
+Let&#x27;s check dimensions:
+- B=4
+- Hq=32
+- Hkv=8
+- T=2048
+- D=128
+- Grid: dim3( B * Hq, T / TILE_Q ) = dim3(128, 256).
+- Block: dim3(256).
+Max grid x is huge, y is 65535. 256 &lt; 65535. Fine.
+
+Let&#x27;s write the full code.
+One catch: `at::BFloat16` from torch doesn&#x27;t have `__nv_bfloat16` built-in conversion directly, but casting `(at::BFloat16)` from `__float2bfloat16` requires a constructor. Actually `__nv_bfloat16` is CUDA type. `at::BFloat16` is the PyTorch type (16-bit struct). They have the same bit representation but might be different types in C++.
+In CUDA kernels included via `torch/extension.h`, I can use `at::BFloat16` directly. But does `at::BFloat16` support arithmetic? No, it&#x27;s just a struct with `x` member. Better to reinterpret as `__nv_bfloat16` or `__nv_bfloat162` for vectorized loads.
+Actually, `at::BFloat16` is aligned to 2 bytes. We can safely `reinterpret_cast&lt;const __nv_bfloat16*&gt;(q.data_ptr&lt;at::BFloat16&gt;())`. This is common.
+
+But for `float4` loads, we need to load from `at::BFloat16*` pointer which is 2-byte aligned. `float4` requires 16-byte alignment. Since the rows are 256 bytes (D=128 * 2), the start of each tile row is 256-byte aligned. Good.
+However, if we load `float4` from `q_ptr` offset by an arbitrary thread index, e.g., `q_ptr + i*8`, is it always 16-byte aligned? Yes, because `i*8 * sizeof(at::BFloat16) = i*16` bytes. Since the base pointer is aligned to at least 256 bytes, adding a multiple of 16 bytes preserves 16-byte alignment.
+
+Wait, is the base `q_ptr` for the tile aligned to 16 bytes? `q_ptr` in the kernel points to `q + ((batch * Hq + head) * T + q_idx) * D`.
+The offset in bytes is `((batch * Hq + head) * T + q_idx) * D * sizeof(bf16)`.
+`D * sizeof(bf16) = 256`. So the offset is a multiple of 256. Yes, aligned to 256.
+So loading `float4` from `q_ptr + i*8` is safe. Similarly for `k_ptr` and `v_ptr` tile starts.
+
+One more issue: SMEM `float4` stores to `k_smem`.
+`reinterpret_cast&lt;float4*&gt;(k_smem)[i] = val`.
+Is `k_smem` (shared memory) guaranteed to be 16-byte aligned? We declare `__nv_bfloat16* k_smem`. As a shared memory pointer from `extern __shared__ char smem[]`, its address is aligned to at least 16 bytes by CUDA for dynamic shared memory? Actually, shared memory arrays are aligned to the alignment of the first element if declared statically. For dynamic shared memory, the pointer is aligned to at least 16 bytes? CUDA C Programming Guide says dynamic shared memory is aligned to 16 bytes. So yes.
+
+So float4 loads/stores to SMEM are safe.
+
+Now, confirm `__nv_bfloat16` registers `q0..q3`. Can I cast `at::BFloat16` to `__nv_bfloat16` on load? Since `reinterpret_cast&lt;const __nv_bfloat16*&gt;(q_ptr)[idx]` will give `__nv_bfloat16`. So `q0 = reinterpret_cast&lt;const __nv_bfloat16*&gt;(q_ptr)[lane * 4 + 0]` etc.
+
+Actually, `q_ptr` is `const at::BFloat16*`. I&#x27;ll just cast the base. Or I can do:
+```cuda
+const __nv_bfloat16* q_bf = reinterpret_cast&lt;const __nv_bfloat16*&gt;(q);
+const __nv_bfloat16* k_bf = reinterpret_cast&lt;const __nv_bfloat16*&gt;(k);
+const __nv_bfloat16* v_bf = reinterpret_cast&lt;const __nv_bfloat16*&gt;(v);
+__nv_bfloat16* o_bf = reinterpret_cast&lt;__nv_bfloat16*&gt;(o);
+```
+Then index as before.
+
+In the cooperative loading loop:
+```cuda
+for (int i = threadIdx.x; i &lt; (TILE_KV * D) / 8; i += blockDim.x) {
+    float4 k4 = reinterpret_cast&lt;const float4*&gt;(k_gptr)[i];
+    reinterpret_cast&lt;float4*&gt;(k_smem)[i] = k4;
+    float4 v4 = reinterpret_cast&lt;const float4*&gt;(v_gptr)[i];
+    reinterpret_cast&lt;float4*&gt;(v_smem)[i] = v4;
+}
+```
+Where `k_gptr` is the base of the KV tile.
+`(TILE_KV * D) / 8` because `float4` covers 8 bf16. 128 * 128 / 8 = 2048. Threads 256. Each does 8 iterations. Nice.
+
+For writing back output, we write one query per warp. To avoid bank conflicts or serialization when multiple warps write to global memory:
+- Each warp writes 8 bf16 (16 bytes) per query.
+- With 8 warps, we issue 8 writes per block.
+- This is fine.
+
+Wait, is there a requirement that all threads in a block participate in `__syncthreads()`? Yes. In the code above, if I have `if (q_idx &gt;= T) return;` before `__syncthreads()`, it will deadlock if some threads return early. But T=2048 is an exact multiple of TILE_Q=8. And grid is sized exactly. So `q_idx` will always be &lt; T. No need for early return. Good.
+
+Since all threads participate, the cooperative load and `__syncthreads()` are safe.
+
+Now, potential improvement: use `__ldg` for Q load since Q is read-only and not in SMEM. Actually Q is read once per block. `__ldg` uses read-only cache.
+```cuda
+const __nv_bfloat16* q_row = q_bf + ((batch * Hq + head) * T + q_idx) * D + lane * 4;
+q0 = q_row[0]; // compiler might use ldg automatically because q is const __restrict__ __nv_bfloat16*
+```
+I&#x27;ll mark all global pointers as `const __restrict__`.
+
+Let&#x27;s write the kernel. I want to define constants as `constexpr int`.
+
+Headers:
+`#include &lt;torch/extension.h&gt;`
+`#include &lt;cuda_runtime.h&gt;`
+`#include &lt;cuda_bf16.h&gt;`
+
+Note: `__nv_bfloat16` comes from `cuda_bf16.h`.
+
+Also, `__shfl_xor_sync` requires `__CUDA_ARCH__ &gt;= 300`. H100 is sm_90. Fine.
+
+A possible issue: `static_assert(smem_size &lt;= ...)` won&#x27;t work if smem_size is dynamic. I just won&#x27;t eat dynamic smem. I&#x27;ll use `extern __shared__` and pass the size at launch.
+
+Wait, I can avoid `extern __shared__` and just declare static shared memory if total is known at compile time: `__shared__ __align__(16) __nv_bfloat16 smem[TILE_KV * D * 2];` where `TILE_KV=128, D=128` gives 32768 elements -&gt; 65536 bytes. This is within static shared memory limits (228KB? Actually static limit is 48KB by default unless opt-in. But opt-in is tricky with torch extension). Using `extern __shared__` and passing size at launch avoids the static limit, because dynamic shared memory can be larger.
+
+Wait, the default limit for static shared memory per block is 48KB on most architectures, but can be configured up to 228KB on Hopper using `cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`. But for `extern __shared__`, dynamic shared memory also has a default limit. The runtime/kernel launch requires setting max dynamic shared memory size if &gt; 48KB? Let&#x27;s check: On Hopper, max dynamic shared memory per block is 227KB. But to use more than 48KB per block with dynamic smem, you still need to call `cudaFuncSetAttribute`? I think on Ampere/Hopper, the limit per block is 164KB/227KB. The default might still be 48KB per block for dynamic shared memory unless you specify a larger `smem_size` in the kernel launch? The kernel launch `&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;` where `smem_size` can be up to the device limit. But do you need the attribute? Prior to Ampere, you needed `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);` if `smem_size &gt; 48KB`. On Hopper, I think you still need it if &gt; 48KB or 96KB? Actually, since Volta, the maximum shared memory per block is configurable. You might need to set it using `cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize)` before launching. However, in some recent CUDA versions, the launch config itself might handle it? No, I think you still need the attribute.
+
+Let&#x27;s look it up quickly (in my head): For kernels needing &gt; 48KB shared memory, you must call `cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);`. This is well-known.
+
+So in my C++ wrapper, I should call:
+```cpp
+size_t smem_size = TILE_KV * D * 2 * sizeof(__nv_bfloat16); // 64KB? Wait, 2 arrays.
+size_t smem_size = 2 * TILE_KV * D * sizeof(__nv_bfloat16);
+// 2 * 128 * 128 * 2 = 65536.
+```
+Wait, 65536 is 64KB, which is &gt; 48KB. So I need to set the attribute!
+
+Actually 64KB is &gt; 48KB, so I definitely need the attribute.
+What about 48KB exactly? I think &gt; 48KB needs the attribute. Let&#x27;s set it to be safe: if smem_size &gt; 48KB (49152), call `cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);` -- no wait, it&#x27;s `cudaFuncAttributeMaxDynamicSharedMemorySize`. On Hopper/Ampere, the limit is 164KB/227KB. But the function attribute may need to be set for each kernel before being used.
+
+If I set it to 65536, that should work on H100.
+
+But wait, can I instead just use `__shared__` with static allocation and avoid the attribute? Static shared memory is limited to 48KB per block per default compilation (unless passing `-Xptxas -v`? No). Actually static shared memory also has a 48KB limit without the attribute? No, the limit is on shared memory per block. Both static and dynamic count toward the limit. But for dynamic, the launch config explicitly requests the size, and if it&#x27;s over the device default/cap, you need to bump the attribute.
+
+I&#x27;ll set the attribute in the C++ wrapper using `cudaFuncSetAttribute`.
+
+Another alternative: reduce SMEM usage to &lt;= 48KB.
+Can I use TILE_KV=64 instead of 128?
+- K: 64*128*2 = 16KB. V: 16KB. Total = 32KB. Way under 48KB!
+If TILE_KV=64:
+- Iterations over T: 2048/64 = 32.
+- Block count: 4*32*256 = 32768.
+- SMEM: 32KB. At 228KB per SM, we can run up to 7 blocks concurrently (7*32=224KB). But thread limit: 7*256=1792 threads &lt; 2048. Register limit: assuming 32 regs/thread, 256*32=8K regs, 64K/8K=8 blocks. So SMEM is the limit: 7 blocks = 7*256=1792 threads active. That&#x27;s actually very great!
+- Wait, 7 blocks per SM! That means 7 warps per query? No, block still has 8 warps for 8 queries.
+- But 7 concurrent blocks per SM is amazing for latency hiding.
+- However, TILE_KV=64 means 32 iterations over KV tiles. Compare to TILE_KV=128 with 16 iterations. The 64KB version had 3 blocks/SM (768 threads). The 32KB version has 7 blocks/SM (1792 threads). That&#x27;s much better occupancy.
+- Memory traffic: 32 tiles vs 16 tiles means reading K and V twice as many times. But if we have 1792 threads active vs 768, global memory latency hiding is much better. However the total HBM traffic increases. For 32 tiles, K/V read twice as much. So overall HBM traffic increases by ~50%? Actually Q and O are constant. K+V traffic doubles. Total traffic becomes 67 + 2*33.5*2 + 67 = 201MB. Compared to 134MB for 16 tiles? Let&#x27;s recalc:
+  - For TILE_KV=128: 16 tiles. HBM reads = Q (67MB) + 16*(K_tile+V_tile) + O (67MB) = 67 + 16*(32KB*4*8*2? Wait, K_tile total bytes for all batches/heads). Actually per block load: K tile = 128*128*2 = 32KB. But each block loads its own tile for its KV head. Total K/V read across all blocks = #blocks * tile_size = (B*Hq*(T/TILE_Q)) * TILE_KV*D*2 bytes. This is tricky because each query head loads the same K/V tile if they share the KV head.
+  - In GQA, 4 query heads share 1 KV head. So each KV head&#x27;s data is loaded 4 times (once by each of the 4 query head blocks). So total K read from HBM = B * Hkv * T * D * 2 bytes * (Hq/Hkv) = B * Hq * T * D * 2 = 67MB. Wait! That&#x27;s the same size as Q.
+  - Actually in standard attention (non-cached), K is read by every query head. So total K read traffic = B * Hq * T * D * 2 bytes. Similarly V. FlashAttention doesn&#x27;t change this unless K/V are persistent in L2 across blocks. In practice, with enough SMs and L2 cache, the K/V reads are cached when multiple query heads on the same SM access the same KV head&#x27;s tile.
+  - So whether I use TILE_KV=64 or 128, the total number of reads from HBM might not double if the L2 can keep the KV tiles. But L2 is 50MB on H100, the full K+V set is 33MB. Since K and V are read multiple times, they fit in L2. So increasing tile count may not increase HBM traffic as much because data stays in L2.
+  - The main difference is the number of kernel loop iterations, which affects instruction overhead.
+
+So TILE_KV=64 with 7-way concurrency might actually be faster than TILE_KV=128 with 3-way concurrency because of better latency hiding and less SMEM pressure. But 16 vs 32 iterations could matter.
+
+TILE_KV=96? 96*128*2*2 = 48KB. Exactly at the limit. Then iterations = 2048/96 = 21.33, not integer. Bad.
+TILE_KV=80? 80*128*2*2 = 40KB. Iterations 25.6. Bad.
+TILE_KV=128 is nice because it&#x27;s integer. 64 is also integer. 256? 256*128*2*2 = 128KB. Too big for &gt;1 block concurrently (128KB*1=128KB &lt; 228KB, but 2 blocks = 256KB &gt; 228KB). 1 block/SM = 256 threads. Bad.
+
+What if I don&#x27;t load V into SMEM at all, but load it on-demand from global or L2? Then SMEM is just K: 32KB for TILE_KV=128, or 16KB for TILE_KV=64. I can increase concurrency.
+But V is accessed in the inner loop (for each key j, load V row). Loading V globally in the inner loop for each key would cause 128 global loads per tile per warp. That&#x27;s 128*256*16 = 524288 global loads per block? Actually per block over 16 tiles, 2048 loads. That is high latency. Better to keep V in SMEM.
+
+But what if I use a smaller V tile or stream it? Complex.
+
+TILE_KV=64 and SMEM=32KB is very attractive. Let&#x27;s see: 7 blocks per SM = 1792 threads. Register usage per thread should be low enough to allow this. Let&#x27;s estimate registers per thread in our kernel:
+的生活态度，q0-3 (4), k0-3 (4), v0-3 (4), o0-3 (4 floats = 4 or 8 regs?), m, l, and temporaries.
+If o0-3 are floats, they take 4 registers each = 16 registers.
+Plus q, k, v as nv_bfloat16. On CUDA, __nv_bfloat16 might be stored as a 16-bit value but in a 32-bit register? Or packed. Let&#x27;s assume unpacked: 1 register each. 12 registers.
+m, l: 2 registers.
+plus loop counters: 3 registers.
+Total ~33 integer/float registers. The compiler might use more. If we want 7 blocks concurrently (64K/7 = 9.3K regs per block, /256 threads = ~36 regs/thread max), we need the kernel to use &lt;= 36 registers. That&#x27;s extremely tight! Probably the compiler will use &gt; 36.
+
+If the compiler uses ~48 registers/thread, then with 256 threads, that&#x27;s 12K regs per block. 64K/12K = 5.33 -&gt; 5 blocks per SM. With 32KB smem, 228/32 = 7 blocks by SMEM, but registers limit to 5. 5*256 = 1280 threads active. Still very good.
+
+What about TILE_KV=128 and SMEM=64KB? 228/64 = 3 blocks by SMEM. If registers/thread = 48, then 5 blocks possible by registers, but SMEM limits to 3. 3*256=768 threads active. Less than 5*256=1280 for the 32KB case.
+So the 32KB case allows more thread-level parallelism (up to 5 or 7 blocks) if registers allow.
+
+However, 32 tiles means 32 iterations. 16 tiles means 16 iterations. More iterations mean more synchronization overhead and more loop instructions.
+But 768 vs 1280 threads is a significant difference in latency hiding.
+
+Maybe I should try TILE_KV=64 and see. I think it&#x27;s the safer bet for occupancy.
+
+Wait! There is another possibility: use more queries per block with fewer warps per query.
+For instance:
+- Block size = 128 threads (4 warps).
+- Each warp handles 2 queries (sequentially). Total 8 queries per block.
+- Or each block handles 16 queries with 8 warps? 256 threads / 16 queries = 16 threads per query.
+- With 16 threads per query, each thread handles 8 dimensions. Dot product: 8 multiplications + 7 adds, then reduction across 16 threads.
+- This increases arithmetic per thread and might be more efficient.
+
+But let&#x27;s keep the 1-warp-per-query model as it&#x27;s the simplest and most parallel.
+
+Actually, I want to ensure good performance. If the reference is FlashAttention, it is highly optimized and likely uses Tensor Cores + fused online softmax. Can my simple warp-shuffle kernel beat it?
+H100 FlashAttention already exists (FlashAttention-3 for Hopper). Our reference is the A100-specific version (likely FlashAttention-2). FlashAttention-2 on H100 might not use the newer features but still performs very well due to being memory-optimal.
+However, our simple kernel:
+- Does not use Tensor Cores. For QK^T and PV, it uses manual FMAs.
+- Arithmetic intensity per thread is low (4 FMAs per key, a few exp per key).
+- Global memory loads of K/V are done once per block and cached in SMEM.
+- Occupancy is reasonable.
+
+Let&#x27;s calculate the compute and memory bounds for the simple kernel more carefully.
+Assume TILE_Q=8, TILE_KV=64, block=256 threads, SMEM=32KB.
+One block:
+- Load K tile: 64*128*2 = 16KB. Load V tile: 16KB. Total HBM read per tile = 32KB.
+- Compute: 8 queries * 64 keys * (128 mul-adds for QK + 128 mul-adds for PV) = 8 * 64 * 256 = 131072 FMAs = 262144 FLOPs.
+- Time if compute bound at 1 TFLOPS per SM (rough guestimate for non-TC): 262us? Wait, 262K FLOPs. At 1 TFLOPS = 1e12 FLOPs/s. 2.6e5 / 1e12 = 2.6e-7 s = 0.26 us. That&#x27;s negligible.
+- Time if memory bound at 20 GB/s effective per SM (just a guess, due to many SMs sharing L2/HBM): 32KB / 20GB/s = 1.6us.
+- So each tile takes ~2us. 32 tiles = 64us. For 32768 blocks, if 1280 threads active (5 blocks * 256) = 5 blocks per SM * 132 SMs = 660 concurrent blocks. Total waves = 32768 / 660 = 49.6 waves. Total time = 49.6 * 64us = 3.1ms. That&#x27;s plausible but maybe slow.
+- If HBM bandwidth per SM is actually higher, say 100GB/s when aggregated via L2, then 32KB / 100GB/s = 0.32us per tile. 32 tiles = 10us. Waves: maybe 10-30. Total 0.5ms.
+- The HBM bandwidth is 3.35TB/s total. If fully utilized across 132 SMs, that&#x27;s 25GB/s per SM. So 1.6us per tile memory time is realistic.
+- 49 waves * 2us compute + memory? Wait, memory and compute overlap. But loading next tile requires previous tile compute done. Actually it&#x27;s sequential: load tile -&gt; compute tile. If compute is ~2us and memory is ~1us, total per tile ~2us (overlapped a bit). 32 tiles = 64us per block.
+
+If total time is ~3ms, that is much slower than FlashAttention reference (which is probably ~0.2-0.5ms).
+So the simple kernel might NOT be fast enough. We need a kernel that does more work per memory access or uses Tensor Cores to increase compute throughput and reduce effective time.
+
+Why is FlashAttention faster?
+- It uses Tensor Cores for the matrix multiplications, which are much faster on the dense operations.
+- Even if memory bound, Tensor Cores reduce the time spent on the compute part, making the memory stall overhead more dominant. But they also allow pipelining and asynchronous copies (on H100).
+
+Wait, but if memory is the bottleneck, reducing compute time doesn&#x27;t help total time. However, FlashAttention pipelines loads with compute via asynchronous copy (`cp.async`) and overlapping. Also, it may process more queries per block (e.g., 64 or 128) allowing more FLOPs per HBM byte. Our simple block processes only 8 queries. Can I process more queries per block while keeping warp flexibility?
+
+If I process 64 queries per block:
+- 64 warps = 2048 threads. Max per block is 1024. So need 2 warps per query or larger warp? Not possible with 1 warp per query.
+- I could use 1024 threads (32 warps), each handling 1 query. 32 queries per block.
+- Then HBM reads per tile: K and V tiles are shared among 32 queries. Compute: 32 * 64 * 256 = 524K FLOPs per tile.
+- Memory per tile still 32KB. 524K FLOPs / 32KB = 16 FLOPs/byte. Still low.
+- Wait, with 32 queries, the compute time increases proportionally (more warps computing in parallel), while memory time stays same (one K/V tile load).
+- Since warps run in parallel, the block takes roughly the same time to compute 32 queries as 8 queries (because SMs have more warps). Actually 32 warps on 1 block means 32 warps executing concurrently if the SM can handle them. If only 7 warps per SM are active across blocks... hmm.
+- Wait, with block size 1024 threads (32 warps), 2 blocks per SM = 64 warps per SM. This might be better than 5 blocks * 8 warps = 40 warps per SM. Actually 64 warps &gt; 40 warps. More warps per SM means better latency hiding.
+- SMEM: 32KB per block. 228/32 = 7 blocks max, but threads limit to 2 blocks (2048 threads). So 2 blocks of 1024 threads = 64 warps.
+- Register pressure: 1024 threads * 32 regs = 32K regs. 64K/32K = 2 blocks. Good.
+- If register usage is 48, 1024*48 = 48K regs. 64K/48K = 1 block only! That would be terrible.
+- So for 1024 threads, we really need &lt; 63 avg registers to get 1 block... wait, 1024*63 = 64512 &gt; 64K. So max avg is 62 to get 1 block. To get 2 blocks: max avg is 31. Impossible with any computation.
+- So with 1024 threads, we can only run 1 block per SM concurrently. Occupancy = 1024 threads. That&#x27;s acceptable.
+- SMEM = 32KB. So we can run 1 block of 1024 threads and 32KB smem. 1024 threads = 32 warps.
+- This handles 32 queries per block.
+- Grid = 4 * 32 * (2048/32) = 4 * 32 * 64 = 8192 blocks.
+- Concurrent blocks = 132 SMs * 1 = 132.
+- Waves = 8192 / 132 = 62 waves.
+- Per block: 32 queries * 64 keys * 256 FLOPs = 524K FLOPs.
+- HBM read per tile: 32KB.
+- At 25GB/s per SM: 1.28us memory. Compute at 1 TFLOPS non-TC: 0.52us. Total per tile ~1.3us.
+- 32 tiles = 42us per block.
+- Total time = 62 * 42us = 2.6ms. Again seems slow.
+
+Wait, I&#x27;m making a huge mistake. The compute time on Tensor Cores is much higher throughput. If FlashAttention uses Tensor Cores, the QK^T for 64x128 @ 128x64 takes maybe a few microseconds, not hundreds! But since HBM bandwidth is still the bottleneck, total time is roughly memory bound.
+Let&#x27;s compute memory bound time directly.
+Total HBM traffic for FlashAttention:
+- Read Q once: 67MB
+- Write O once: 67MB
+- Read K and V: each is read T/Tile_K times. If Tile_K=128, read 16 times. Total K traffic = B * Hq * D * T * 2 bytes * (Hq/Hkv?) Wait, each block reads K tile of 32KB. Number of blocks = B*Hq*(T/Tile_Q). For Tile_Q=64, blocks = 4*32*32 = 4096. Each reads K 16 times -&gt; 4096*16*32KB = 2GB. That&#x27;s huge.
+- Wait, FLOPs didn&#x27;t match. Let&#x27;s recalculate.
+  - Each K element is read by every query head block that shares the KV head. GQA ratio = 4. Number of query blocks per KV head = (Hq / Hkv) * (T / Tile_Q).
+  - For Tile_Q=64: (32/8) * 32 = 4 * 32 = 128 blocks per batch per KV head.
+  - Each block reads K tile 16 times. Total K reads per batch per KV head = 128 * 16 * 32KB = 64MB.
+  - K total size per batch per KV head = 2048 * 128 * 2 = 512KB.
+  - So K is read from HBM 128 times! That&#x27;s a lot.
+  - But L2 caches K across blocks. If K fits in L2, subsequent reads might hit L2. K total per KV head is 512KB. L2 on H100 is 50MB. All K/V across all heads? 8 KV heads * 512KB = 4MB. Fits easily!
+  - So K and V are effectively read from L2, not HBM, after the first wave.
+  - Therefore the effective bandwidth is much higher (L2 bandwidth is ~10-20 TB/s).
+  - This means the kernel might actually be compute-bound or L2-latency-bound, not HBM-bandwidth-bound.
+  - FlashAttention heavily relies on L2 caching for KV when multiple query heads reuse them.
+
+So the time depends on L2 bandwidth and compute throughput.
+If K/V are in L2, then the tile loads are fast, and the bottleneck is SMEM bandwidth for feeding Tensor Cores or the compute itself.
+For our simple kernel, we process 1 key at a time per warp sequentially. SMEM bandwidth for K/V row reads: 32 warps * 8 bytes/warp * 2 (K+V) = 512 bytes per key. For 64 keys: 32KB SMEM reads. SMEM bandwidth is ~10TB/s. 32KB / 10TB/s = 3.2ns. That&#x27;s tiny.
+Wait, that&#x27;s per block. But with 32 warps, we might be issuing these loads in parallel. Actually each warp reads its own row of K and V? No, for a given key j, all warps read the *same* row j of K and V. Because all warps are on different queries but the same key.
+- K row for key j: 128 bf16 = 256 bytes.
+- 32 warps reading the same 256 bytes simultaneously -&gt; broadcast or serialized. With SMEM broadcasts, this might be fast, but 32 warps = 1024 threads reading the same 4-byte chunk groups. Bank conflicts: all threads in all warps hit the same row. This is a massive broadcast/n-way conflict.
+- 32 warps * 32 threads = 1024 threads, each reading 8 bytes (4 bf16). 1024 * 8 bytes = 8KB. But the row is only 256 bytes. So it&#x27;s a huge broadcast load.
+- SMEM can handle broadcasts efficiently if threads in a warp read the same address. But here, threads in a warp read *different* addresses within the row (thread t reads lane*4), which is coalesced. But across warps, they read the same addresses as other warps. SMEM has one or a few read ports per bank. With 32 warps, it might take 32 cycles to serve all warps if serialized. This is a major bottleneck!
+
+Ah! This is critical. In our design, 32 warps all reading the same K row and V row in lockstep (because all warps iterate j synchronously). The SMEM accesses from different warps for the same address might be queued.
+On Ampere/Hopper, there are multiple SMEM banks, and requests from different warps can be processed in parallel to some extent, but not fully. This could kill performance.
+
+In FlashAttention, the compute is organized as warptile MMA where each warp computes a subtile of the score matrix. This means warps access different rows/columns of K, distributing the SMEM bandwidth.
+For example, in FlashAttention tile=64x128:
+- Warp 0 computes S[0:16][0:16] (using K columns 0:16).
+- Warp 1 computes S[0:16][16:32].
+- ...
+- This way, warps access different parts of K and V, spreading the load across SMEM banks.
+
+So my simple broadcast design is flawed for large number of warps per block. The SMEM bandwidth per SM is high but not infinite.
+
+Let&#x27;s redesign to have each thread/warp process a *slice* of the key dimension, so multiple warps cooperate on one query, or different warps process different KV subtiles to avoid broadcast.
+
+Option: process multiple KV tiles in parallel across warps.
+For example, block has 8 warps. Warp 0 handles query 0 and keys 0..63. Warp 1 handles query 0 and keys 64..127? No, we want to compute the full softmax over all keys, which is sequential across tiles but within a tile we need all keys.
+
+Actually, for one query, to compute its row of P and update O, it needs to process all keys sequentially for online softmax. However, we can parallelize across the dimension D for the output accumulation. But the score computation per key is a dot product that requires reduction.
+
+We could have 4 warps cooperate on one query:
+- Warp 0 handles dims 0..31, warp 1 handles 32..63, etc.
+- They each compute partial dot products, reduce via warp shuffle, then one thread accumulates or broadcasts the score back.
+- Then all warps load their part of V and update their part of O.
+- This avoids all warps reading the same V elements? Actually they still read different V elements. K is the broadcast issue: all warps read the same K row but different dimensions. If 4 warps, each reading 32 dims of the same row, they access different banks -&gt; less conflict. 32 warps (1024 threads) reading the same row is still a lot.
+
+Let&#x27;s go back to a smaller block size.
+If block has 8 warps (256 threads), that&#x27;s 8 queries. For a given key row j, 8 warps read it. 8 warps * 32 threads = 256 threads reading 256 bytes (the row). Each thread reads 8 bytes. Total read = 2KB. The row is 256 bytes. So 8x oversubscription. This might still be okay for SMEM (a few cycles). With 32 warps it&#x27;s 32x oversubscription, probably too much.
+
+So block size of 256 threads (8 warps) seems better for SMEM bandwidth broadcast.
+And we can increase tile size to 128 to reduce HBM/L2 tile count. With 8 warps and TILE_KV=128, SMEM = 64KB. 3 blocks per SM. 768 threads active.
+Broadcast factor: 8 warps reading same K row. Row = 256 bytes. 8 warps * 32 threads * 8 bytes = 2KB total request vs 256B data. 8x oversubscription. Acceptable.
+Broadcast for V row: same.
+
+So TILE_Q=8, TILE_KV=128, block=256 threads is likely better for SMEM broadcast.
+But &gt;48KB SMEM requires the attribute. I&#x27;ll set it.
+
+Can I reduce the oversubscription further by having each warp process a *chunk* of keys for the *same* query? Then they&#x27;d access different K rows, avoiding broadcast. But softmax becomes harder because we need to merge chunks. However, we can do a two-pass approach:
+- Pass 1: Each warp computes scores and local max for its chunk of keys (e.g., 16 keys).
+- At end of tile, all warps sync and communicate local max to find global max of the tile.
+- Then rescale and compute local sum and local O accumulation.
+- Then accumulate into global O.
+- But this requires storing partial O and sums, and doing reductions across warps. This is exactly what FlashAttention does, but simplified.
+
+Wait, if I have 8 warps, and each processes one query but a different chunk of keys, I&#x27;d need 8 queries * 8 chunks = 64 warps? No.
+Let&#x27;s consider: 1 block handles 1 query. 8 warps process 8 chunks of keys (e.g., each chunk is 16 keys out of 128). After computing scores for all chunks, they reduce to find global max, then compute weighted sum and output.
+This is feasible:
+- Each warp handles a contiguous chunk of keys.
+- Warp computes local max `m_local`, local sum `l_local`, and local O accumulator `o_local[4]`.
+- After tile: write `m_local`, `l_local`, `o_local` to SMEM.
+- __syncthreads().
+- Thread 0 reduces across warps to find tile max `m_tile`.
+- Compute factors `exp(m_local - m_tile)` for each warp.
+- Rescale O and sum.
+- Update global max, global sum, global O.
+This is a bit complex but manageable. But only 1 query per block means grid size = 4*32*2048 = 262144 blocks, which is huge. Max blocks in grid is ~2^31, so fine. But wave count: 262144 / (132 * 8 blocks? no, 1 query per block means 8 warps per block, 256 threads. SMEM = 64KB (K tile 32KB, V tile 32K? but V is not needed if each warp loads its chunk directly? Actually V is needed for O).
+- If SMEM = K tile (32KB) + workspace (few KB), we can have 7 blocks per SM. 7*256=1792 threads.
+- But 262144 blocks / (132*7) = 283 waves. That&#x27;s a lot of kernel launch overhead? Actually overhead per wave is small.
+
+However, having so many blocks (262k) means each block does very little work (128 keys / 8 warps = 16 keys per warp). The tile loop has 16 iterations for T=2048. Each block processes 128 keys per tile. Wait, 1 query per block, tile_kv=128, 16 tiles. Each warp handles 16 keys. Compute per warp: 16 keys * 128 dims * 2 = 4K FLOPs. Very small. Kernel launch overhead might dominate.
+
+So 8 queries per block is better.
+
+What if I increase queries per block to 16, but use 2 warps per query? 16 queries * 2 warps = 32 warps = 1024 threads. Per query: 2 warps handle the same query but maybe different key chunks? Or one warp handles dims 0..63, the other 64..127.
+- 2 warps per query: warp A handles dims 0..63, warp B handles 64..127. Each computes partial dot product over 64 dims.
+- Reduce partial dots across 2 warps using SMEM or shfl across warps? `__shfl_sync` only within warp. Use `__threadfence_block` + SMEM. Or use `cg::reduce` from C++ cooperative groups.
+- After getting score, both warps load V row and update their half of O.
+- This avoids broadcast on K row to some extent: 2 warps per query means 16 queries * 2 = 32 warps accessing same K row? Still a lot of warps.
+- But each warp accesses different half of dims? Warp A: lanes 0..31 access dims 0..127 with their 4 elements. Wait, with 64 dims per warp, each thread handles 2 dims? Let me recalculate. D=128. If 2 warps handle one query, we can split dims: warp A handles dims 0..63 (each thread handles 2 dims), warp B handles 64..127. For K row, warp A accesses columns 0..63, warp B accesses 64..127. So they access different banks! This eliminates broadcast conflicts on K completely.
+- For V, both warps need the whole row to update their part of O? Warp A only needs V[0..63], warp B needs V[64..127]. They also access different banks!
+- So with 2 warps per query, we also eliminate V broadcast conflicts.
+
+Wait, this is a huge win. And we still process 16 queries per block.
+- Block size: 16 queries * 2 warps/query = 32 warps = 1024 threads.
+- Each warp handles 2 dims per thread? D=128. Warp has 32 threads. Each thread handles 2 dims (32*2=64).
+- Register usage: q0, q1 (2 bf16), k0, k1, v0, v1, o0, o1 (2 float each). Less than before! Because each thread handles fewer dims (2 instead of 4).
+- Register pressure might be low enough for 1 block per SM. 1024 threads * 32 regs = 32K. 64K/32K = 2 blocks max. But we want to see if we can get 1 block per SM. With 1024 threads, that&#x27;s 100% occupancy if max threads is 2048. Actually 1 block of 1024 threads means 50% thread occupancy. 2 blocks would be 100%. To get 2 blocks, avg regs/thread &lt;= 31. Probably impossible. Let&#x27;s say we get 1 block per SM. 1024 threads active. That&#x27;s not bad.
+
+But SMEM? K tile 128*128*2 = 32KB. V tile 32KB. Total 64KB. 228/64 = 3 blocks by SMEM. But thread/occupancy limits to 2 blocks if registers permit. Probably 1 or 2 blocks.
+If 2 blocks per SM: 2048 threads active. Great!
+
+But wait, to have 2 blocks of 1024 threads, we need to fit two K/V tiles in SMEM simultaneously? Yes, each block gets its own SMEM partition. 64KB * 2 = 128KB &lt; 228KB. So SMEM allows 3 blocks, but threads allow 2. Can registers allow 2? As above, maybe not.
+If we get 1 block per SM: 1024 threads active. 132 SMs = 132 concurrent blocks. Total blocks = 4 * 32 * (2048/16) = 4 * 32 * 128 = 16384 blocks. Waves = 16384 / 132 = 124 waves.
+Per block: 16 queries * 128 keys * 128 dims * 2 FMAs = 524K FLOPs per tile. 16 tiles. Total 8.4M FLOPs. At say 10 TFLOPS per SM for non-TC, that is 0.84us compute per block? Wait, 8.4M FLOPs / 10 TFLOPS = 0.84ms? No: 8.4e6 / 1e13 = 8.4e-7 s = 0.84 microseconds. That&#x27;s tiny. Memory: 16 tiles * 64KB = 1MB. At 25GB/s per SM = 40 microseconds. So memory bound.
+But with L2 caching, K/V bandwidth is much higher. Effective bandwidth might be 100-500GB/s. 1MB / 100GB/s = 10us. 1MB / 500GB/s = 2us.
+Total time per block maybe 5-10us. 124 waves * 5us = 0.62ms.
+
+That&#x27;s still competitive!
+
+The key advantage of 2 warps per query is avoiding SMEM bank conflicts/broadcast issues. Let&#x27;s design this.
+
+Kernel Design v3:
+- TILE_Q = 16 queries per block.
+- TILE_KV = 128 keys per tile.
+- Queries per block: 16.
+- Warps per query: 2.
+- Total warps: 32.
+- Threads: 1024.
+- Each warp handles 64 dimensions of the head (split by dim).
+- Warp A (id 0): dims 0..63. Warp B (id 1): dims 64..127.
+- Wait, warp IDs within the block are 0..31. Query id = warp_id / 2. Sub-warp = warp_id % 2.
+  - If sub-warp == 0: lane handles dims lane*2, lane*2+1. (0..63 total).
+  - If sub-warp == 1: lane handles dims 64 + lane*2, 64 + lane*2+1. (64..127 total).
+
+Loop over KV tiles:
+1. Load K tile (128 x 128 bf16) into SMEM. (32K)
+2. Load V tile into SMEM. (32K)
+3. __syncthreads()
+4. For j = 0..127:
+   a. Each warp loads its 2 dims from K[j][sub_start + lane*2].
+   b. Dot product partial = q0*k0 + q1*k1.
+   c. Warp reduce via __shfl_xor_sync. Now each thread in warp has partial dot over its 64 dims.
+   d. Need to reduce partial dots from the two warps of the same query.
+      - Write partial dot to SMEM (one float per warp). Or use thread 0 of each warp to write to a SMEM array `s_qk[query_local]` and `s_qk[query_local + 16]`.
+      - Actually we can have a small SMEM scratch: `float qk_smem[16];` for the 16 queries. Warp A thread 0 writes to `qk_smem[query_local]`, Warp B thread 0 writes to `qk_smem[query_local + 16]`?
+      - Then `__syncthreads()`? That would be a sync per key! Very expensive.
+   d-alt: Instead of reducing across warps per key, we can have each sub-warp accumulate its own `m` and `l` and `o` locally over a chunk of keys, and only synchronize at the end of the tile (128 keys). This requires splitting the key dimension between the two warps.
+      - Warp A handles keys 0..63, Warp B handles 64..127.
+      - Then no inter-warp communication needed during the tile!
+      - At end of tile, we have two local maxes/sums/outputs per query. We need to merge them.
+      - Merge formula: global_m = max(m_a, m_b). global_l = l_a * exp(m_a - global_m) + l_b * exp(m_b - global_m). O similarly.
+      - Only one sync per tile (128 keys) to merge. This is much better.
+      - And SMEM broadcast is reduced: Warp A reads keys 0..63, Warp B reads keys 64..127. They access different rows -&gt; no broadcast conflicts! This is a huge win.
+
+This is brilliant. Let&#x27;s refine:
+
+For a query, we have 2 warps.
+- Warp A processes keys `j = 0..63` of the tile.
+- Warp B processes keys `j = 64..127`.
+
+But wait, each warp has 32 threads. If a warp processes 64 keys sequentially, that&#x27;s 2 keys per thread? No, the warp processes keys sequentially as a whole (all 32 threads together). Each iteration j, all 32 threads compute the score for key j and update O. The warp does 64 iterations.
+- Warp A does j = sub_start .. sub_start + 63.
+- Warp B does j = sub_start + 64 .. sub_start + 127.
+
+Within a warp, all threads access the same K row j and same V row j. But there are only 2 warps per query. And importantly, Warp A and Warp B access DIFFERENT rows (j vs j+64). So no broadcast conflict between them! Within a warp, 32 threads access different dims of the same row. That&#x27;s a coalesced access (small bank conflict as before). 2-way bank conflict is fine.
+
+So with 16 queries * 2 warps = 32 warps:
+- Warps are paired: (0,1), (2,3), ..., (30,31).
+- For a given key row, only one warp out of the pair accesses it at a time. The other warp accesses a different row. Since warps are independent schedulers, they might not be perfectly synchronized. But the SMEM request queue handles them.
+- Even if they are synchronized, only 16 warps access row j, and the other 16 access row j+64. This halves the SMEM pressure compared to all 32 warps accessing the same row.
+
+This is already better. Can we split into 4 warps per query?
+- Warp A: keys 0..31, dims 0..31
+- Warp B: keys 32..63, dims 32..63
+- ... This gets too fragmented.
+
+2 warps per query with chunked keys seems optimal.
+
+Now, each warp iterates 64 times. Can we further unroll or vectorize? Yes, process 2 keys at a time? But online softmax with 2 keys means we need to compare two scores and update. Can do:
+- Compute score_j and score_j+1.
+- m_local = max(m_local, score_j, score_j+1).
+- Update l and o accordingly. This reduces the number of exp() calls relative to keys? No, still 2 exp calls. But reduces loop overhead.
+
+Given 64 iterations, loop overhead is minimal if unrolled by 4 or 8. `#pragma unroll 4` might help. But with 64 iterations, the compiler might automatically unroll.
+
+But wait, the block has 32 warps. Synchronization:
+- `__syncthreads()` after loading K/V tiles (every 128 keys).
+- After inner loop (64 keys per warp), need to merge the two partial results.
+- Merge happens in SMEM.
+
+Let&#x27;s define the merge logic.
+Per query (local id `q = 0..15`), we have:
+- `float m_a, l_a, o0_a, o1_a` in registers of warp `q*2`.
+- `float m_b, l_b, o0_b, o1_b` in registers of warp `q*2 + 1`.
+
+At end of tile, we need to combine them.
+Method:
+1. Warps A and B write their `m`, `l`, and `o[64]` (two dims per lane? no, each warp handles 64 dims, but each thread handles 2 dims. A full O vector is 128 floats. We can&#x27;t store all 128 floats easily in SMEM if many queries. For 16 queries, 16 * 128 * 4 = 8KB. Plus m and l. Total maybe 9KB. That&#x27;s fine! We have 64KB SMEM total. K tile 32KB + V tile 32KB + workspace 9KB = 73KB. Oops, that&#x27;s &gt;64KB.
+- We need to reduce SMEM. If K and V are each 32KB, total workspace &gt;64KB means &gt;48KB dynamic limit issue plus SMEM size issue. Wait, 32+32+9 = 73KB. That&#x27;s over 64KB. But H100 has 228KB, so 73KB is fine. It would allow 3 blocks (73*3=219KB &lt; 228KB). But 73KB is &gt;48KB, meaning I need the dynamic shared memory attribute anyway.
+
+Can we avoid storing full O in SMEM? We can merge O on the fly with a small loop.
+Idea:
+- Write `m_a`, `l_a`, `m_b`, `l_b` to SMEM for each query (16 * 4 floats = 256B).
+- `__syncthreads()`.
+- Now one thread (e.g., lane 0 of warp A) reads both m and l, computes global_m, and scaling factors. It stores factors back to SMEM.
+- `__syncthreads()`.
+- Then both warps read the factors and rescale their local O in registers.
+- But they cannot combine the O contributions because O_b is in another warp&#x27;s registers. We need to add O_b to O_a. This requires one warp to read O_b from the other warp. The only way is through SMEM or shuffle across warps. Shuffle across warps within a block is not possible directly (only within a warp).
+- So we need to write O to SMEM. How much O? Each warp handles 64 dims. For 16 queries, that&#x27;s 16 * 64 dims * 4 bytes = 4KB per sub-warp group. Actually each warp&#x27;s O is 64 dims = 64 floats = 256 bytes. 32 warps * 256B = 8KB. That&#x27;s manageable.
+- We can partition SMEM: O_smem: 32 * 64 * 4 bytes = 8KB? Wait, each thread in a warp holds 2 dims. The warp collectively holds 64 dims. If each thread writes its 2 dims to SMEM: 32 threads * 2 floats = 256 bytes per warp. 32 warps = 8192 bytes (8KB).
+- m/l workspace: maybe 256B.
+- K tile: 32KB.
+- V tile: 32KB.
+- Total: 32 + 32 + 8 + 1 = 73KB.
+- This fits in 228KB and allows 3 blocks concurrently? No, 228/73 = 3.12. So 3 blocks by SMEM. But thread limit: 3 * 1024 = 3072 &gt; 2048. So threads limit to 2 blocks (2048 threads). If registers allow 2 blocks.
+- SMEM size per block: 73KB &gt; 48KB -&gt; needs `cudaFuncSetAttribute`.
+
+But we only need O_smem for a short period at the end of each tile. Do we really need 2 warps per query? If we go back to 1 warp per query (8 queries, 256 threads), we avoid needing the O_smem reduction and keep SMEM = 64KB. 64KB &gt; 48KB still needs attribute.
+With 1 warp per query and 8 queries/block (256 threads), SMEM = K (32K) + V (32K) = 64K. Block count: 4*32*256 = 32768. Concurrent blocks: 3 by SMEM. Threads: 768 active. This is simpler.
+The broadcast issue: 8 warps reading same K row. Is that worse than 2 warps reading same K row? Yes, 8x worse. But is it fatal? Maybe SMEM bandwidth is high enough. On Ampere, shared memory bandwidth is ~10-20 TB/s per SM. 256 bytes * 8 warps = 2KB. Time to read 2KB from SMEM at 10TB/s: 0.2ns. Negligible. Wait, really! 2KB / 10TB/s = 2e3 / 1e13 = 2e-10 s. That&#x27;s incredibly fast. Even with 10x overhead due to serialization, it&#x27;s 2ns.
+Is my understanding of SMEM bandwidth correct? Shared memory bandwidth per SM on Ampere/Hopper is indeed in the ~10s of TB/s. A100 has ~19 TB/s? No, A100 shared memory bandwidth is 19 TB/s? Let me think. A100 HBM is 2 TB/s. SMEM is much faster. Actually per SM, the shared memory bandwidth is around 10-20 TB/s. For 108 SMs on A100, aggregate is &gt; 1 PB/s. Yes, it&#x27;s massive.
+So 8 warps broadcasting the same 256-byte row is absolutely fine. Even 32 warps reading 1KB might be fine (1KB / 10TB/s = 0.1ns).
+
+Then why did I worry about SMEM broadcast? Because I confused it with L1/shared memory latency under heavy concurrent load from many warps. But with only 8 warps, it&#x27;s fine.
+
+Okay, the 1-warp-per-query with TILE_Q=8 and TILE_KV=128 is much simpler and SMEM broadcast is NOT a bottleneck. Let&#x27;s re-adopt it.
+
+Wait, but with 1 warp per query, each thread handles 4 dims (128/32=4). Register usage per thread: q0..q3 (4 regs if not packed), k0..k3 (4), v0..v3 (4), o0..o3 (4 floats = 8-16 regs), m, l, loop vars. Could be around 30-40 registers. With 256 threads: 256 * 40 = 10K regs. 64K / 10K = 6 blocks possible by registers. SMEM = 64KB limits to 3 blocks. So 3 blocks per SM = 768 threads. Good.
+
+If we can reduce SMEM to 48KB or less, we can get more blocks. But we need the attribute anyway if &gt;48KB. Unless we process TILE_KV=64. 32KB SMEM. Then 7 blocks per SM. But the number of tiles doubles. Is the attribute required for 32KB? No, 32KB &lt; 48KB. So we can launch without any attribute.
+And 7 blocks per SM = 1792 threads active. That&#x27;s great.
+Even though tiles are 64, number of tiles is 32. But with 7 blocks per SM, global memory latency is well hidden.
+Also, 32KB SMEM means we can declare it statically: `__shared__ __nv_bfloat16 smem[64 * 128 * 2];` (32K elements = 64KB? Wait. 64*128=8192 bf16 = 16KB. Two arrays = 32KB. Static allocation of 32768 bf16 = 65536 bytes = 64KB. That&#x27;s fine statically as long as block-level limit is &gt;64KB, but static shared memory has a default limit of 48KB. Actually the 48KB limit applies to the sum of static and dynamic shared memory per block. For static allocation of &gt;48KB, you might also need to set `cudaFuncAttributeMaxDynamicSharedMemorySize`? Or is that only for dynamic? According to CUDA docs: &quot;The maximum amount of shared memory that can be used per block is 48 KB (on devices of compute capability 3.x - 8.x) or 99 KB (on devices of compute capability 9.0), unless the kernel uses more than 48 KB of shared memory, in which case it must use dynamic shared memory.&quot; Wait, is that accurate? On Hopper (sm_90), the max static shared memory might be 48KB, and beyond that you must use dynamic. Let me recall: On Ampere, static shared memory &gt; 48KB is not allowed; you must use dynamic shared memory and set the attribute. On Hopper, I think static might still be limited to 48KB for default, but dynamic can go up to 228KB. So either way, if we need &gt;48KB, we must use dynamic and set the attribute. If we want to avoid attributes entirely, we must keep total shared memory &lt;= 48KB.
+Therefore, to avoid `cudaFuncSetAttribute` and any complexity, I should limit SMEM to 48KB.
+
+Option 1: TILE_KV=64, K+V = 32KB. Under 48KB. No attribute needed.
+Option 2: TILE_KV=128, K+V = 64KB. Needs attribute.
+Given the complexity of setting attributes in `torch.utils.cpp_extension.load_inline`... it&#x27;s actually easy to do in C++.
+
+But maybe for maximum performance and simplicity of code, I should just use 64KB and call `cudaFuncSetAttribute`. It&#x27;s standard.
+
+Actually wait, `torch.utils.cpp_extension.load_inline` compiles and loads the extension. The C++ wrapper function can call `cudaFuncSetAttribute` before launching. This is straightforward.
+
+But what if I want to avoid any chance of SMEM size issues? 48KB limit is clear. I can do TILE_KV=64 with SMEM=32KB. Then I can fit 7 blocks by SMEM (if threads allow). Let&#x27;s see if that beats 128KB tile with 3 blocks.
+Compute per block: 8 queries * 64 keys * 256 FLOPs = 131K FLOPs.
+Memory per block: 32KB.
+Tiles: 32.
+Total compute per block: 4.2M FLOPs.
+Total memory per block: 1MB.
+
+With 7 blocks per SM = 1792 threads. Time per block if memory bound at 25GB/s per SM: 1MB / 25GB/s = 40us. But with L2 cache, the actual DRAM traffic is lower. Wait, total HBM read per block: Q (1 query loads its row: 256 bytes) + K tile (16KB) + V tile (16KB). But Q is read once per block. K and V tiles are read from HBM or L2.
+Actually for 32 tiles, K and V are each read 32 times per block. 32 * 32KB = 1MB. This is a lot if going to HBM.
+But L2 caches K and V across tiles? Not within the same block, because the block reads tile 0, then tile 1, etc. L2 has 50MB, the full K+V for the KV head is 512KB. Over 32 tiles, the block reads 1MB of K and 1MB of V. Since K tile is 16KB, and L2 is 50MB, the previously read tiles might stay in L2, but the block reads them sequentially and doesn&#x27;t revisit. So L2 hit rate within a block is near zero for K/V (unless another block is reading the same tile concurrently and populates L2). But across blocks on the same SM or different SMs, blocks processing the same KV head and overlapping in time can benefit from L2.
+Given 32768 blocks on 132 SMs, many blocks run concurrently. For a given KV tile, it is read by many blocks (all blocks processing queries that map to that KV head). Since many blocks execute simultaneously, L2 can serve the data to multiple blocks without HBM reads after the first few waves. But over time, the working set for all tiles of all KV heads is 8 * 512KB * 2 = 8MB, which easily fits in L2. So after the first wave, K and V tiles might reside in L2 and be served at L2 bandwidth (~10-20 TB/s).
+So memory time per tile becomes much shorter.
+
+Thus, the 32KB SMEM (TILE_KV=64) with 7 blocks/SM might be better than 64KB SMEM (TILE_KV=128) with 3 blocks/SM because of higher occupancy and L2 caching compensating for the extra tiles.
+
+However, the 64KB variant has half the number of loop iterations, reducing loop/synchronization overhead.
+Also, 3 blocks * 256 threads = 768 threads. 7 blocks * 256 = 1792 threads. The latter is 2.3x more threads, which is significant for latency hiding and throughput.
+
+Let&#x27;s go with TILE_Q=8, TILE_KV=64, block=256 threads. SMEM=32KB.
+Register usage: each thread has q0..q3 (4), k0..k3 (4), v0..v3 (4), o0..o3 (4 float = 4 or 8 regs?), m (1), l (1), plus temporaries. Let&#x27;s estimate ~30-40 registers. If 40: 256*40=10K regs. 64K/10K = 6 blocks by registers. SMEM limit = 7 blocks. So concurrency likely 6 blocks = 1536 threads. Great!
+
+Now, can I use vectorized loads/stores for K and V tiles to improve global memory throughput?
+Yes, load as `float4`.
+For TILE_KV=64, D=128:
+- K tile elements: 64*128 = 8192 bf16.
+- float4 each holds 8 bf16. So 1024 float4 loads.
+- 256 threads, each loads 4 float4. Good.
+
+For Q load: each warp loads its query row. Row is 128 bf16 = 256 bytes. 32 threads in warp, each loads 4 bf16 (8 bytes). That&#x27;s 32 loads of 8 bytes = 256 bytes. Coalesced. I can load as `__nv_bfloat162` or `float2` (4 bytes) or `float4` (8 bytes per thread = 16 bytes?). Wait, each thread handles 4 bf16 = 8 bytes. `float2` is 8 bytes (`__nv_bfloat162` is also 4 bytes, so two of them = 8 bytes). But `float2` covers 2 `float`s = 8 bytes, which corresponds to 4 `bf16`s. So I can load Q row as `float2` per thread.
+`const float2 q4 = reinterpret_cast&lt;const float2*&gt;(q_ptr)[0];` then unpack.
+Similarly for O write.
+
+But `reinterpret_cast` between `__nv_bfloat16*` and `float*`? We should cast to `float2*` which is 8 bytes, but `float2` elements are float. The bit pattern of 4 bf16s in memory is the same as 2 float2 elements? No, `float2` is two 32-bit floats. `__nv_bfloat16` is 16-bit. 4 bf16s = 64 bits = same size as `float2` (64 bits). The reinterpretation is valid for memory copy but not for arithmetic. We just need load bits.
+Wait, `float2` contains floats. If I `reinterpret_cast&lt;const float2*&gt;(q_ptr)` and load, the compiler will perform a float2 load. This is fine as a vector memory instruction. But I can&#x27;t use the values as floats. I need to recast to `__nv_bfloat162`.
+Alternatively, I can use `__nv_bfloat162` type directly. `#include &lt;cuda_bf16.h&gt;` provides `__nv_bfloat162`. A `__nv_bfloat162` is a vector of two `__nv_bfloat16`, packed into 32 bits (4 bytes). Wait, is it 4 bytes or 8 bytes? `__half2` is two `__half` packed into 32 bits (4 bytes). `__nv_bfloat162` is also two `__nv_bfloat16` packed into 32 bits (4 bytes).
+So 4 bf16s is two `__nv_bfloat162`s (8 bytes). To load 8 bytes, I can load `int2` or `longlong2`? Or just load as `__nv_bfloat162` twice.
+Actually, I can just load each element individually. Since Q is loaded only once per block and each warp loads 1 row, that&#x27;s 32 `__nv_bfloat16` loads per warp. Not a bottleneck.
+
+For the cooperative K/V load, using `float4` (16 bytes = 8 bf16) is ideal. I&#x27;ll do `float4` loads.
+
+Now, let&#x27;s think about the arithmetic in the inner loop again.
+For each key j:
+```cuda
+float qk = __bfloat162float(q0) * __bfloat162float(k0)
+         + __bfloat162float(q1) * __bfloat162float(k1)
+         + __bfloat162float(q2) * __bfloat162float(k2)
+         + __bfloat162float(q3) * __bfloat162float(k3);
+```
+This is 4 multiplications and 3 additions. The `__bfloat162float` conversions happen each time. Can I pre-convert q to float? Yes!
+```cuda
+float qf0 = __bfloat162float(q0);
+...
+```
+Do this once before the loop. Then in the loop:
+```cuda
+float qk = qf0 * __bfloat162float(k0) + qf1 * __bfloat162float(k1) + ...
+```
+This saves 4 conversions per key. Good.
+
+Similarly, can I load K row elements as `__nv_bfloat162` and convert via `__bfloat162float2`?
+CUDA provides `__bfloat1622float2` for `__nv_bfloat162` to convert both to float2. But I have 4 elements. I could use two `__nv_bfloat162` loads per thread. Each thread currently handles 4 dims. 32 threads * 4 = 128. Yes. So I load `__nv_bfloat162 k01 = *(__nv_bfloat162*)&amp;k_row[0];` and `__nv_bfloat162 k23 = *(__nv_bfloat162*)&amp;k_row[2];`. Then:
+```cuda
+float2 kf01 = __bfloat1622float2(k01);
+float2 kf23 = __bfloat1622float2(k23);
+qk = qf0 * kf01.x + qf1 * kf01.y + qf2 * kf23.x + qf3 * kf23.y;
+```
+This might be more efficient because `__bfloat1622float2` is a single instruction for two elements.
+Wait, does `__bfloat1622float2` exist? For `__half2`, there&#x27;s `__half22float2`. For bfloat16, I believe it&#x27;s `__bfloat1622float2` in `cuda_bf16.h`. Let me check from memory: yes, `__bfloat1622float2` is available for sm_80+? It should be. I can also manually unpack:
+```cuda
+float kf0 = __bfloat162float(k01.x);
+float kf1 = __bfloat162float(k01.y);
+```
+This might compile to the same thing.
+
+For V update, we need to convert v to float. Same idea.
+
+For writing O back: we have 4 float values. We can use `__float2bfloat16` individually.
+
+Inner loop unroll: `#pragma unroll 8` maybe? Since TILE_KV=64 is fixed, unrolling by 8 gives 8 iterations. The compiler will unroll automatically with `#pragma unroll` but we can hint.
+
+What about using `__ldg` for Q, K, V loads?
+For Q: `__ldg` is useful, the compiler might do it for const restrict.
+For K/V: during cooperative tile load, the compiler generates global loads. Using `__ldg` explicitly is good. But since we load them into shared memory, the compiler might not recognize it as `ld.global.ca` or `ld.global.cs`. Actually with `const` and `restrict`, it should. But we can add `__ldg` for extra safety. Wait, `__ldg` returns a value, not a pointer. So for `float4` loads, `__ldg((const float4*)ptr)` is valid and generates a cache-streaming load. Using `__ldg` for data that will be reused in L1/SMEM is fine because we only load it once per block. `ld.global` suffices.
+
+One more thing: scale factor. `scale = 1.0f / sqrtf((float)D)`.
+We multiply `qk * scale` after warp reduction. So only one multiplication per key.
+
+Memory layout of PyTorch tensors: (B, H, T, D). Strides: contiguous. So `((batch * H + head) * T + pos) * D + d` is the correct linear index.
+
+Let&#x27;s write the kernel clearly.
+
+```cuda
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_bf16.h&gt;
+
+constexpr int TILE_Q = 8;
+constexpr int TILE_KV = 64;
+constexpr int THREADS = 256; // 8 warps
+constexpr int D = 128;
+constexpr float NEG_INF = -1e30f;
+
+__global__ void flash_attn_fwd_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ o,
+    int B, int Hq, int Hkv, int T, float scale)
+{
+    extern __shared__ char smem[];
+    __nv_bfloat16* k_smem = reinterpret_cast&lt;__nv_bfloat16*&gt;(smem);
+    __nv_bfloat16* v_smem = k_smem + TILE_KV * D;
+
+    int batch = blockIdx.x / Hq;
+    int head = blockIdx.x % Hq;
+    int q_tile = blockIdx.y;
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int q_idx = q_tile * TILE_Q + warp_id; // each warp handles 1 query
+    int kv_head = head / (Hq / Hkv);
+
+    if (q_idx &gt;= T) return; // safety, but shouldn&#x27;t happen with exact division
+
+    const __nv_bfloat16* q_ptr = q + ((batch * Hq + head) * T + q_idx) * D + lane * 4;
+    __nv_bfloat16 q0 = q_ptr[0];
+    __nv_bfloat16 q1 = q_ptr[1];
+    __nv_bfloat16 q2 = q_ptr[2];
+    __nv_bfloat16 q3 = q_ptr[3];
+    float qf0 = __bfloat162float(q0);
+    float qf1 = __bfloat162float(q1);
+    float qf2 = __bfloat162float(q2);
+    float qf3 = __bfloat162float(q3);
+
+    float m = NEG_INF;
+    float l = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    int num_kv_tiles = T / TILE_KV; // 32
+
+    for (int kv_tile = 0; kv_tile &lt; num_kv_tiles; ++kv_tile) {
+        int kv_start = kv_tile * TILE_KV;
+        const __nv_bfloat16* k_ptr = k + ((batch * Hkv + kv_head) * T + kv_start) * D;
+        const __nv_bfloat16* v_ptr = v + ((batch * Hkv + kv_head) * T + kv_start) * D;
+
+        // Cooperative load of K and V tiles
+        int total_elems = TILE_KV * D; // 8192
+        int vec4_count = total_elems / 8; // 1024 float4 loads
+        for (int i = threadIdx.x; i &lt; vec4_count; i += blockDim.x) {
+            float4 k4 = reinterpret_cast&lt;const float4*&gt;(k_ptr)[i];
+            reinterpret_cast&lt;float4*&gt;(k_smem)[i] = k4;
+            float4 v4 = reinterpret_cast&lt;const float4*&gt;(v_ptr)[i];
+            reinterpret_cast&lt;float4*&gt;(v_smem)[i] = v4;
+        }
+        __syncthreads();
+
+        // Each warp processes its query against all keys in this tile
+        for (int j = 0; j &lt; TILE_KV; ++j) {
+            const __nv_bfloat16* k_row = k_smem + j * D + lane * 4;
+            float kf0 = __bfloat162float(k_row[0]);
+            float kf1 = __bfloat162float(k_row[1]);
+            float kf2 = __bfloat162float(k_row[2]);
+            float kf3 = __bfloat162float(k_row[3]);
+
+            float qk = qf0 * kf0 + qf1 * kf1 + qf2 * kf2 + qf3 * kf3;
+
+            // Warp reduce sum
+            #pragma unroll
+            for (int offset = 16; offset &gt; 0; offset /= 2) {
+                qk += __shfl_xor_sync(0xffffffff, qk, offset);
+            }
+
+            qk *= scale;
+
+            float new_m = fmaxf(m, qk);
+            float exp_old = expf(m - new_m);
+            float exp_new = expf(qk - new_m);
+
+            l = l * exp_old + exp_new;
+
+            const __nv_bfloat16* v_row = v_smem + j * D + lane * 4;
+            float vf0 = __bfloat162float(v_row[0]);
+            float vf1 = __bfloat162float(v_row[1]);
+            float vf2 = __bfloat162float(v_row[2]);
+            float vf3 = __bfloat162float(v_row[3]);
+
+            o0 = o0 * exp_old + exp_new * vf0;
+            o1 = o1 * exp_old + exp_new * vf1;
+            o2 = o2 * exp_old + exp_new * vf2;
+            o3 = o3 * exp_old + exp_new * vf3;
+
+            m = new_m;
+        }
+        __syncthreads();
+    }
+
+    float inv_l = 1.0f / l;
+    o0 *= inv_l; o1 *= inv_l; o2 *= inv_l; o3 *= inv_l;
+
+    __nv_bfloat16* o_ptr = o + ((batch * Hq + head) * T + q_idx) * D + lane * 4;
+    o_ptr[0] = __float2bfloat16(o0);
+    o_ptr[1] = __float2bfloat16(o1);
+    o_ptr[2] = __float2bfloat16(o2);
+    o_ptr[3] = __float2bfloat16(o3);
+}
+```
+
+Wait, is the `if (q_idx &gt;= T) return;` safe before `__syncthreads()`? If T is exactly divisible by TILE_Q, the grid is exact and no thread returns early. But for safety if grid has rounding, I should add a condition. If `q_idx &gt;= T`, we must not participate in __syncthreads. A common pattern is to put the condition at the top and `return`, but only if `blockDim.x` is an exact match. If grid is exact, it&#x27;s fine. But if we want to be robust:
+```cuda
+bool valid = (q_idx &lt; T);
+// load q only if valid
+// but all threads must participate in syncthreads
+```
+Actually, all threads in the block must reach `__syncthreads()`. If some threads return early, deadlock.
+Since `T=2048` and `TILE_Q=8`, `T/TILE_Q = 256` exactly. So `q_idx` is always valid. I can omit the check or add it only before the write.
+
+But wait, `blockIdx.y` goes up to 255. `q_tile * TILE_Q + warp_id`. `q_tile` max 255. `255*8 + 7 = 2047`. Correct.
+
+One more thing: for `__shfl_xor_sync`, the mask should be `0xffffffff` for all threads in the warp.
+
+Now, does this use `__nv_bfloat16` correctly? I&#x27;ll import `&lt;cuda_bf16.h&gt;`. The torch tensor is `torch.bfloat16`. On CUDA, `at::BFloat16` defined in `c10/util/BFloat16.h` is a different struct. But we can `reinterpret_cast` the pointer to `__nv_bfloat16*` because the binary representation is the same. This is a common pattern and safe.
+
+However, `torch/extension.h` might not expose `__nv_bfloat16` directly unless we include `cuda_bf16.h`. That&#x27;s fine.
+
+What is the `__nv_bfloat16` constructor? `__nv_bfloat16` is from the header and works in device code.
+
+Compilation: I should compile with `-O3`, `--use_fast_math`, `-gencode=arch=compute_90,code=sm_90`.
+Also, because I&#x27;m using `reinterpret_cast&lt;const float4*&gt;(k_ptr)`, the pointer alignment must be 16 bytes. As argued, it is. But to be safe, I can add `assert(((uintptr_t)k_ptr) % 16 == 0)`? Not necessary.
+
+Let&#x27;s test if this compiles and is correct.
+I notice a potential issue: `reinterpret_cast&lt;const float4*&gt;(k_ptr)[i]` where `k_ptr` is `const __nv_bfloat16*`. On some compilers, strict aliasing might complain? `float4` is a built-in vector type. Reinterpreting between pointers to different types is technically UB in C++ but CUDA generally allows it. A safer way is to use `*(const float4*)(((char*)k_ptr) + i * sizeof(float4))`. But `reinterpret_cast` is standard for this.
+
+Another issue: `float4` stores 4 floats = 128 bits = 16 bytes. `__nv_bfloat16` is 16 bits. 16 bytes = 8 `__nv_bfloat16`. Good.
+
+Wait, `const float4* ptr = reinterpret_cast&lt;const float4*&gt;(k_ptr); ptr[i];` This accesses bytes `i*16` to `i*16+15`. The linear index of the `i`-th `float4` corresponds to elements `8*i` through `8*i+7` in the bf16 array. Since the total array is 8192 bf16, `i` goes from 0 to 1023. This is correct.
+
+One issue: `k_ptr` is a pointer to global memory. `k_ptr[i]` indexing is in units of `__nv_bfloat16`. Wait, we do:
+```cuda
+const __nv_bfloat16* k_ptr = k + ((batch * Hkv + kv_head) * T + kv_start) * D;
+...
+for (int i = threadIdx.x; i &lt; vec4_count; i += blockDim.x) {
+    float4 k4 = reinterpret_cast&lt;const float4*&gt;(k_ptr)[i];
+    ...
+}
+```
+This is correct because `k_ptr` is a pointer to `__nv_bfloat16` of size 2 bytes. `reinterpret_cast&lt;const float4*&gt;(k_ptr)` changes the pointer type to `const float4*` which points to 16-byte chunks. `ptr[i]` accesses the i-th 16-byte chunk, i.e., bytes `i*16` from `k_ptr`. This covers elements `k_ptr[8*i]` through `k_ptr[8*i+7]`. Correct.
+
+For SMEM:
+```cuda
+__nv_bfloat16* k_smem = reinterpret_cast&lt;__nv_bfloat16*&gt;(smem);
+...
+reinterpret_cast&lt;float4*&gt;(k_smem)[i] = k4;
+```
+Same logic.
+
+Now, SMEM dynamic size for this kernel is `TILE_KV * D * 2 * sizeof(__nv_bfloat16)` = 64 * 128 * 2 * 2 = 32768 bytes = 32KB.
+Wait, I defined `k_smem` and `v_smem` each of size `TILE_KV * D`. That&#x27;s 8192 elements each. 8192 * 2 bytes = 16KB each. Total 32KB.
+So `smem_size = 32 * 1024 = 32768`.
+No need for `cudaFuncSetAttribute` because 32KB &lt; 48KB. Excellent! This simplifies things.
+
+Wait, I said `extern __shared__ char smem[];` and then launch with `32768` bytes.
+The compiler should handle it. No need for extra attributes.
+
+Wait, but what about `__launch_bounds__(256)`? I&#x27;ll add it for compiler hint.
+
+One more sub-optimality: The K and V tiles are loaded with `float4` from global to shared memory without going through L1 cache explicitly? The compiler should generate `LDG` to registers then `STS`. That&#x27;s fine.
+
+For the inner `j` loop, can I do the QK dot product and V update using `__nv_bfloat162` to halve the instructions?
+```cuda
+__nv_bfloat162 q01 = *(__nv_bfloat162*)(q_ptr);
+__nv_bfloat162 q23 = *(__nv_bfloat162*)(q_ptr + 2);
+float2 qf01 = __bfloat1622float2(q01);
+float2 qf23 = __bfloat1622float2(q23);
+```
+Then in the loop:
+```cuda
+__nv_bfloat162 k01 = *(__nv_bfloat162*)&amp;k_row[0];
+__nv_bfloat162 k23 = *(__nv_bfloat162*)&amp;k_row[2];
+float2 kf01 = __bfloat1622float2(k01);
+float2 kf23 = __bfloat1622float2(k23);
+float qk = qf01.x * kf01.x + qf01.y * kf01.y + qf23.x * kf23.x + qf23.y * kf23.y;
+```
+This might be cleaner.
+
+Wait, does `__bfloat1622float2` exist? Let me double check. For half2, it&#x27;s `__half22float2`. For bfloat162, I think it&#x27;s `__bfloat1622float2`. Quick mental check: `__nv_bfloat162` has `.x` and `.y` members of type `__nv_bfloat16`. The intrinsic `__bfloat1622float2` takes `__nv_bfloat162` and returns `float2`. Yes, this exists. If not, we can manually convert.
+
+Actually, in `cuda_bf16.hpp` / `cuda_bf16.h`:
+```cpp
+__CUDA_BF16_DECL__ float2 __bfloat1622float2(const __nv_bfloat162 a);
+```
+And `__nv_bfloat162` can be constructed. I need to `#include &lt;cuda_bf16.h&gt;`. On H100 (sm_90), this is fully supported.
+
+What about `__nv_bfloat162` load/store? I should be able to do `*(const __nv_bfloat162*)addr`.
+
+Let&#x27;s use `__nv_bfloat162` for Q load and K/V row loads to reduce code verbosity.
+
+```cuda
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_bf16.h&gt;
+
+constexpr int TILE_Q = 8;
+constexpr int TILE_KV = 64;
+constexpr int D = 128;
+constexpr int THREADS = 256;
+constexpr float NEG_INF = -1e30f;
+
+__global__ __launch_bounds__(THREADS) void flash_attn_fwd_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ o,
+    int B, int Hq, int Hkv, int T, float scale)
+{
+    extern __shared__ char smem[];
+    __nv_bfloat16* k_smem = reinterpret_cast&lt;__nv_bfloat16*&gt;(smem);
+    __nv_bfloat16* v_smem = k_smem + TILE_KV * D;
+
+    int batch = blockIdx.x / Hq;
+    int head = blockIdx.x % Hq;
+    int q_tile = blockIdx.y;
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int q_idx = q_tile * TILE_Q + warp_id;
+    int kv_head = head / (Hq / Hkv);
+
+    // Load Q row for this query/warp
+    const __nv_bfloat16* q_ptr = q + ((batch * Hq + head) * T + q_idx) * D + lane * 4;
+    __nv_bfloat162 q01 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(q_ptr)[0];
+    __nv_bfloat162 q23 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(q_ptr)[1];
+    float2 qf01 = __bfloat1622float2(q01);
+    float2 qf23 = __bfloat1622float2(q23);
+
+    float m = NEG_INF;
+    float l = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    int num_kv_tiles = T / TILE_KV;
+
+    for (int kv_tile = 0; kv_tile &lt; num_kv_tiles; ++kv_tile) {
+        int kv_start = kv_tile * TILE_KV;
+        const __nv_bfloat16* k_ptr = k + ((batch * Hkv + kv_head) * T + kv_start) * D;
+        const __nv_bfloat16* v_ptr = v + ((batch * Hkv + kv_head) * T + kv_start) * D;
+
+        // Cooperative vectorized load of K and V into SMEM
+        int total_elems = TILE_KV * D; // 8192
+        int num_vec8 = total_elems / 8; // 1024 float4s
+        for (int i = threadIdx.x; i &lt; num_vec8; i += blockDim.x) {
+            float4 k4 = reinterpret_cast&lt;const float4*&gt;(k_ptr)[i];
+            reinterpret_cast&lt;float4*&gt;(k_smem)[i] = k4;
+            float4 v4 = reinterpret_cast&lt;const float4*&gt;(v_ptr)[i];
+            reinterpret_cast&lt;float4*&gt;(v_smem)[i] = v4;
+        }
+        __syncthreads();
+
+        for (int j = 0; j &lt; TILE_KV; ++j) {
+            const __nv_bfloat16* k_row = k_smem + j * D + lane * 4;
+            __nv_bfloat162 k01 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(k_row)[0];
+            __nv_bfloat162 k23 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(k_row)[1];
+            float2 kf01 = __bfloat1622float2(k01);
+            float2 kf23 = __bfloat1622float2(k23);
+
+            float qk = qf01.x * kf01.x + qf01.y * kf01.y
+                     + qf23.x * kf23.x + qf23.y * kf23.y;
+
+            #pragma unroll
+            for (int offset = 16; offset &gt; 0; offset /= 2) {
+                qk += __shfl_xor_sync(0xffffffff, qk, offset);
+            }
+
+            qk *= scale;
+
+            float new_m = fmaxf(m, qk);
+            float exp_old = expf(m - new_m);
+            float exp_new = expf(qk - new_m);
+            l = l * exp_old + exp_new;
+
+            const __nv_bfloat16* v_row = v_smem + j * D + lane * 4;
+            __nv_bfloat162 v01 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(v_row)[0];
+            __nv_bfloat162 v23 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(v_row)[1];
+            float2 vf01 = __bfloat1622float2(v01);
+            float2 vf23 = __bfloat1622float2(v23);
+
+            o0 = o0 * exp_old + exp_new * vf01.x;
+            o1 = o1 * exp_old + exp_new * vf01.y;
+            o2 = o2 * exp_old + exp_new * vf23.x;
+            o3 = o3 * exp_old + exp_new * vf23.y;
+
+            m = new_m;
+        }
+        __syncthreads();
+    }
+
+    float inv_l = 1.0f / l;
+    o0 *= inv_l; o1 *= inv_l; o2 *= inv_l; o3 *= inv_l;
+
+    __nv_bfloat16* o_ptr = o + ((batch * Hq + head) * T + q_idx) * D + lane * 4;
+    __nv_bfloat162 o01 = __floats2bfloat162_rn(o0, o1);
+    __nv_bfloat162 o23 = __floats2bfloat162_rn(o2, o3);
+    reinterpret_cast&lt;__nv_bfloat162*&gt;(o_ptr)[0] = o01;
+    reinterpret_cast&lt;__nv_bfloat162*&gt;(o_ptr)[1] = o23;
+}
+```
+
+Wait, `__floats2bfloat162_rn` might not exist. I think it does in `cuda_bf16.h`. Alternatively, we can just do individual `__float2bfloat16` stores.
+```cuda
+o_ptr[0] = __float2bfloat16(o0);
+...
+```
+I&#x27;ll use the simpler individual stores for safety.
+
+Is there a race condition or bank conflict in K/V cooperative loading? No, each thread accesses a unique `float4` index.
+Is `reinterpret_cast` from `__nv_bfloat16*` to `float4*` well-defined for alignment? Yes, if aligned to 16 bytes. Start of each tile `k_ptr` is 256-byte aligned. Successive `float4` accesses are `i * 16` bytes offset, maintaining alignment.
+
+But wait, `k_smem` is allocated as `char smem[]` and then cast to `__nv_bfloat16*`. Dynamic shared memory is 16-byte aligned. So `k_smem` is 16-byte aligned. Successive `float4` accesses are fine.
+
+What if the compiler complains about strict aliasing? In CUDA, vector types like `float4` are commonly used for type punning. It should be okay.
+
+Now, let&#x27;s write the wrapper.
+```cpp
+torch::Tensor flash_attn_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+    int B = q.size(0);
+    int Hq = q.size(1);
+    int T = q.size(2);
+    int D = q.size(3);
+    int Hkv = k.size(1);
+    auto o = torch::empty_like(q);
+    float scale = 1.0f / sqrtf((float)D);
+    dim3 grid(B * Hq, T / TILE_Q);
+    dim3 block(THREADS);
+    size_t smem = TILE_KV * D * 2 * sizeof(__nv_bfloat16);
+    flash_attn_fwd_kernel&lt;&lt;&lt;grid, block, smem&gt;&gt;&gt;(
+        reinterpret_cast&lt;const __nv_bfloat16*&gt;(q.data_ptr&lt;at::BFloat16&gt;()),
+        reinterpret_cast&lt;const __nv_bfloat16*&gt;(k.data_ptr&lt;at::BFloat16&gt;()),
+        reinterpret_cast&lt;const __nv_bfloat16*&gt;(v.data_ptr&lt;at::BFloat16&gt;()),
+        reinterpret_cast&lt;__nv_bfloat16*&gt;(o.data_ptr&lt;at::BFloat16&gt;()),
+        B, Hq, Hkv, T, scale);
+    return o;
+}
+```
+I should include `AT_DISPATCH_FLOATING_TYPES_AND2`? No, since we know input is bf16. But torch tensor might be `at::kBFloat16`. `q.data_ptr&lt;at::BFloat16&gt;()` is correct.
+
+Let&#x27;s compile this. I should add `-gencode=arch=compute_90,code=sm_90` for H100.
+
+One subtle compile issue: `__nv_bfloat1622float2` requires `#include &lt;cuda_bf16.h&gt;`, but also might need the latest CUDA version. H100 is sm_90. The environment should support it. If the compiler complains, we can manually extract:
+```cuda
+float2 kf01;
+kf01.x = __bfloat162float(k01.x);
+kf01.y = __bfloat162float(k01.y);
+```
+
+I&#x27;ll include `cuda_bf16.h` and use the intrinsic. If it fails, I&#x27;ll switch.
+
+Wait, in the cuda source string, I need to escape backslashes or newlines properly for the C++ raw string literal inside the Python code. Since I&#x27;m using `r&#x27;&#x27;&#x27; ... &#x27;&#x27;&#x27;` for the CUDA source, I should be careful with quotes. Actually `r&#x27;&#x27;&#x27;...&#x27;&#x27;&#x27;` is a Python raw string. Inside it, `&#x27;&#x27;&#x27;` would end it. I should avoid `&#x27;&#x27;&#x27;` in the C++ code? Unlikely in C++. But I should end the C++ code before the Python string closes.
+
+Also, `PYBIND11_MODULE` defines the module name. `TORCH_EXTENSION_NAME` is automatically defined by PyTorch&#x27;s load_inline.
+
+Let&#x27;s write the full Python module code and try to compile.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncpp_source = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\ntorch::Tensor flash_attn_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v);\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n    m.def(\&quot;flash_attn_forward\&quot;, &amp;flash_attn_forward, \&quot;Flash Attention Forward\&quot;);\n}\n&#x27;&#x27;&#x27;\n\ncuda_source = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cuda_bf16.h&gt;\n\nconstexpr int TILE_Q = 8;\nconstexpr int TILE_KV = 64;\nconstexpr int D = 128;\nconstexpr int THREADS = 256;\nconstexpr float NEG_INF = -1e30f;\n\n__global__ __launch_bounds__(THREADS) void flash_attn_fwd_kernel(\n    const __nv_bfloat16* __restrict__ q,\n    const __nv_bfloat16* __restrict__ k,\n    const __nv_bfloat16* __restrict__ v,\n    __nv_bfloat16* __restrict__ o,\n    int B, int Hq, int Hkv, int T, float scale)\n{\n    extern __shared__ char smem[];\n    __nv_bfloat16* k_smem = reinterpret_cast&lt;__nv_bfloat16*&gt;(smem);\n    __nv_bfloat16* v_smem = k_smem + TILE_KV * D;\n\n    int batch = blockIdx.x / Hq;\n    int head  = blockIdx.x % Hq;\n    int q_tile = blockIdx.y;\n    int warp_id = threadIdx.x / 32;\n    int lane = threadIdx.x % 32;\n    int q_idx = q_tile * TILE_Q + warp_id;\n    int kv_head = head / (Hq / Hkv);\n\n    const __nv_bfloat16* q_ptr = q + ((batch * Hq + head) * T + q_idx) * D + lane * 4;\n    __nv_bfloat162 q01 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(q_ptr)[0];\n    __nv_bfloat162 q23 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(q_ptr)[1];\n    float2 qf01 = __bfloat1622float2(q01);\n    float2 qf23 = __bfloat1622float2(q23);\n\n    float m = NEG_INF;\n    float l = 0.0f;\n    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;\n\n    int num_kv_tiles = T / TILE_KV;\n\n    for (int kv_tile = 0; kv_tile &lt; num_kv_tiles; ++kv_tile) {\n        int kv_start = kv_tile * TILE_KV;\n        const __nv_bfloat16* k_ptr = k + ((batch * Hkv + kv_head) * T + kv_start) * D;\n        const __nv_bfloat16* v_ptr = v + ((batch * Hkv + kv_head) * T + kv_start) * D;\n\n        int total_elems = TILE_KV * D;\n        int num_vec8 = total_elems / 8;\n        for (int i = threadIdx.x; i &lt; num_vec8; i += blockDim.x) {\n            float4 k4 = reinterpret_cast&lt;const float4*&gt;(k_ptr)[i];\n            reinterpret_cast&lt;float4*&gt;(k_smem)[i] = k4;\n            float4 v4 = reinterpret_cast&lt;const float4*&gt;(v_ptr)[i];\n            reinterpret_cast&lt;float4*&gt;(v_smem)[i] = v4;\n        }\n        __syncthreads();\n\n        #pragma unroll 8\n        for (int j = 0; j &lt; TILE_KV; ++j) {\n            const __nv_bfloat16* k_row = k_smem + j * D + lane * 4;\n            __nv_bfloat162 k01 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(k_row)[0];\n            __nv_bfloat162 k23 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(k_row)[1];\n            float2 kf01 = __bfloat1622float2(k01);\n            float2 kf23 = __bfloat1622float2(k23);\n\n            float qk = qf01.x * kf01.x + qf01.y * kf01.y\n                     + qf23.x * kf23.x + qf23.y * kf23.y;\n\n            #pragma unroll\n            for (int offset = 16; offset &gt; 0; offset /= 2) {\n                qk += __shfl_xor_sync(0xffffffff, qk, offset);\n            }\n\n            qk *= scale;\n\n            float new_m = fmaxf(m, qk);\n            float exp_old = expf(m - new_m);\n            float exp_new = expf(qk - new_m);\n            l = l * exp_old + exp_new;\n\n            const __nv_bfloat16* v_row = v_smem + j * D + lane * 4;\n            __nv_bfloat162 v01 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(v_row)[0];\n            __nv_bfloat162 v23 = reinterpret_cast&lt;const __nv_bfloat162*&gt;(v_row)[1];\n            float2 vf01 = __bfloat1622float2(v01);\n            float2 vf23 = __bfloat1622float2(v23);\n\n            o0 = o0 * exp_old + exp_new * vf01.x;\n            o1 = o1 * exp_old + exp_new * vf01.y;\n            o2 = o2 * exp_old + exp_new * vf23.x;\n            o3 = o3 * exp_old + exp_new * vf23.y;\n\n            m = new_m;\n        }\n        __syncthreads();\n    }\n\n    float inv_l = 1.0f / l;\n    o0 *= inv_l;\n    o1 *= inv_l;\n    o2 *= inv_l;\n    o3 *= inv_l;\n\n    __nv_bfloat16* o_ptr = o + ((batch * Hq + head) * T + q_idx) * D + lane * 4;\n    o_ptr[0] = __float2bfloat16(o0);\n    o_ptr[1] = __float2bfloat16(o1);\n    o_ptr[2] = __float2bfloat16(o2);\n    o_ptr[3] = __float2bfloat16(o3);\n}\n\ntorch::Tensor flash_attn_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {\n    int B = q.size(0);\n    int Hq = q.size(1);\n    int T = q.size(2);\n    int Hkv = k.size(1);\n    auto o = torch::empty_like(q);\n    float scale = 1.0f / sqrtf((float)D);\n    dim3 grid(B * Hq, T / TILE_Q);\n    dim3 block(THREADS);\n    size_t smem = TILE_KV * D * 2 * sizeof(__nv_bfloat16);\n    flash_attn_fwd_kernel&lt;&lt;&lt;grid, block, smem&gt;&gt;&gt;(\n        reinterpret_cast&lt;const __nv_bfloat16*&gt;(q.data_ptr&lt;at::BFloat16&gt;()),\n        reinterpret_cast&lt;const __nv_bfloat16*&gt;(k.data_ptr&lt;at::BFloat16&gt;()),\n        reinterpret_cast&lt;const __nv_bfloat16*&gt;(v.data_ptr&lt;at::BFloat16&gt;()),\n        reinterpret_cast&lt;__nv_bfloat16*&gt;(o.data_ptr&lt;at::BFloat16&gt;()),\n        B, Hq, Hkv, T, scale);\n    return o;\n}\n&#x27;&#x27;&#x27;\n\nmodule = load_inline(\n    name=\&quot;flash_attn_h100_v2\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;, \&quot;-gencode=arch=compute_90,code=sm_90\&quot;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, num_heads, num_kv_heads, head_dim):\n        super().__init__()\n        self.num_heads = num_heads\n        self.num_kv_heads = num_kv_heads\n        self.head_dim = head_dim\n\n    def forward(self, q, k, v):\n        return module.flash_attn_forward(q, k, v)\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: unexpected error during tool execution.
+_WorkItemTimeout: work item exceeded soft timeout budget
+Traceback (most recent call last):
+  File &quot;/scratch/abaner/KernelBench/src/kernelbench/agent/agent.py&quot;, line 666, in _execute_tool
+    return tool.execute(self.ctx, **args)
+  File &quot;/scratch/abaner/KernelBench/src/kernelbench/agent/tools.py&quot;, line 292, in execute
+    return ctx.eval_client.compile_kernel(ctx, kernel_code)
+  File &quot;/scratch/abaner/KernelBench/src/kernelbench/agent/eval_client.py&quot;, line 54, in compile_kernel
+    return self._call(&quot;compile&quot;, args)
+  File &quot;/scratch/abaner/KernelBench/src/kernelbench/agent/eval_client.py&quot;, line 117, in _call
+    payload = self._response_q.get(timeout=remaining)
+  File &quot;&lt;string&gt;&quot;, line 2, in get
+  File &quot;/opt/conda/lib/python3.10/multiprocessing/managers.py&quot;, line 818, in _callmethod
+    kind, result = conn.recv()
+  File &quot;/opt/conda/lib/python3.10/multiprocessing/connection.py&quot;, line 250, in recv
+    buf = self._recv_bytes()
+  File &quot;/opt/conda/lib/python3.10/multiprocessing/connection.py&quot;, line 414, in _recv_bytes
+    buf = self._recv(4)
+  File &quot;/opt/conda/lib/python3.10/multiprocessing/connection.py&quot;, line 379, in _recv
+    chunk = read(handle, remaining)
+  File &quot;/scratch/abaner/KernelBench/scripts/run_sweep.py&quot;, line 194, in _alarm_handler
+    raise _WorkItemTimeout(&quot;work item exceeded soft timeout budget&quot;)
+__mp_main__._WorkItemTimeout: work item exceeded soft timeout budget
+</div></details></div></details></div>
 </body></html>
