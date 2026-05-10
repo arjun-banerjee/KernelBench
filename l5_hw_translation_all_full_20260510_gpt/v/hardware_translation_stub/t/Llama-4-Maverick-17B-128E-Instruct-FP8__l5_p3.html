@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L5 P3 · hardware_translation_stub</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 3</a></div><div class="site-subtitle">Llama-4-Maverick-17B-128E-Instruct-FP8 · hardware_translation_stub · l5_hw_translation_all_full_20260510</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">← Llama-4-Maverick-17B-128E-Instruct-FP8</a><span class="meta">generated 2026-05-10 10:02:11 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html" class=current>Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-error">error</span>
+  <span style="font-size:13px;">03_fused_rmsnorm.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">Llama-4-Maverick-17B-128E-Instruct-FP8</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">4 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp16</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">hardware_translation_stub</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-10T09:58:39Z</div></div>
+</div>
+
+
+
+</div><details class="turn-collapse"><summary><b>turn 0</b> · 0 tool call(s) · 16.1s · 6,803 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 16.1s</span></div><div class="block assistant"><span class="role-tag">assistant</span>```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_fp16.h&gt;
+
+__device__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__global__ void rms_norm_kernel(float* __restrict__ out, 
+                                const half* __restrict__ input, 
+                                const half* __restrict__ weight, 
+                                float epsilon, 
+                                int num_tokens, 
+                                int hidden_size) {
+    __shared__ float s_variance;
+    float variance = 0.0f;
+
+    int idx = blockIdx.x;
+    const half* input_row = input + idx * hidden_size;
+    half* out_row = reinterpret_cast&lt;half*&gt;(out + idx * hidden_size);
+
+    for (int i = threadIdx.x; i &lt; hidden_size; i += blockDim.x) {
+        half2 val = __ldg(reinterpret_cast&lt;const half2*&gt;(input_row + i));
+        float2 fval = __half22float2(val);
+        variance += fval.x * fval.x + fval.y * fval.y;
+    }
+
+    variance = warp_reduce_sum(variance);
+    if (threadIdx.x == 0) {
+        s_variance = rsqrtf(variance / hidden_size + epsilon);
+    }
+    __syncthreads();
+
+    half2 s_variance_h2 = __float2half2_rn(s_variance);
+    for (int i = threadIdx.x; i &lt; hidden_size / 2; i += blockDim.x) {
+        half2 input_val = __ldg(reinterpret_cast&lt;const half2*&gt;(input_row + i * 2));
+        half2 weight_val = __ldg(reinterpret_cast&lt;const half2*&gt;(weight + i * 2));
+        half2 out_val;
+        out_val.x = __hmul(input_val.x, weight_val.x) * s_variance;
+        out_val.y = __hmul(input_val.y, weight_val.y) * s_variance;
+        reinterpret_cast&lt;half2*&gt;(out_row)[i] = out_val;
+    }
+    if (threadIdx.x == 0 &amp;&amp; hidden_size % 2 == 1) {
+        out_row[hidden_size - 1] = __hmul(input_row[hidden_size - 1], weight[hidden_size - 1]) * __float2half(s_variance);
+    }
+}
+
+__global__ void fused_add_rms_norm_kernel(half* __restrict__ input, 
+                                         int64_t input_stride, 
+                                         half* __restrict__ residual, 
+                                         const half* __restrict__ weight, 
+                                         float epsilon, 
+                                         int num_tokens, 
+                                         int hidden_size) {
+    __shared__ float s_variance;
+    float variance = 0.0f;
+
+    int idx = blockIdx.x;
+    half* input_row = input + idx * input_stride;
+    half* residual_row = residual + idx * hidden_size;
+
+    for (int i = threadIdx.x; i &lt; hidden_size / 2; i += blockDim.x) {
+        half2 input_val = __ldg(reinterpret_cast&lt;const half2*&gt;(input_row + i * 2));
+        half2 residual_val = __ldg(reinterpret_cast&lt;const half2*&gt;(residual_row + i * 2));
+        half2 sum_val;
+        sum_val.x = __hadd(input_val.x, residual_val.x);
+        sum_val.y = __hadd(input_val.y, residual_val.y);
+        reinterpret_cast&lt;half2*&gt;(residual_row)[i] = sum_val;
+
+        float2 fsum_val = __half22float2(sum_val);
+        variance += fsum_val.x * fsum_val.x + fsum_val.y * fsum_val.y;
+    }
+    if (threadIdx.x == 0 &amp;&amp; hidden_size % 2 == 1) {
+        half sum_val = __hadd(input_row[hidden_size - 1], residual_row[hidden_size - 1]);
+        residual_row[hidden_size - 1] = sum_val;
+        variance += static_cast&lt;float&gt;(sum_val) * static_cast&lt;float&gt;(sum_val);
+    }
+
+    variance = warp_reduce_sum(variance);
+    if (threadIdx.x == 0) {
+        s_variance = rsqrtf(variance / hidden_size + epsilon);
+    }
+    __syncthreads();
+
+    half2 s_variance_h2 = __float2half2_rn(s_variance);
+    for (int i = threadIdx.x; i &lt; hidden_size / 2; i += blockDim.x) {
+        half2 residual_val = __ldg(reinterpret_cast&lt;const half2*&gt;(residual_row + i * 2));
+        half2 weight_val = __ldg(reinterpret_cast&lt;const half2*&gt;(weight + i * 2));
+        half2 out_val;
+        out_val.x = __hmul(residual_val.x, weight_val.x) * s_variance;
+        out_val.y = __hmul(residual_val.y, weight_val.y) * s_variance;
+        reinterpret_cast&lt;half2*&gt;(input_row)[i] = out_val;
+    }
+    if (threadIdx.x == 0 &amp;&amp; hidden_size % 2 == 1) {
+        half residual_val = residual_row[hidden_size - 1];
+        half weight_val = weight[hidden_size - 1];
+        input_row[hidden_size - 1] = __hmul(residual_val, weight_val) * __float2half(s_variance);
+    }
+}
+
+torch::Tensor rms_norm(torch::Tensor input, torch::Tensor weight, double epsilon) {
+    int num_tokens = input.size(0);
+    int hidden_size = input.size(1);
+    torch::Tensor out = torch::empty_like(input);
+
+    int blockSize = 256;
+    int numBlocks = num_tokens;
+
+    rms_norm_kernel&lt;&lt;&lt;numBlocks, blockSize&gt;&gt;&gt;(
+        out.data_ptr&lt;float&gt;(), 
+        input.data_ptr&lt;at::Half&gt;(), 
+        weight.data_ptr&lt;at::Half&gt;(), 
+        static_cast&lt;float&gt;(epsilon), 
+        num_tokens, 
+        hidden_size);
+
+    return out;
+}
+
+torch::Tensor fused_add_rms_norm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double epsilon) {
+    int num_tokens = input.size(0);
+    int hidden_size = input.size(1);
+    int64_t input_stride = input.stride(0);
+
+    int blockSize = 256;
+    int numBlocks = num_tokens;
+
+    fused_add_rms_norm_kernel&lt;&lt;&lt;numBlocks, blockSize&gt;&gt;&gt;(
+        input.data_ptr&lt;at::Half&gt;(), 
+        input_stride, 
+        residual.data_ptr&lt;at::Half&gt;(), 
+        weight.data_ptr&lt;at::Half&gt;(), 
+        static_cast&lt;float&gt;(epsilon), 
+        num_tokens, 
+        hidden_size);
+
+    return input;
+}
+&quot;&quot;&quot;
+
+class ModelNew(nn.Module):
+    def __init__(self, hidden_size, eps):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x):
+        return rms_norm(x, self.weight, 1e-5)
+
+model_new_cuda = load_inline(
+    name=&quot;model_new_cuda&quot;,
+    cuda_sources=[cuda_source],
+    functions=[&#x27;rms_norm&#x27;, &#x27;fused_add_rms_norm&#x27;],
+    extra_cuda_include_paths=[&#x27;/usr/local/cuda/include&#x27;],
+    with_cuda=True
+)
+
+class ModelNewWrapper(nn.Module):
+    def __init__(self, hidden_size, eps):
+        super(ModelNewWrapper, self).__init__()
+        self.model_new = ModelNew(hidden_size, eps)
+
+    def forward(self, x):
+        return self.model_new(x)
+
+def get_model(hidden_size, eps):
+    return ModelNewWrapper(hidden_size, eps)
+```
+</div></div></details><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 48.7s · 7,433 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 48.7s</span></div><details><summary>call → static_check</summary><div class="block tool-args"><span class="role-tag">call</span><b>static_check</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = &#x27;&#x27;&#x27;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cuda_fp16.h&gt;\n\n__device__ float warp_reduce_sum(float val) {\n    for (int offset = 16; offset &gt; 0; offset /= 2) {\n        val += __shfl_xor_sync(0xffffffff, val, offset);\n    }\n    return val;\n}\n\n__global__ void rms_norm_kernel(float* __restrict__ out, \n                                const half* __restrict__ input, \n                                const half* __restrict__ weight, \n                                float epsilon, \n                                int num_tokens, \n                                int hidden_size) {\n    __shared__ float s_variance;\n    float variance = 0.0f;\n\n    int idx = blockIdx.x;\n    const half* input_row = input + idx * hidden_size;\n    half* out_row = reinterpret_cast&lt;half*&gt;(out + idx * hidden_size);\n\n    for (int i = threadIdx.x; i &lt; hidden_size; i += blockDim.x) {\n        half2 val = __ldg(reinterpret_cast&lt;const half2*&gt;(input_row + i));\n        float2 fval = __half22float2(val);\n        variance += fval.x * fval.x + fval.y * fval.y;\n    }\n\n    variance = warp_reduce_sum(variance);\n    if (threadIdx.x == 0) {\n        s_variance = rsqrtf(variance / hidden_size + epsilon);\n    }\n    __syncthreads();\n\n    half2 s_variance_h2 = __float2half2_rn(s_variance);\n    for (int i = threadIdx.x; i &lt; hidden_size / 2; i += blockDim.x) {\n        half2 input_val = __ldg(reinterpret_cast&lt;const half2*&gt;(input_row + i * 2));\n        half2 weight_val = __ldg(reinterpret_cast&lt;const half2*&gt;(weight + i * 2));\n        half2 out_val;\n        out_val.x = __hmul(input_val.x, weight_val.x) * s_variance;\n        out_val.y = __hmul(input_val.y, weight_val.y) * s_variance;\n        reinterpret_cast&lt;half2*&gt;(out_row)[i] = out_val;\n    }\n    if (threadIdx.x == 0 &amp;&amp; hidden_size % 2 == 1) {\n        out_row[hidden_size - 1] = __hmul(input_row[hidden_size - 1], weight[hidden_size - 1]) * __float2half(s_variance);\n    }\n}\n\n__global__ void fused_add_rms_norm_kernel(half* __restrict__ input, \n                                         int64_t input_stride, \n                                         half* __restrict__ residual, \n                                         const half* __restrict__ weight, \n                                         float epsilon, \n                                         int num_tokens, \n                                         int hidden_size) {\n    __shared__ float s_variance;\n    float variance = 0.0f;\n\n    int idx = blockIdx.x;\n    half* input_row = input + idx * input_stride;\n    half* residual_row = residual + idx * hidden_size;\n\n    for (int i = threadIdx.x; i &lt; hidden_size / 2; i += blockDim.x) {\n        half2 input_val = __ldg(reinterpret_cast&lt;const half2*&gt;(input_row + i * 2));\n        half2 residual_val = __ldg(reinterpret_cast&lt;const half2*&gt;(residual_row + i * 2));\n        half2 sum_val;\n        sum_val.x = __hadd(input_val.x, residual_val.x);\n        sum_val.y = __hadd(input_val.y, residual_val.y);\n        reinterpret_cast&lt;half2*&gt;(residual_row)[i] = sum_val;\n\n        float2 fsum_val = __half22float2(sum_val);\n        variance += fsum_val.x * fsum_val.x + fsum_val.y * fsum_val.y;\n    }\n    if (threadIdx.x == 0 &amp;&amp; hidden_size % 2 == 1) {\n        half sum_val = __hadd(input_row[hidden_size - 1], residual_row[hidden_size - 1]);\n        residual_row[hidden_size - 1] = sum_val;\n        variance += static_cast&lt;float&gt;(sum_val) * static_cast&lt;float&gt;(sum_val);\n    }\n\n    variance = warp_reduce_sum(variance);\n    if (threadIdx.x == 0) {\n        s_variance = rsqrtf(variance / hidden_size + epsilon);\n    }\n    __syncthreads();\n\n    half2 s_variance_h2 = __float2half2_rn(s_variance);\n    for (int i = threadIdx.x; i &lt; hidden_size / 2; i += blockDim.x) {\n        half2 residual_val = __ldg(reinterpret_cast&lt;const half2*&gt;(residual_row + i * 2));\n        half2 weight_val = __ldg(reinterpret_cast&lt;const half2*&gt;(weight + i * 2));\n        half2 out_val;\n        out_val.x = __hmul(residual_val.x, weight_val.x) * s_variance;\n        out_val.y = __hmul(residual_val.y, weight_val.y) * s_variance;\n        reinterpret_cast&lt;half2*&gt;(input_row)[i] = out_val;\n    }\n    if (threadIdx.x == 0 &amp;&amp; hidden_size % 2 == 1) {\n        half residual_val = residual_row[hidden_size - 1];\n        half weight_val = weight[hidden_size - 1];\n        input_row[hidden_size - 1] = __hmul(residual_val, weight_val) * __float2half(s_variance);\n    }\n}\n\ntorch::Tensor rms_norm(torch::Tensor input, torch::Tensor weight, double epsilon) {\n    int num_tokens = input.size(0);\n    int hidden_size = input.size(1);\n    torch::Tensor out = torch::empty_like(input);\n\n    int blockSize = 256;\n    int numBlocks = num_tokens;\n\n    rms_norm_kernel&lt;&lt;&lt;numBlocks, blockSize&gt;&gt;&gt;(\n        out.data_ptr&lt;float&gt;(), \n        input.data_ptr&lt;at::Half&gt;(), \n        weight.data_ptr&lt;at::Half&gt;(), \n        static_cast&lt;float&gt;(epsilon), \n        num_tokens, \n        hidden_size);\n\n    return out;\n}\n\ntorch::Tensor fused_add_rms_norm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double epsilon) {\n    int num_tokens = input.size(0);\n    int hidden_size = input.size(1);\n    int64_t input_stride = input.stride(0);\n\n    int blockSize = 256;\n    int numBlocks = num_tokens;\n\n    fused_add_rms_norm_kernel&lt;&lt;&lt;numBlocks, blockSize&gt;&gt;&gt;(\n        input.data_ptr&lt;at::Half&gt;(), \n        input_stride, \n        residual.data_ptr&lt;at::Half&gt;(), \n        weight.data_ptr&lt;at::Half&gt;(), \n        static_cast&lt;float&gt;(epsilon), \n        num_tokens, \n        hidden_size);\n\n    return input;\n}\n&#x27;&#x27;&#x27;,\nextra_cuda_cflags=[&#x27;-O3&#x27;]\n\nclass ModelNew(nn.Module):\n    def __init__(self, hidden_size, eps):\n        super(ModelNew, self).__init__()\n        self.weight = nn.Parameter(torch.ones(hidden_size))\n\n    def forward(self, x):\n        out = model_new_cuda.rms_norm(x, self.weight, 1e-5)\n        return out\n\nmodel_new_cuda = load_inline(\n    name=&#x27;model_new_cuda&#x27;,\n    cuda_sources=[cuda_source],\n    functions=[&#x27;rms_norm&#x27;, &#x27;fused_add_rms_norm&#x27;],\n    extra_cuda_include_paths=[&#x27;/usr/local/cuda/include&#x27;],\n    with_cuda=True,\n    extra_cflags=[&#x27;-O3&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;]\n)\n\nclass ModelNewWrapper(nn.Module):\n    def __init__(self, hidden_size, eps):\n        super(ModelNewWrapper, self).__init__()\n        self.model_new = ModelNew(hidden_size, eps)\n\n    def forward(self, x):\n        return self.model_new(x)\n\ndef get_model(hidden_size, eps):\n    return ModelNewWrapper(hidden_size, eps)\n&quot;
+}</div></details><details><summary>result ← static_check (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>static_check</b>
+static_check PASSED: no violations or warnings detected.</div></details></div></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>llm latency: 15.6s</span></div><details><summary>call → run_correctness</summary><div class="block tool-args"><span class="role-tag">call</span><b>run_correctness</b>
+{
+  &quot;_raw&quot;: &quot;{\&quot;kernel_code\&quot;: \&quot;import torch&quot;
+}</div></details><details open><summary>result ← run_correctness (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>run_correctness</b>
+Tool call arguments could not be parsed as JSON: Unterminated string starting at: line 1 column 17 (char 16). Please re-issue the call with valid JSON arguments.</div></details></div><div class="turn"><div class="turn-head"><span class="turn-id">turn 3</span><span>llm latency: 6.0s</span></div><div class="block assistant"><span class="role-tag">feedback</span>LLM call failed: RateLimitError: Error code: 429 - {&#x27;error&#x27;: {&#x27;code&#x27;: &#x27;RateLimitReached&#x27;, &#x27;message&#x27;: &#x27;Rate limit exceeded. Quota request exceeds the tokens limit. Requested tokens: 0.&#x27;, &#x27;details&#x27;: &#x27;Rate limit exceeded. Quota request exceeds the tokens limit. Requested tokens: 0.&#x27;}}</div></div></div>
+</body></html>
