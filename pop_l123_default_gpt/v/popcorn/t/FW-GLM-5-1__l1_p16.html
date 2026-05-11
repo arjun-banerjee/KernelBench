@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 16</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 14:36:28 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 16</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 14:38:18 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">16_DeepSeekMoECombineScatter.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 12</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">1738</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 12</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">10246</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -112,5 +112,703 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 857.8s turn · 66.9s LLM · tokens in=1,787 · out=6,721 · total=8,508 · 28,373 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>857.8s turn · 66.9s LLM · 790.9s tools · <span class="turn-tokens">tokens in=1,787 · out=6,721 · total=8,508</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me understand the problem:
+
+1. `expert_hidden` is shape (num_tokens * fanout, hidden_dim) = (3072, 128)
+2. `token_idx` is shape (num_tokens * fanout,) = (3072,) - contains indices into the output tensor
+3. `gates` is shape (num_tokens * fanout,) = (3072,) - scaling factors
+4. `num_tokens` = 1536
+5. Output is shape (num_tokens, hidden_dim) = (1536, 128)
+
+The operation is essentially a scatter-add:
+- For each row `i` in expert_hidden:
+  - Get the target token index from token_idx[i]
+  - Scale expert_hidden[i] by gates[i]
+  - Add to output[token_idx[i]]
+
+This is a memory-bound operation. Each row of expert_hidden is 128 floats = 512 bytes. The output rows are also 512 bytes each.
+
+The key challenge is that multiple rows of expert_hidden may map to the same output token (fanout=2 means each token gets 2 expert contributions). This creates a potential race condition in parallel writes.
+
+Optimization strategies:
+1. Atomic adds - but these are slow for FP32
+2. Parallelize by output token instead - each thread block handles one or more output tokens
+3. Use shared memory for reduction within a block
+
+Let me think about approach 2:
+- Each output token has exactly `fanout` expert contributions (since token_idx is created with repeat_interleave)
+- We could have each thread block handle one or more output tokens
+- For each token, find its fanout rows in expert_hidden and sum them with gates scaling
+
+Actually, let me look at how token_idx is constructed:
+```python
+token_idx = torch.arange(num_tokens, dtype=torch.int32).repeat_interleave(fanout)
+```
+
+So token_idx = [0, 0, 1, 1, 2, 2, ..., 1535, 1535] for fanout=2.
+
+This means:
+- expert_hidden[0] and expert_hidden[1] both go to output[0]
+- expert_hidden[2] and expert_hidden[3] both go to output[1]
+- etc.
+
+So the mapping is very regular: output[i] gets expert_hidden[2*i] and expert_hidden[2*i+1].
+
+But wait, the kernel should work for any token_idx pattern, not just this regular one. Let me design a general solution.
+
+Approach 1: One thread per expert row
+- Each thread reads one row from expert_hidden
+- Scales it by gates[i]
+- Atomically adds to output[token_idx[i]]
+- Problem: atomic adds are slow
+
+Approach 2: Parallelize by output token
+- Each thread block handles a chunk of output tokens
+- But we need to know which expert rows map to each token
+- This requires pre-processing or sorting
+
+Approach 3: Two-phase approach
+- Phase 1: Each thread processes one expert row, writes scaled values to a temporary buffer
+- Phase 2: Parallel reduction within each output token
+- Complex and memory intensive
+
+Given the small problem size (3072 rows × 128 cols), I think a simple approach might work well:
+
+Option A: One thread per output token element
+- Each thread handles one element of one output token
+- For that element, loop through the fanout expert rows that contribute to it
+- But we don&#x27;t know which rows contribute without searching...
+
+Actually, let&#x27;s think more carefully. The number of rows in expert_hidden is `num_tokens * fanout`. But the fanout is not passed as a parameter! We need to find which rows map to each output token.
+
+Option B: Sort-based approach
+- Sort expert_hidden rows by token_idx
+- Then each output token&#x27;s contributions are contiguous
+- But this adds overhead
+
+Option C: Bincount + segment sum
+- Use bincount to find which output tokens have contributions
+- Build a list of rows for each token
+- Again, complex overhead
+
+Let me go with a simpler approach first and see if it works:
+
+Approach: One thread per expert row, use atomicAdd
+- Launch num_tokens * fanout threads
+- Each thread handles one row
+- Scale and atomicAdd to output
+
+For 3072 rows and 128 columns, that&#x27;s 3072 threads. We could have each thread handle an entire row (128 elements), which is 3072 threads total.
+
+Or we could have 3072 * 128 threads, each handling one element.
+
+Let&#x27;s try the first approach with vectorized loads/writes:
+
+Actually, let me reconsider. With hidden_dim=128, we can have:
+- 3072 threads, each handling one row of 128 elements
+- Each thread does 128 loads from expert_hidden, 1 load from gates, 1 load from token_idx
+- Then does 128 atomicAdds to output
+
+That&#x27;s a lot of atomicAdds. Let&#x27;s try a different approach:
+
+Each thread handles one element of the output tensor:
+- num_tokens * hidden_dim = 1536 * 128 = 196608 threads
+- Each thread needs to find which expert rows contribute to its output token
+- But this requires searching through token_idx...
+
+Actually, for the given regular pattern, we could use a specialized kernel. But let&#x27;s build a general one first.
+
+Let me try: one thread block per output token
+- Each block handles one output token (128 elements)
+- Use shared memory to gather contributions from all expert rows that map to this token
+- But finding those rows requires searching...
+
+Hmm, this is tricky without preprocessing.
+
+Let me just go with the straightforward atomicAdd approach first:
+
+```cuda
+__global__ void scatter_add_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim) {
+    
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= num_rows) return;
+    
+    int token = token_idx[row];
+    float gate = gates[row];
+    const float* src = expert_hidden + row * hidden_dim;
+    float* dst = output + token * hidden_dim;
+    
+    for (int i = 0; i &lt; hidden_dim; i++) {
+        atomicAdd(&amp;dst[i], gate * src[i]);
+    }
+}
+```
+
+But this has race conditions and is slow due to atomics.
+
+Let me try a different approach: since each token has exactly fanout contributions in this specific case, and they are contiguous (indices 2*i and 2*i+1 map to token i), we could specialize for this pattern. But the kernel should work for general inputs.
+
+Let me think about this differently. The problem is essentially:
+- We have a sparse matrix of shape (num_tokens, num_tokens * fanout) where each column has exactly one 1
+- We multiply this by gates (diagonal matrix)
+- Then multiply by expert_hidden
+- Result is (num_tokens, hidden_dim)
+
+Actually, the simplest correct approach is:
+1. Initialize output to zeros
+2. For each row in expert_hidden, atomicAdd scaled values to the appropriate output row
+
+Let me implement this with optimizations:
+- Use vectorized loads/stores where possible
+- Use cooperative groups for reduction within a block
+
+Actually, let me try a cleaner approach: have each thread block handle one output token. Threads within the block cooperatively find all expert rows that map to this token and sum them.
+
+Wait, but finding which rows map to which token requires scanning token_idx, which is O(num_rows * fanout) per block - too expensive.
+
+Let me go back to the atomic approach but optimize it:
+- Use float4 vectorized loads/stores
+- Use separate kernels for different hidden_dim sizes
+
+Actually, I realize we can do better: since the problem says fanout=2 and token_idx is constructed with repeat_interleave, the mapping is regular. But the kernel should handle general cases too.
+
+Let me implement a kernel that works for general cases but optimizes for the common case where token_idx is sorted:
+
+```cuda
+__global__ void scatter_add_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim,
+    int num_tokens) {
+    
+    // Each thread handles one element of the output
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = num_tokens * hidden_dim;
+    
+    if (tid &gt;= total_elements) return;
+    
+    int token = tid / hidden_dim;
+    int col = tid % hidden_dim;
+    
+    float sum = 0.0f;
+    for (int row = 0; row &lt; num_rows; row++) {
+        if (token_idx[row] == token) {
+            sum += gates[row] * expert_hidden[row * hidden_dim + col];
+        }
+    }
+    output[tid] = sum;
+}
+```
+
+But this is O(num_tokens * hidden_dim * num_rows) which is terrible.
+
+OK let me just go with the atomicAdd approach. With 3072 rows × 128 cols = 393216 atomic operations. On modern GPUs, this might actually be OK.
+
+Actually, here&#x27;s a better idea: use warp-level primitives.
+
+Approach: Each warp handles one expert row
+- Load the row into registers (each thread handles 4 elements for 128-wide rows)
+- One thread reads the token index and gate
+- Broadcast to all threads in warp
+- Each thread does atomicAdd for its elements
+
+Or even better: if we know that each token has exactly 2 contributions, we can have:
+- Each warp handles 16 output tokens (16 threads × 8 elements each for 128-wide rows)
+- Threads cooperatively load the 2 expert rows for each token and sum them
+
+But this requires knowing fanout=2, which isn&#x27;t passed to the kernel.
+
+Let me implement a flexible solution:
+
+```cuda
+__global__ void scatter_add_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim) {
+    
+    // Each thread handles one expert row
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= num_rows) return;
+    
+    int token = token_idx[row];
+    float gate = gates[row];
+    
+    // Use vectorized loads/stores if hidden_dim is multiple of 4
+    const float4* src_vec = reinterpret_cast&lt;const float4*&gt;(expert_hidden + row * hidden_dim);
+    float4* dst_vec = reinterpret_cast&lt;float4*&gt;(output + token * hidden_dim);
+    
+    int num_vec = hidden_dim / 4;
+    
+    for (int i = 0; i &lt; num_vec; i++) {
+        float4 val = src_vec[i];
+        val.x *= gate;
+        val.y *= gate;
+        val.z *= gate;
+        val.w *= gate;
+        
+        atomicAdd(&amp;dst_vec[i].x, val.x);
+        atomicAdd(&amp;dst_vec[i].y, val.y);
+        atomicAdd(&amp;dst_vec[i].z, val.z);
+        atomicAdd(&amp;dst_vec[i].w, val.w);
+    }
+    
+    // Handle remaining elements
+    for (int i = num_vec * 4; i &lt; hidden_dim; i++) {
+        atomicAdd(&amp;output[token * hidden_dim + i], gate * expert_hidden[row * hidden_dim + i]);
+    }
+}
+```
+
+Actually, atomicAdd on float4 doesn&#x27;t work directly. We need atomicAdd on individual floats.
+
+Let me write a cleaner version:
+
+```cuda
+__global__ void scatter_add_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim) {
+    
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= num_rows) return;
+    
+    int token = token_idx[row];
+    float gate = gates[row];
+    
+    const float* src = expert_hidden + row * hidden_dim;
+    float* dst = output + token * hidden_dim;
+    
+    for (int i = 0; i &lt; hidden_dim; i++) {
+        atomicAdd(&amp;dst[i], gate * src[i]);
+    }
+}
+```
+
+This is simple and correct. Let me implement this first and see the performance.
+
+Actually, for better performance, let&#x27;s have each thread handle multiple rows if there are fewer rows than threads we want to launch. Or have each warp handle one row cooperatively.
+
+Let me try: each thread handles one output element
+- Total threads: num_tokens * hidden_dim = 1536 * 128 = 196608
+- Each thread loops over num_rows to find contributions to its element
+- Too slow!
+
+Let me try: each warp handles one expert row cooperatively
+- 32 threads in a warp
+- Each thread handles 4 elements of the row (for 128-wide rows)
+- 32 * 4 = 128 elements per warp
+- Number of warps needed: num_rows / 1 = 3072 warps = 98304 threads
+
+```cuda
+__global__ void scatter_add_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim) {
+    
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane = threadIdx.x % 32;
+    int warp_id = row / 32;
+    
+    if (warp_id &gt;= num_rows) return;
+    
+    // One warp per expert row
+    int token = token_idx[warp_id];
+    float gate = gates[warp_id];
+    
+    const float* src = expert_hidden + warp_id * hidden_dim;
+    float* dst = output + token * hidden_dim;
+    
+    // Each lane handles elements [lane*4, lane*4+3]
+    for (int i = lane * 4; i &lt; min((lane + 1) * 4, hidden_dim); i++) {
+        atomicAdd(&amp;dst[i], gate * src[i]);
+    }
+}
+```
+
+Hmm, this has an issue: I&#x27;m using row as the linear thread index, but then using warp_id = row / 32 to determine which expert row to process. This means 32 threads process the same expert row. Let me fix:
+
+```cuda
+__global__ void scatter_add_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim) {
+    
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    
+    if (warp_id &gt;= num_rows) return;
+    
+    int token = token_idx[warp_id];
+    float gate = gates[warp_id];
+    
+    const float* src = expert_hidden + warp_id * hidden_dim;
+    float* dst = output + token * hidden_dim;
+    
+    // Each lane handles elements [lane*4, lane*4+3]
+    for (int i = lane * 4; i &lt; min((lane + 1) * 4, hidden_dim); i++) {
+        atomicAdd(&amp;dst[i], gate * src[i]);
+    }
+}
+```
+
+This is still using atomics. Let me think about how to avoid atomics...
+
+If we know the structure of token_idx (repeat_interleave), we can use a specialized kernel:
+- Each warp handles one output token
+- The two expert rows that map to it are indices 2*token and 2*token + 1
+
+```cuda
+__global__ void scatter_add_known_fanout_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim,
+    int num_tokens,
+    int fanout) {
+    
+    int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token &gt;= num_tokens) return;
+    
+    // Each thread handles one output token
+    // Assumes token_idx = arange(num_tokens).repeat_interleave(fanout)
+    // So expert rows [fanout*token, fanout*token + fanout) map to this token
+    
+    float* dst = output + token * hidden_dim;
+    
+    for (int f = 0; f &lt; fanout; f++) {
+        int row = fanout * token + f;
+        float gate = gates[row];
+        const float* src = expert_hidden + row * hidden_dim;
+        
+        for (int i = 0; i &lt; hidden_dim; i++) {
+            if (f == 0) {
+                dst[i] = gate * src[i];
+            } else {
+                dst[i] += gate * src[i];
+            }
+        }
+    }
+}
+```
+
+This kernel doesn&#x27;t need atomics because each thread owns its output token exclusively. But it assumes a specific token_idx structure.
+
+For a general kernel, we need atomics or some form of coordination.
+
+Let me implement both:
+1. A general kernel that uses atomics
+2. A specialized kernel for the known fanout case
+
+Actually, we don&#x27;t know fanout from the parameters. We could compute it as num_rows / num_tokens, but that might not always be integer.
+
+Let me just implement the general kernel with atomics and see if it&#x27;s fast enough:
+
+```cuda
+__global__ void scatter_add_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim) {
+    
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= num_rows) return;
+    
+    int token = token_idx[row];
+    float gate = gates[row];
+    
+    const float* src = expert_hidden + row * hidden_dim;
+    float* dst = output + token * hidden_dim;
+    
+    for (int i = 0; i &lt; hidden_dim; i++) {
+        atomicAdd(&amp;dst[i], gate * src[i]);
+    }
+}
+```
+
+Wait, I just realized something. The problem says we should output the same as the reference. The reference uses a Python loop that does `out[token] += gates[row] * expert_hidden[row]`. This is a scatter-add operation.
+
+If multiple expert rows map to the same token, they all contribute additively. With fanout=2, each token gets 2 contributions.
+
+The atomic approach is correct. But let me think about a better approach:
+
+If we can sort expert_hidden by token_idx, then all rows for each token are contiguous. Then we can:
+1. Have each thread block handle one output token
+2. Threads in the block cooperatively load and sum the contiguous expert rows
+3. Write the result without atomics
+
+But sorting is expensive.
+
+Alternative: build a mapping from token to list of rows (inverted index). This requires preprocessing.
+
+Actually, for this specific problem where token_idx is constructed as arange(num_tokens).repeat_interleave(fanout), we know exactly which rows map to which tokens:
+- Token i maps to rows fanout*i, fanout*i+1, ..., fanout*i + fanout - 1
+
+So fanout = num_rows / num_tokens.
+
+Let me implement this:
+
+```cuda
+__global__ void scatter_add_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim,
+    int num_tokens) {
+    
+    // Assume fanout = num_rows / num_tokens
+    // And token_idx is sorted by token (repeat_interleave pattern)
+    
+    int token = blockIdx.x;  // One block per output token
+    if (token &gt;= num_tokens) return;
+    
+    int fanout = num_rows / num_tokens;
+    
+    // Find the first row for this token
+    int row_start = token * fanout;
+    
+    float* dst = output + token * hidden_dim;
+    
+    // Use shared memory for partial sums
+    extern __shared__ float shared[];
+    
+    int tid = threadIdx.x;
+    
+    // Initialize output to zero
+    for (int i = tid; i &lt; hidden_dim; i += blockDim.x) {
+        dst[i] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Sum contributions from all fanout rows
+    for (int f = 0; f &lt; fanout; f++) {
+        int row = row_start + f;
+        float gate = gates[row];
+        const float* src = expert_hidden + row * hidden_dim;
+        
+        for (int i = tid; i &lt; hidden_dim; i += blockDim.x) {
+            atomicAdd(&amp;dst[i], gate * src[i]);
+        }
+    }
+}
+```
+
+Wait, I&#x27;m still using atomics within the block because multiple threads write to the same dst[i]... No, actually each thread handles different i values, so there&#x27;s no race condition within a block for the same i.
+
+Let me fix:
+
+```cuda
+__global__ void scatter_add_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim,
+    int num_tokens) {
+    
+    int token = blockIdx.x;
+    if (token &gt;= num_tokens) return;
+    
+    int fanout = num_rows / num_tokens;
+    int row_start = token * fanout;
+    
+    float* dst = output + token * hidden_dim;
+    int tid = threadIdx.x;
+    
+    // Each thread handles a subset of elements
+    // Initialize and accumulate in one pass
+    for (int i = tid; i &lt; hidden_dim; i += blockDim.x) {
+        float sum = 0.0f;
+        for (int f = 0; f &lt; fanout; f++) {
+            int row = row_start + f;
+            sum += gates[row] * expert_hidden[row * hidden_dim + i];
+        }
+        dst[i] = sum;
+    }
+}
+```
+
+This kernel:
+- Launches one block per output token
+- Each thread handles hidden_dim / blockDim.x elements
+- No atomics needed because each thread writes to unique memory locations
+- Assumes the regular pattern of token_idx
+
+Let me check: with 1536 tokens and hidden_dim=128, we launch 1536 blocks. Each block has, say, 128 threads. Each thread handles 1 element. That&#x27;s 1536 * 128 = 196608 threads total.
+
+Actually, the assumption about token_idx pattern might not hold for all inputs. Let me verify by reading the token_idx array instead of computing row_start:
+
+```cuda
+__global__ void scatter_add_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim,
+    int num_tokens) {
+    
+    int token = blockIdx.x;
+    if (token &gt;= num_tokens) return;
+    
+    int tid = threadIdx.x;
+    float* dst = output + token * hidden_dim;
+    
+    // Each thread handles a subset of elements
+    for (int i = tid; i &lt; hidden_dim; i += blockDim.x) {
+        float sum = 0.0f;
+        // Scan all rows to find those that map to this token
+        for (int row = 0; row &lt; num_rows; row++) {
+            if (token_idx[row] == token) {
+                sum += gates[row] * expert_hidden[row * hidden_dim + i];
+            }
+        }
+        dst[i] = sum;
+    }
+}
+```
+
+This scans all rows for each output token, which is O(num_tokens * hidden_dim * num_rows). Too slow!
+
+So we need a more efficient approach. Let me think...
+
+For the given problem with repeat_interleave pattern, the specialized kernel works. For general patterns, we need either:
+1. Atomics (slow but general)
+2. Preprocessing (build inverted index)
+3. Assume sorted input
+
+I&#x27;ll implement the specialized kernel that assumes the repeat_interleave pattern. If needed, we can verify by checking that token_idx matches the expected pattern.
+
+Actually, looking at the reference code more carefully:
+```python
+token_idx = torch.arange(num_tokens, dtype=torch.int32).repeat_interleave(fanout)
+```
+
+This creates [0, 0, 1, 1, 2, 2, ...] for fanout=2. So the pattern is fixed for this problem.
+
+But the model&#x27;s forward function doesn&#x27;t know about fanout; it just takes token_idx as input. So the kernel should work for any token_idx.
+
+Let me implement both:
+1. A fast kernel that assumes sorted/token-grouped input
+2. A fallback kernel that uses atomics for unsorted input
+
+But for simplicity, let&#x27;s just implement the atomic version and see if it&#x27;s fast enough:
+
+```cuda
+__global__ void scatter_add_atomic_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim) {
+    
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= num_rows) return;
+    
+    int token = token_idx[row];
+    float gate = gates[row];
+    
+    const float* src = expert_hidden + row * hidden_dim;
+    float* dst = output + token * hidden_dim;
+    
+    // Process in chunks of 4 for coalesced memory access
+    for (int i = 0; i &lt; hidden_dim; i++) {
+        atomicAdd(&amp;dst[i], gate * src[i]);
+    }
+}
+```
+
+Let me think about memory access patterns:
+- expert_hidden is accessed row by row, each thread reads a contiguous chunk
+- token_idx and gates are accessed one element per thread
+- output is written atomically, potentially to the same location by different threads
+
+The atomic operations will serialize writes to the same location. With fanout=2, each output location gets at most 2 atomic adds. This should be manageable.
+
+Let me also consider using float4 for vectorized memory access:
+
+```cuda
+__global__ void scatter_add_atomic_kernel(
+    const float* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const float* __restrict__ gates,
+    float* __restrict__ output,
+    int num_rows,
+    int hidden_dim) {
+    
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= num_rows) return;
+    
+    int token = token_idx[row];
+    float gate = gates[row];
+    
+    // Use float4 for vectorized loads
+    const float4* src4 = (const float4*)(expert_hidden + row * hidden_dim);
+    float4* dst4 = (float4*)(output + token * hidden_dim);
+    
+    int num_vec4 = hidden_dim / 4;
+    int remainder = hidden_dim % 4;
+    
+    for (int i = 0; i &lt; num_vec4; i++) {
+        float4 val = src4[i];
+        atomicAdd(&amp;dst4[i].x, gate * val.x);
+        atomicAdd(&amp;dst4[i].y, gate * val.y);
+        atomicAdd(&amp;dst4[i].z, gate * val.z);
+        atomicAdd(&amp;dst4[i].w, gate * val.w);
+    }
+    
+    // Handle remainder
+    const float* src = expert_hidden + row * hidden_dim;
+    float* dst = output + token * hidden_dim;
+    for (int i = num_vec4 * 4; i &lt; hidden_dim; i++) {
+        atomicAdd(&amp;dst[i], gate * src[i]);
+    }
+}
+```
+
+Actually, atomicAdd on float4 components doesn&#x27;t help much since each atomic is still separate. The vectorized load helps though.
+
+Let me write the complete Python module:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Now let me understand the problem better and write an initial kernel implementation.
+
+The operation is a scatter-add:
+- `expert_hidden` shape: (num_tokens * fanout, hidden_dim) = (3072, 128)
+- `token_idx` tells which output token each expert row contributes to
+- `gates` provides the scaling factor
+- Each output token receives contributions from multiple expert rows (fanout=2)
+
+I&#x27;ll start with a straightforward CUDA kernel and optimize from there.
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n__global__ void scatter_add_kernel(\n    const float* __restrict__ expert_hidden,\n    const int* __restrict__ token_idx,\n    const float* __restrict__ gates,\n    float* __restrict__ output,\n    int num_rows,\n    int hidden_dim) {\n    \n    int row = blockIdx.x * blockDim.x + threadIdx.x;\n    if (row &gt;= num_rows) return;\n    \n    int token = token_idx[row];\n    float gate = gates[row];\n    \n    const float* __restrict__ src = expert_hidden + row * hidden_dim;\n    float* __restrict__ dst = output + token * hidden_dim;\n    \n    for (int i = 0; i &lt; hidden_dim; i++) {\n        atomicAdd(&amp;dst[i], gate * src[i]);\n    }\n}\n\nvoid scatter_add_cuda(\n    const float* expert_hidden,\n    const int* token_idx,\n    const float* gates,\n    float* output,\n    int num_rows,\n    int hidden_dim) {\n    \n    int threads = 256;\n    int blocks = (num_rows + threads - 1) / threads;\n    scatter_add_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(expert_hidden, token_idx, gates, output, num_rows, hidden_dim);\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\nvoid scatter_add_cuda(const float* expert_hidden, const int* token_idx, const float* gates, float* output, int num_rows, int hidden_dim);\n\&quot;\&quot;\&quot;\n\nmodule = load_inline(\n    name=&#x27;scatter_add_module&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;scatter_add_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(\n        self,\n        expert_hidden: torch.Tensor,\n        token_idx: torch.Tensor,\n        gates: torch.Tensor,\n        num_tokens: int,\n    ) -&gt; torch.Tensor:\n        out = torch.zeros(num_tokens, expert_hidden.shape[1], dtype=expert_hidden.dtype, device=expert_hidden.device)\n        num_rows = expert_hidden.shape[0]\n        hidden_dim = expert_hidden.shape[1]\n        \n        # Ensure contiguous tensors\n        expert_hidden = expert_hidden.contiguous()\n        token_idx = token_idx.contiguous()\n        gates = gates.contiguous()\n        \n        module.scatter_add_cuda(\n            expert_hidden.data_ptr(),\n            token_idx.data_ptr(),\n            gates.data_ptr(),\n            out.data_ptr(),\n            num_rows,\n            hidden_dim\n        )\n        \n        return out&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
