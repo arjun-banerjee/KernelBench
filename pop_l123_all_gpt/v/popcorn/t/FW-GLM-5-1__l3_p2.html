@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L3 P2 · popcorn</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L3 · problem 2</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 20:21:50 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-in_progress">in_progress</span>
+  <span style="font-size:13px;">2_FusedMultiStepDiffusionSolver.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">3606</div></div>
+  <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-11T20:20:51Z</div></div>
+</div>
+
+
+
+</div><details class="ref-source"><summary>reference PyTorch source (the prompt the agent sees)</summary><pre class="block">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Default ModelNew is PyTorch-only. run_and_check: use check_kernel=False with backend=cuda
+# until the candidate file contains a real CUDA kernel (see kernel_static_checker).
+
+
+def _linear_beta_schedule(num_timesteps: int, beta_start: float, beta_end: float) -&gt; torch.Tensor:
+    return torch.linspace(beta_start, beta_end, num_timesteps)
+
+
+class Model(nn.Module):
+    &quot;&quot;&quot;
+    Fused **multi-step** diffusion denoising (VP-DDPM-style) in a single ``forward``.
+
+    Instead of one scheduler step per Python call, this reference unrolls
+    ``num_fused_steps`` consecutive **deterministic** reverse updates (posterior mean,
+    no sampler noise)—a typical fusion target for robotics / world-model diffusion
+    heads where latency matters.
+
+    Each inner step: predict ``ε_θ(x, t)`` with a small MLP, then apply the standard
+    DDPM mean update from discrete time ``t`` to ``t-1``. Batch elements may start
+    from different ``t_start``; inputs must satisfy ``t_start &gt;= num_fused_steps`` so
+    indices stay valid.
+    &quot;&quot;&quot;
+
+    def __init__(self, dim: int, num_fused_steps: int, total_timesteps: int = 1000):
+        super().__init__()
+        assert num_fused_steps &gt;= 1
+        assert total_timesteps &gt;= num_fused_steps + 1
+        self.dim = dim
+        self.num_fused_steps = num_fused_steps
+        self.total_timesteps = total_timesteps
+
+        self.eps_net = nn.Sequential(
+            nn.Linear(dim + 1, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+        betas = _linear_beta_schedule(total_timesteps, 1e-4, 0.02)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer(&quot;betas&quot;, betas)
+        self.register_buffer(&quot;alphas&quot;, alphas)
+        self.register_buffer(&quot;alphas_cumprod&quot;, alphas_cumprod)
+        # x_{t-1} = (1/sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1-alpha_bar_t)) * eps)
+        self.register_buffer(&quot;sqrt_recip_alphas&quot;, torch.sqrt(1.0 / alphas))
+        self.register_buffer(
+            &quot;coef_eps&quot;,
+            betas / torch.sqrt(1.0 - alphas_cumprod),
+        )
+
+    def forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:
+        &quot;&quot;&quot;
+        Args:
+            x: (B, dim) noisy latent at discrete time ``t_start`` (same semantics as DDPM).
+            t_start: (B,) int64 timesteps in ``[num_fused_steps, total_timesteps - 1]``.
+        Returns:
+            (B, dim) latent after ``num_fused_steps`` fused denoise steps toward 0.
+        &quot;&quot;&quot;
+        B, d = x.shape
+        assert d == self.dim
+        assert t_start.shape == (B,)
+        # Harness paths (measure_ref_program_time / eval) cast activations to fp32;
+        # discrete timesteps must survive as whole-valued floats → long indices.
+        t_start = t_start.long()
+
+        x_cur = x
+        for k in range(self.num_fused_steps):
+            t_idx = t_start - k
+            # ``get_inputs`` samples t_start &gt;= num_fused_steps so t_idx &gt;= 1 always.
+            t_norm = t_idx.float() / float(self.total_timesteps)
+            eps = self.eps_net(torch.cat([x_cur, t_norm.unsqueeze(-1)], dim=-1))
+
+            c1 = self.sqrt_recip_alphas[t_idx].view(B, 1)
+            c2 = self.coef_eps[t_idx].view(B, 1)
+            x_cur = c1 * (x_cur - c2 * eps)
+
+        return x_cur
+
+
+class ModelNew(nn.Module):
+    &quot;&quot;&quot;KernelBench candidate entry point; default delegates to ``Model``.&quot;&quot;&quot;
+
+    def __init__(self, dim: int, num_fused_steps: int, total_timesteps: int = 1000):
+        super().__init__()
+        self._impl = Model(dim, num_fused_steps, total_timesteps=total_timesteps)
+
+    def forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:
+        return self._impl(x, t_start)
+
+
+batch_size = 8
+dim = 64
+num_fused_steps = 16
+total_timesteps = 1000
+
+
+def get_inputs():
+    x = torch.randn(batch_size, dim)
+    low = num_fused_steps
+    high = total_timesteps
+    t_start = torch.randint(low, high, (batch_size,), dtype=torch.long)
+    return [x, t_start]
+
+
+def get_init_inputs():
+    return [dim, num_fused_steps, total_timesteps]
+</pre></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>17.5s turn · 8.6s LLM · 8.9s tools · <span class="turn-tokens">tokens in=2,901 · out=705 · total=3,606</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the reference implementation to understand what needs to be optimized:
+
+1. The model performs multi-step diffusion denoising
+2. Each step involves:
+   - Computing `t_norm = t_idx.float() / total_timesteps`
+   - Passing `[x_cur, t_norm]` through a small MLP (eps_net)
+   - Applying DDPM mean update with coefficients looked up from buffers
+
+3. The MLP (eps_net) has 3 linear layers with SiLU activations:
+   - Linear(dim+1, dim*4)
+   - SiLU
+   - Linear(dim*4, dim*4)
+   - SiLU
+   - Linear(dim*4, dim)
+
+4. The coefficients are precomputed and stored in buffers:
+   - sqrt_recip_alphas
+   - coef_eps
+
+Key optimization opportunities:
+1. Fuse all operations into a single kernel
+2. Avoid multiple kernel launches for each step
+3. Use shared memory for intermediate results
+4. Optimize the MLP computation
+
+Let me start by getting the GPU specs and understanding the problem better.
+
+For the CUDA kernel, I&#x27;ll need to:
+1. Load the MLP weights
+2. Implement SiLU activation
+3. Implement the denoising step
+4. Loop over num_fused_steps
+
+The challenge is that:
+- Batch elements can have different t_start values
+- We need to look up coefficients per element per step
+- The MLP needs to be applied at each step
+
+Let me design the kernel:
+
+1. Each thread block handles one batch element
+2. Within a block, threads cooperate on the MLP computation
+3. We use shared memory for intermediate activations
+
+Wait, let me reconsider. With batch_size=8 and dim=64:
+- dim*4 = 256 for intermediate layers
+- This is small enough that we could have each thread handle multiple outputs
+
+Actually, let me think about the matrix multiplications:
+
+
+- Linear1: (dim+1) x (dim*4) = 65 x 256
+- Linear2: (dim*4) x (dim*4) = 256 x 256
+- Linear3: (dim*4) x dim = 256 x 64
+
+I can implement the MLP computation efficiently by having each thread handle multiple output elements. The activation functions (SiLU) can be fused into the matrix multiplication operations to reduce memory traffic and kernel launches.
+
+Since the batch size is 8, I should assign one thread block per batch element, which allows me to leverage shared memory for intermediate activations and keeps the coefficient lookups per-step straightforward.
+
+The kernel structure needs to load weights from global memory into shared memory, then process each fusion step: looking up coefficients for the timestep, running the MLP forward pass, and applying the DDPM update to x. I&#x27;ll start with a simpler approach—focusing on kernel fusion for the denoising step and MLP computation first, since batch_size might be larger in practice than the test case suggests.
+
+The coefficients and timestep normalization depend on each batch element&#x27;s t_start, so I need to look up the timestep index, compute the normalized timestep, apply the MLP, and perform the DDPM update for each element. I&#x27;ll construct the kernel to handle this step-by-step.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>I&#x27;ll start by getting the GPU specs to understand the hardware constraints, then analyze and implement an optimized CUDA kernel for this multi-step diffusion denoising operation.
+</div><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+</body></html>
