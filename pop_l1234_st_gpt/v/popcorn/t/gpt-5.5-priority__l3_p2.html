@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L3 P2 · popcorn</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L3 · problem 2</a></div><div class="site-subtitle">gpt-5.5-priority · popcorn · pop_l1234_st_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5-priority.html">← gpt-5.5-priority</a><span class="meta">generated 2026-05-11 08:40:57 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html">FW-GLM-5-1</a><a href="../../../v/popcorn/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html" class=current>gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-in_progress">in_progress</span>
+  <span style="font-size:13px;">2_FusedMultiStepDiffusionSolver.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">gpt-5.5-priority</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 1</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-11T08:39:45Z</div></div>
+</div>
+
+
+
+</div><details class="ref-source"><summary>reference PyTorch source (the prompt the agent sees)</summary><pre class="block">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Default ModelNew is PyTorch-only. run_and_check: use check_kernel=False with backend=cuda
+# until the candidate file contains a real CUDA kernel (see kernel_static_checker).
+
+
+def _linear_beta_schedule(num_timesteps: int, beta_start: float, beta_end: float) -&gt; torch.Tensor:
+    return torch.linspace(beta_start, beta_end, num_timesteps)
+
+
+class Model(nn.Module):
+    &quot;&quot;&quot;
+    Fused **multi-step** diffusion denoising (VP-DDPM-style) in a single ``forward``.
+
+    Instead of one scheduler step per Python call, this reference unrolls
+    ``num_fused_steps`` consecutive **deterministic** reverse updates (posterior mean,
+    no sampler noise)—a typical fusion target for robotics / world-model diffusion
+    heads where latency matters.
+
+    Each inner step: predict ``ε_θ(x, t)`` with a small MLP, then apply the standard
+    DDPM mean update from discrete time ``t`` to ``t-1``. Batch elements may start
+    from different ``t_start``; inputs must satisfy ``t_start &gt;= num_fused_steps`` so
+    indices stay valid.
+    &quot;&quot;&quot;
+
+    def __init__(self, dim: int, num_fused_steps: int, total_timesteps: int = 1000):
+        super().__init__()
+        assert num_fused_steps &gt;= 1
+        assert total_timesteps &gt;= num_fused_steps + 1
+        self.dim = dim
+        self.num_fused_steps = num_fused_steps
+        self.total_timesteps = total_timesteps
+
+        self.eps_net = nn.Sequential(
+            nn.Linear(dim + 1, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+        betas = _linear_beta_schedule(total_timesteps, 1e-4, 0.02)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer(&quot;betas&quot;, betas)
+        self.register_buffer(&quot;alphas&quot;, alphas)
+        self.register_buffer(&quot;alphas_cumprod&quot;, alphas_cumprod)
+        # x_{t-1} = (1/sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1-alpha_bar_t)) * eps)
+        self.register_buffer(&quot;sqrt_recip_alphas&quot;, torch.sqrt(1.0 / alphas))
+        self.register_buffer(
+            &quot;coef_eps&quot;,
+            betas / torch.sqrt(1.0 - alphas_cumprod),
+        )
+
+    def forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:
+        &quot;&quot;&quot;
+        Args:
+            x: (B, dim) noisy latent at discrete time ``t_start`` (same semantics as DDPM).
+            t_start: (B,) int64 timesteps in ``[num_fused_steps, total_timesteps - 1]``.
+        Returns:
+            (B, dim) latent after ``num_fused_steps`` fused denoise steps toward 0.
+        &quot;&quot;&quot;
+        B, d = x.shape
+        assert d == self.dim
+        assert t_start.shape == (B,)
+        # Harness paths (measure_ref_program_time / eval) cast activations to fp32;
+        # discrete timesteps must survive as whole-valued floats → long indices.
+        t_start = t_start.long()
+
+        x_cur = x
+        for k in range(self.num_fused_steps):
+            t_idx = t_start - k
+            # ``get_inputs`` samples t_start &gt;= num_fused_steps so t_idx &gt;= 1 always.
+            t_norm = t_idx.float() / float(self.total_timesteps)
+            eps = self.eps_net(torch.cat([x_cur, t_norm.unsqueeze(-1)], dim=-1))
+
+            c1 = self.sqrt_recip_alphas[t_idx].view(B, 1)
+            c2 = self.coef_eps[t_idx].view(B, 1)
+            x_cur = c1 * (x_cur - c2 * eps)
+
+        return x_cur
+
+
+class ModelNew(nn.Module):
+    &quot;&quot;&quot;KernelBench candidate entry point; default delegates to ``Model``.&quot;&quot;&quot;
+
+    def __init__(self, dim: int, num_fused_steps: int, total_timesteps: int = 1000):
+        super().__init__()
+        self._impl = Model(dim, num_fused_steps, total_timesteps=total_timesteps)
+
+    def forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:
+        return self._impl(x, t_start)
+
+
+batch_size = 8
+dim = 64
+num_fused_steps = 16
+total_timesteps = 1000
+
+
+def get_inputs():
+    x = torch.randn(batch_size, dim)
+    low = num_fused_steps
+    high = total_timesteps
+    t_start = torch.randint(low, high, (batch_size,), dtype=torch.long)
+    return [x, t_start]
+
+
+def get_init_inputs():
+    return [dim, num_fused_steps, total_timesteps]
+</pre></details></div>
+</body></html>
