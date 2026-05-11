@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 16</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 12:55:28 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 16</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 12:57:04 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">16_HamiltonianMonteCarloStep.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 12</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 12</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">14217</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -100,5 +100,1411 @@ def get_inputs():
 
 def get_init_inputs():
     return [dim]
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 342.7s turn · 110.9s LLM · tokens in=1,802 · out=12,415 · total=14,217 · 45,534 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>342.7s turn · 110.9s LLM · 231.9s tools · <span class="turn-tokens">tokens in=1,802 · out=12,415 · total=14,217</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze this HMC (Hamiltonian Monte Carlo) proposal kernel. The forward pass does:
+
+1. Generates random momentum `p` from normal distribution
+2. Saves current state (current_p, current_q)
+3. Leapfrog integration:
+   - Half step for momentum: p = p + 0.5 * eps * grad_log_prob(q)
+   - Loop for num_leapfrog_steps-1:
+     - q = q + eps * p
+     - p = p + eps * grad_log_prob(q)
+   - q = q + eps * p
+   - p = p + 0.5 * eps * grad_log_prob(q)
+   - p = -p (negate for reversibility)
+4. Compute Hamiltonian for current and proposed states
+5. Metropolis acceptance step
+
+The grad_log_prob is simple: -(x - mu), and mu is zeros(dim), so grad_log_prob = -x
+
+Let me think about how to optimize this:
+
+1. The batch is 2048, dim is 64 - so we have 2048 * 64 = 131072 elements
+2. We need to generate random numbers for momentum (same shape as q)
+3. We need to generate random uniform for acceptance (2048 elements)
+4. The leapfrog loop is sequential, so each particle is independent
+
+I can parallelize across batch dimension. Each thread can handle one particle (or use warp-level cooperation for each particle).
+
+Key operations:
+- Random number generation (normal for momentum, uniform for acceptance)
+- Leapfrog integration (simple element-wise operations)
+- Reduction for Hamiltonian computation (sum over dim)
+
+Let me start with a straightforward implementation:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+# CUDA kernel
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;curand_kernel.h&gt;
+
+__global__ void hmc_kernel(
+    const float* q_in,
+    float* q_out,
+    bool* accepted,
+    float* mu,
+    int batch_size,
+    int dim,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &gt;= batch_size) return;
+    
+    // Initialize random states
+    curandState state;
+    curand_init(seed, idx, 0, &amp;state);
+    
+    // Load current position
+    float q[64];  // Assuming dim &lt;= 64
+    for (int i = 0; i &lt; dim; i++) {
+        q[i] = q_in[idx * dim + i];
+    }
+    
+    // Generate momentum
+    float p[64];
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] = curand_normal(&amp;state);
+    }
+    
+    // Save current state
+    float current_q[64], current_p[64];
+    for (int i = 0; i &lt; dim; i++) {
+        current_q[i] = q[i];
+        current_p[i] = p[i];
+    }
+    
+    float eps = step_size;
+    
+    // Half step for momentum: p = p + 0.5 * eps * (-q)
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] -= 0.5f * eps * q[i];
+    }
+    
+    // Leapfrog steps
+    for (int step = 0; step &lt; num_leapfrog_steps - 1; step++) {
+        // q = q + eps * p
+        for (int i = 0; i &lt; dim; i++) {
+            q[i] += eps * p[i];
+        }
+        // p = p + eps * (-q)
+        for (int i = 0; i &lt; dim; i++) {
+            p[i] -= eps * q[i];
+        }
+    }
+    
+    // Final full step for position
+    for (int i = 0; i &lt; dim; i++) {
+        q[i] += eps * p[i];
+    }
+    
+    // Half step for momentum: p = p + 0.5 * eps * (-q)
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] -= 0.5f * eps * q[i];
+    }
+    
+    // Negate momentum
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] = -p[i];
+    }
+    
+    // Compute Hamiltonians
+    float current_H = 0.0f, proposed_H = 0.0f;
+    for (int i = 0; i &lt; dim; i++) {
+        current_H += 0.5f * current_q[i] * current_q[i] + 0.5f * current_p[i] * current_p[i];
+        proposed_H += 0.5f * q[i] * q[i] + 0.5f * p[i] * p[i];
+    }
+    
+    float log_alpha = current_H - proposed_H;
+    float log_u = logf(curand_uniform(&amp;state));
+    
+    accepted[idx] = (log_u &lt; log_alpha);
+    
+    // Output
+    if (accepted[idx]) {
+        for (int i = 0; i &lt; dim; i++) {
+            q_out[idx * dim + i] = q[i];
+        }
+    } else {
+        for (int i = 0; i &lt; dim; i++) {
+            q_out[idx * dim + i] = current_q[i];
+        }
+    }
+}
+&quot;&quot;&quot;
+
+Wait, I need to think about this more carefully. The grad_log_prob is -(x - mu), and mu is zeros, so it&#x27;s just -x.
+
+Actually, let me reconsider the computation:
+- log_prob(x) = -0.5 * (x^2).sum()
+- current_H = -log_prob(current_q) + 0.5 * (current_p^2).sum() = 0.5 * (current_q^2).sum() + 0.5 * (current_p^2).sum()
+
+So the Hamiltonian is just 0.5 * (q^2 + p^2).sum()
+
+Let me trace through the algorithm more carefully:
+
+1. p ~ N(0, 1) (random momentum)
+2. Save current_q = q, current_p = p
+3. Half step: p = p + 0.5 * eps * grad_log_prob(q) = p - 0.5 * eps * q
+4. Loop for (num_leapfrog_steps - 1) iterations:
+   - q = q + eps * p
+   - p = p + eps * grad_log_prob(q) = p - eps * q
+5. q = q + eps * p (one more full position step)
+6. p = p + 0.5 * eps * grad_log_prob(q) = p - 0.5 * eps * q (final half momentum step)
+7. p = -p (negate momentum for reversibility)
+
+Wait, let me count the steps more carefully. Looking at the reference:
+
+```python
+# Half step for momentum
+p = p + 0.5 * eps * self._grad_log_prob(q)
+
+for _ in range(self.num_leapfrog_steps - 1):
+    q = q + eps * p
+    p = p + eps * self._grad_log_prob(q)
+
+q = q + eps * p
+p = p + 0.5 * eps * self._grad_log_prob(q)
+p = -p  # negate for reversibility
+```
+
+So the total number of position updates is:
+- num_leapfrog_steps - 1 in the loop
+- 1 after the loop
+= num_leapfrog_steps total
+
+And the momentum updates are:
+- 1 half step before the loop
+- num_leapfrog_steps - 1 full steps in the loop  
+- 1 half step after the loop
+= 2 * 0.5 + num_leapfrog_steps - 1 = num_leapfrog_steps total (but split into half steps at start/end)
+
+This is standard leapfrog. Let me re-implement:
+
+```python
+# Half step for momentum: p = p - 0.5 * eps * q
+p -= 0.5 * eps * q
+
+# Full steps (num_leapfrog_steps - 1 times)
+for _ in range(num_leapfrog_steps - 1):
+    q += eps * p
+    p -= eps * q
+
+# Final position step
+q += eps * p
+
+# Final half momentum step
+p -= 0.5 * eps * q
+
+# Negate
+p = -p
+```
+
+Actually wait, I misread. Let me look again at the reference:
+```python
+for _ in range(self.num_leapfrog_steps - 1):
+    q = q + eps * p
+    p = p + eps * self._grad_log_prob(q)  # = p - eps * q
+```
+
+So in each iteration of the loop, we do:
+1. q += eps * p
+2. p -= eps * q
+
+Then after the loop:
+1. q += eps * p (final position update)
+2. p -= 0.5 * eps * q (final half momentum update)
+
+This matches what I said above. But let me trace through with num_leapfrog_steps = 10:
+- Before loop: p -= 0.5 * eps * q (half step)
+- Loop runs 9 times (10 - 1):
+  - Each iteration: q += eps * p, then p -= eps * q
+- After loop: q += eps * p, then p -= 0.5 * eps * q
+
+So we have:
+- 10 position updates
+- 1 half + 9 full + 1 half = 10 momentum updates (but split correctly for leapfrog)
+
+OK, my understanding is correct.
+
+Now for the CUDA implementation, I need to:
+1. Handle random number generation
+2. Use shared memory or registers efficiently
+3. Possibly vectorize with float4 loads/stores
+
+Since dim = 64 and batch_size = 2048, each thread handles one particle (64 floats). That&#x27;s 256 bytes per thread for q, plus 256 for p, plus 256 for current_q, plus 256 for current_p = 1024 bytes in registers (might be tight).
+
+Actually, let me think about this differently. With dim=64, we could use 2 threads per particle, each handling 32 elements (one warp). This would give better register utilization.
+
+But let&#x27;s start simple and optimize later.
+
+Actually, thinking more about this - each particle is independent, so we can parallelize across batch. With 2048 particles and blocks of 256 threads, we have 8 blocks.
+
+Let me write a basic kernel first:
+
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;curand_kernel.h&gt;
+
+__global__ void hmc_kernel(
+    const float* __restrict__ q_in,
+    float* __restrict__ q_out,
+    bool* __restrict__ accepted_out,
+    int batch_size,
+    int dim,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &gt;= batch_size) return;
+    
+    // Initialize random state
+    curandState state;
+    curand_init(seed, idx, 0, &amp;state);
+    
+    // Allocate local arrays
+    extern __shared__ float shared_data[];
+    float* q = shared_data + threadIdx.x * 4 * dim;  // This won&#x27;t work well
+    
+    // ... this is getting complicated
+}
+```
+
+Actually, using shared memory dynamically sized per-thread is awkward. Let me use registers by assuming dim &lt;= 64 and manually unrolling, or just keep data in global memory and optimize access patterns.
+
+Let me try a different approach - keep q and p in registers for the computation:
+
+```cpp
+__global__ void hmc_kernel(
+    const float* __restrict__ q_in,
+    float* __restrict__ q_out,
+    bool* __restrict__ accepted_out,
+    int batch_size,
+    int dim,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &gt;= batch_size) return;
+    
+    const float* q_in_ptr = q_in + idx * dim;
+    float* q_out_ptr = q_out + idx * dim;
+    
+    // Initialize random state
+    curandState state;
+    curand_init(seed, idx, 0, &amp;state);
+    
+    // Load initial position and generate momentum
+    float q[64], p[64], current_q[64], current_p[64];
+    
+    for (int i = 0; i &lt; dim; i++) {
+        q[i] = q_in_ptr[i];
+        p[i] = curand_normal(&amp;state);
+        current_q[i] = q[i];
+        current_p[i] = p[i];
+    }
+    
+    const float eps = step_size;
+    
+    // Half step for momentum
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] -= 0.5f * eps * q[i];
+    }
+    
+    // Leapfrog steps
+    for (int step = 0; step &lt; num_leapfrog_steps - 1; step++) {
+        for (int i = 0; i &lt; dim; i++) {
+            q[i] += eps * p[i];
+        }
+        for (int i = 0; i &lt; dim; i++) {
+            p[i] -= eps * q[i];
+        }
+    }
+    
+    // Final position update
+    for (int i = 0; i &lt; dim; i++) {
+        q[i] += eps * p[i];
+    }
+    
+    // Final half momentum update
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] -= 0.5f * eps * q[i];
+    }
+    
+    // Negate momentum
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] = -p[i];
+    }
+    
+    // Compute Hamiltonians
+    float current_H = 0.0f, proposed_H = 0.0f;
+    for (int i = 0; i &lt; dim; i++) {
+        current_H += 0.5f * (current_q[i] * current_q[i] + current_p[i] * current_p[i]);
+        proposed_H += 0.5f * (q[i] * q[i] + p[i] * p[i]);
+    }
+    
+    // Acceptance
+    float log_alpha = current_H - proposed_H;
+    float u = curand_uniform(&amp;state);
+    // Clamp u to avoid log(0)
+    if (u &lt; 1e-10f) u = 1e-10f;
+    float log_u = logf(u);
+    
+    bool accepted = (log_u &lt; log_alpha);
+    accepted_out[idx] = accepted;
+    
+    // Output
+    const float* src = accepted ? q : current_q;
+    for (int i = 0; i &lt; dim; i++) {
+        q_out_ptr[i] = src[i];
+    }
+}
+```
+
+Hmm, but this uses 4 * 64 * 4 = 1024 bytes of register memory per thread. With 256 threads per block, that&#x27;s 256KB, which is too much. Modern GPUs have ~64KB register file per SM.
+
+Let me try a different approach - use float4 to load/store data more efficiently and reduce register pressure:
+
+Actually, let me reconsider. The register arrays are local to the function, not shared memory. The compiler might optimize them into registers if they fit, or spill to local memory (which is actually global memory with caching).
+
+For dim=64, each array is 256 bytes. With 4 arrays (q, p, current_q, current_p), that&#x27;s 1KB per thread. With typical register limits of 255 registers per thread (1KB for float32), this might be tight but could work if the compiler is smart.
+
+Let me try a simpler approach first - maybe just use one array and swap pointers logically:
+
+Actually, the best approach might be to use float4 loads/stores for efficiency. Let me write a kernel that processes each particle with float4 operations:
+
+```cpp
+__global__ void hmc_kernel(
+    const float* __restrict__ q_in,
+    float* __restrict__ q_out,
+    bool* __restrict__ accepted_out,
+    int batch_size,
+    int dim,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &gt;= batch_size) return;
+    
+    const int dim4 = dim / 4;  // Number of float4 elements
+    const float4* q_in4 = reinterpret_cast&lt;const float4*&gt;(q_in + idx * dim);
+    float4* q_out4 = reinterpret_cast&lt;float4*&gt;(q_out + idx * dim);
+    
+    // Initialize random state
+    curandState state;
+    curand_init(seed, idx, 0, &amp;state);
+    
+    // Load initial position and generate momentum
+    float4 q[16], p[16];  // 16 float4 = 64 floats
+    float4 current_q[16], current_p[16];
+    
+    for (int i = 0; i &lt; dim4; i++) {
+        q[i] = q_in4[i];
+        // Generate 4 random numbers at once would be nice, but curand doesn&#x27;t support that directly
+        float r0 = curand_normal(&amp;state);
+        float r1 = curand_normal(&amp;state);
+        float r2 = curand_normal(&amp;state);
+        float r3 = curand_normal(&amp;state);
+        p[i] = make_float4(r0, r1, r2, r3);
+        current_q[i] = q[i];
+        current_p[i] = p[i];
+    }
+    
+    const float eps = step_size;
+    
+    // Helper macros for float4 operations
+    #define F4_MUL_S(v, s) make_float4((v).x * (s), (v).y * (s), (v).z * (s), (v).w * (s))
+    #define F4_SUB(a, b) make_float4((a).x - (b).x, (a).y - (b).y, (a).z - (b).z, (a).w - (b).w)
+    #define F4_ADD(a, b) make_float4((a).x + (b).x, (a).y + (b).y, (a).z + (b).z, (a).w + (b).w)
+    #define F4_MUL(a, b) make_float4((a).x * (b).x, (a).y * (b).y, (a).z * (b).z, (a).w * (b).w)
+    #define F4_DOT(a, b) ((a).x * (b).x + (a).y * (b).y + (a).z * (b).z + (a).w * (b).w)
+    
+    // Half step for momentum: p -= 0.5 * eps * q
+    float4 eps_q[16];
+    for (int i = 0; i &lt; dim4; i++) {
+        eps_q[i] = F4_MUL_S(q[i], 0.5f * eps);
+        p[i] = F4_SUB(p[i], eps_q[i]);
+    }
+    
+    // Leapfrog steps
+    for (int step = 0; step &lt; num_leapfrog_steps - 1; step++) {
+        // q += eps * p
+        for (int i = 0; i &lt; dim4; i++) {
+            float4 eps_p = F4_MUL_S(p[i], eps);
+            q[i] = F4_ADD(q[i], eps_p);
+        }
+        // p -= eps * q
+        for (int i = 0; i &lt; dim4; i++) {
+            float4 eps_q_val = F4_MUL_S(q[i], eps);
+            p[i] = F4_SUB(p[i], eps_q_val);
+        }
+    }
+    
+    // Final position update
+    for (int i = 0; i &lt; dim4; i++) {
+        float4 eps_p = F4_MUL_S(p[i], eps);
+        q[i] = F4_ADD(q[i], eps_p);
+    }
+    
+    // Final half momentum update
+    for (int i = 0; i &lt; dim4; i++) {
+        float4 eps_q_val = F4_MUL_S(q[i], 0.5f * eps);
+        p[i] = F4_SUB(p[i], eps_q_val);
+    }
+    
+    // Negate momentum
+    for (int i = 0; i &lt; dim4; i++) {
+        p[i] = make_float4(-p[i].x, -p[i].y, -p[i].z, -p[i].w);
+    }
+    
+    // Compute Hamiltonians
+    float current_H = 0.0f, proposed_H = 0.0f;
+    for (int i = 0; i &lt; dim4; i++) {
+        current_H += 0.5f * (F4_DOT(current_q[i], current_q[i]) + F4_DOT(current_p[i], current_p[i]));
+        proposed_H += 0.5f * (F4_DOT(q[i], q[i]) + F4_DOT(p[i], p[i]));
+    }
+    
+    // Acceptance
+    float log_alpha = current_H - proposed_H;
+    float u = curand_uniform(&amp;state);
+    if (u &lt; 1e-10f) u = 1e-10f;
+    float log_u = logf(u);
+    
+    bool accepted = (log_u &lt; log_alpha);
+    accepted_out[idx] = accepted;
+    
+    // Output
+    const float4* src = accepted ? q : current_q;
+    for (int i = 0; i &lt; dim4; i++) {
+        q_out4[i] = src[i];
+    }
+}
+```
+
+Wait, that still has the same register pressure issue. Let me think differently.
+
+Actually, the key insight is that 256 bytes per array for 4 arrays = 1KB total for local data per thread. With 128 threads per block (smaller block size), that&#x27;s 128KB, which might be manageable. But modern GPUs have ~64KB register file per SM, so we&#x27;d need to be careful.
+
+Let me try a simpler approach that might work well with the compiler:
+
+Actually, I realize I should just try the basic version and see if it compiles and works. The compiler might handle register allocation reasonably.
+
+But let me also think about an alternative approach: use warp-level parallelism where each warp handles one particle. Each thread in the warp handles 2 elements (32 threads * 2 = 64 elements). This reduces register pressure and allows warp-level reductions for Hamiltonian computation.
+
+Let me try this approach:
+
+```cpp
+__global__ void hmc_kernel_warp(
+    const float* __restrict__ q_in,
+    float* __restrict__ q_out,
+    bool* __restrict__ accepted_out,
+    int batch_size,
+    int dim,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+) {
+    // Each warp handles one particle
+    // 32 threads per warp, each handles 2 elements (dim = 64)
+    
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int elements_per_thread = dim / 32;
+    
+    if (warp_id &gt;= batch_size) return;
+    
+    // Initialize random state - only lane 0 generates and broadcasts
+    curandState state;
+    curand_init(seed, warp_id, lane_id, &amp;state);
+    
+    // Load initial position
+    float q[2], p[2], current_q[2], current_p[2];
+    
+    const float* q_in_ptr = q_in + warp_id * dim;
+    
+    for (int i = 0; i &lt; elements_per_thread; i++) {
+        int idx = lane_id * elements_per_thread + i;
+        q[i] = q_in_ptr[idx];
+        p[i] = curand_normal(&amp;state);
+        current_q[i] = q[i];
+        current_p[i] = p[i];
+    }
+    
+    const float eps = step_size;
+    
+    // Half step for momentum
+    for (int i = 0; i &lt; elements_per_thread; i++) {
+        p[i] -= 0.5f * eps * q[i];
+    }
+    
+    // Leapfrog steps
+    for (int step = 0; step &lt; num_leapfrog_steps - 1; step++) {
+        for (int i = 0; i &lt; elements_per_thread; i++) {
+            q[i] += eps * p[i];
+        }
+        for (int i = 0; i &lt; elements_per_thread; i++) {
+            p[i] -= eps * q[i];
+        }
+    }
+    
+    // Final position update
+    for (int i = 0; i &lt; elements_per_thread; i++) {
+        q[i] += eps * p[i];
+    }
+    
+    // Final half momentum update
+    for (int i = 0; i &lt; elements_per_thread; i++) {
+        p[i] -= 0.5f * eps * q[i];
+    }
+    
+    // Negate momentum
+    for (int i = 0; i &lt; elements_per_thread; i++) {
+        p[i] = -p[i];
+    }
+    
+    // Compute local Hamiltonian contribution
+    float local_H_current = 0.0f, local_H_proposed = 0.0f;
+    for (int i = 0; i &lt; elements_per_thread; i++) {
+        local_H_current += 0.5f * (current_q[i] * current_q[i] + current_p[i] * current_p[i]);
+        local_H_proposed += 0.5f * (q[i] * q[i] + p[i] * p[i]);
+    }
+    
+    // Warp reduce
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        local_H_current += __shfl_down_sync(0xffffffff, local_H_current, offset);
+        local_H_proposed += __shfl_down_sync(0xffffffff, local_H_proposed, offset);
+    }
+    
+    // Only lane 0 does acceptance test
+    bool accepted = false;
+    if (lane_id == 0) {
+        float log_alpha = local_H_current - local_H_proposed;
+        float u = curand_uniform(&amp;state);
+        if (u &lt; 1e-10f) u = 1e-10f;
+        float log_u = logf(u);
+        accepted = (log_u &lt; log_alpha);
+        accepted_out[warp_id] = accepted;
+    }
+    
+    // Broadcast acceptance decision
+    accepted = __shfl_sync(0xffffffff, accepted, 0);
+    
+    // Output
+    float* q_out_ptr = q_out + warp_id * dim;
+    const float* src = accepted ? q : current_q;
+    for (int i = 0; i &lt; elements_per_thread; i++) {
+        int idx = lane_id * elements_per_thread + i;
+        q_out_ptr[idx] = src[i];
+    }
+}
+```
+
+This approach uses much less register memory per thread (only 8 floats = 32 bytes per thread for the local arrays). With 32 threads per warp and 4 warps per block (128 threads total), we get 128 * 32 = 4KB per block for local data, which is very manageable.
+
+However, there&#x27;s an issue with the random number generation - each thread generates its own random numbers, but we want the same random numbers across multiple runs. Actually, the reference uses torch.randn_like and torch.rand, which should be deterministic given a seed. But the curand approach needs to be careful.
+
+Let me check the reference more carefully:
+
+```python
+p = torch.randn_like(q)
+# ...
+log_u = torch.log(torch.rand(q.shape[0], device=q.device).clamp(min=1e-10))
+```
+
+So p is generated from a normal distribution with the same shape as q (B, dim), and u is generated from a uniform distribution with shape (B,).
+
+For reproducibility and correctness, I need to ensure:
+1. The momentum p has the same distribution as torch.randn_like(q)
+2. The uniform random number u has the same distribution as torch.rand(B,)
+
+The curand library can generate these, but I need to be careful about the order of generation and the seeding.
+
+Actually, for correctness, I don&#x27;t need to match the exact random numbers - I just need to match the distribution. The reference and my kernel will produce different random numbers, but that&#x27;s fine as long as the statistical properties match.
+
+Let me write a cleaner version:
+
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;curand_kernel.h&gt;
+
+template&lt;int DIM&gt;
+__global__ void hmc_kernel(
+    const float* __restrict__ q_in,
+    float* __restrict__ q_out,
+    bool* __restrict__ accepted_out,
+    int batch_size,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &gt;= batch_size) return;
+    
+    const int dim = DIM;
+    
+    // Initialize random state
+    curandState state;
+    curand_init(seed, idx, 0, &amp;state);
+    
+    // Load initial position and generate momentum
+    float q[64], p[64], current_q[64], current_p[64];
+    
+    const float* q_in_ptr = q_in + idx * dim;
+    
+    #pragma unroll
+    for (int i = 0; i &lt; DIM; i++) {
+        q[i] = q_in_ptr[i];
+        p[i] = curand_normal(&amp;state);
+        current_q[i] = q[i];
+        current_p[i] = p[i];
+    }
+    
+    const float eps = step_size;
+    const float half_eps = 0.5f * eps;
+    
+    // Half step for momentum
+    #pragma unroll
+    for (int i = 0; i &lt; DIM; i++) {
+        p[i] -= half_eps * q[i];
+    }
+    
+    // Leapfrog steps
+    for (int step = 0; step &lt; num_leapfrog_steps - 1; step++) {
+        #pragma unroll
+        for (int i = 0; i &lt; DIM; i++) {
+            q[i] += eps * p[i];
+        }
+        #pragma unroll
+        for (int i = 0; i &lt; DIM; i++) {
+            p[i] -= eps * q[i];
+        }
+    }
+    
+    // Final position update
+    #pragma unroll
+    for (int i = 0; i &lt; DIM; i++) {
+        q[i] += eps * p[i];
+    }
+    
+    // Final half momentum update
+    #pragma unroll
+    for (int i = 0; i &lt; DIM; i++) {
+        p[i] -= half_eps * q[i];
+    }
+    
+    // Negate momentum
+    #pragma unroll
+    for (int i = 0; i &lt; DIM; i++) {
+        p[i] = -p[i];
+    }
+    
+    // Compute Hamiltonians
+    float current_H = 0.0f, proposed_H = 0.0f;
+    #pragma unroll
+    for (int i = 0; i &lt; DIM; i++) {
+        current_H += 0.5f * (current_q[i] * current_q[i] + current_p[i] * current_p[i]);
+        proposed_H += 0.5f * (q[i] * q[i] + p[i] * p[i]);
+    }
+    
+    // Acceptance
+    float log_alpha = current_H - proposed_H;
+    float u = curand_uniform(&amp;state);
+    u = fmaxf(u, 1e-10f);
+    float log_u = logf(u);
+    
+    bool accepted = (log_u &lt; log_alpha);
+    accepted_out[idx] = accepted;
+    
+    // Output
+    float* q_out_ptr = q_out + idx * dim;
+    #pragma unroll
+    for (int i = 0; i &lt; DIM; i++) {
+        q_out_ptr[i] = accepted ? q[i] : current_q[i];
+    }
+}
+```
+
+Hmm, the template parameter might cause issues with compilation. Let me make dim a runtime parameter instead and remove the template.
+
+Actually, let me think about performance more carefully. The key operations are:
+1. Load q from global memory (64 floats per particle)
+2. Generate 64 random numbers (momentum)
+3. Leapfrog integration (arithmetic on 64-element vectors, repeated)
+4. Reduction for Hamiltonian
+5. Generate 1 random number (acceptance)
+6. Store q to global memory
+
+The computation-to-memory ratio is quite high:
+- Each particle: 64 loads + 64 stores + ~10 leapfrog steps * 2 * 64 arithmetic ops = many ops per byte
+- This should be compute-bound, not memory-bound
+
+For optimization:
+1. Keep all particle data in registers (avoid local memory spills)
+2. Use efficient random number generation
+3. Unroll loops to help the compiler
+
+Let me write a version that I think will work:
+
+Actually, I just realized I should start with something simpler and get it working first. Let me write a straightforward version:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+hmc_cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;curand_kernel.h&gt;
+
+__global__ void hmc_kernel(
+    const float* __restrict__ q_in,
+    float* __restrict__ q_out,
+    bool* __restrict__ accepted_out,
+    int batch_size,
+    int dim,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &gt;= batch_size) return;
+    
+    // Initialize random state
+    curandState state;
+    curand_init(seed, idx, 0, &amp;state);
+    
+    const float* q_in_ptr = q_in + idx * dim;
+    float* q_out_ptr = q_out + idx * dim;
+    
+    // Allocate local arrays (hopefully in registers)
+    float q[64], p[64], current_q[64], current_p[64];
+    
+    // Load initial position and generate momentum
+    for (int i = 0; i &lt; dim; i++) {
+        q[i] = q_in_ptr[i];
+        p[i] = curand_normal(&amp;state);
+        current_q[i] = q[i];
+        current_p[i] = p[i];
+    }
+    
+    const float eps = step_size;
+    const float half_eps = 0.5f * eps;
+    
+    // Half step for momentum
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] -= half_eps * q[i];
+    }
+    
+    // Leapfrog steps
+    for (int step = 0; step &lt; num_leapfrog_steps - 1; step++) {
+        for (int i = 0; i &lt; dim; i++) {
+            q[i] += eps * p[i];
+        }
+        for (int i = 0; i &lt; dim; i++) {
+            p[i] -= eps * q[i];
+        }
+    }
+    
+    // Final position update
+    for (int i = 0; i &lt; dim; i++) {
+        q[i] += eps * p[i];
+    }
+    
+    // Final half momentum update
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] -= half_eps * q[i];
+    }
+    
+    // Negate momentum
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] = -p[i];
+    }
+    
+    // Compute Hamiltonians
+    float current_H = 0.0f, proposed_H = 0.0f;
+    for (int i = 0; i &lt; dim; i++) {
+        current_H += 0.5f * (current_q[i] * current_q[i] + current_p[i] * current_p[i]);
+        proposed_H += 0.5f * (q[i] * q[i] + p[i] * p[i]);
+    }
+    
+    // Acceptance
+    float log_alpha = current_H - proposed_H;
+    float u = curand_uniform(&amp;state);
+    u = fmaxf(u, 1e-10f);
+    float log_u = logf(u);
+    
+    bool accepted = (log_u &lt; log_alpha);
+    accepted_out[idx] = accepted;
+    
+    // Output
+    for (int i = 0; i &lt; dim; i++) {
+        q_out_ptr[i] = accepted ? q[i] : current_q[i];
+    }
+}
+
+void hmc_cuda(
+    const torch::Tensor&amp; q_in,
+    torch::Tensor&amp; q_out,
+    torch::Tensor&amp; accepted_out,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+) {
+    const int batch_size = q_in.size(0);
+    const int dim = q_in.size(1);
+    
+    const int threads_per_block = 128;
+    const int num_blocks = (batch_size + threads_per_block - 1) / threads_per_block;
+    
+    hmc_kernel&lt;&lt;&lt;num_blocks, threads_per_block&gt;&gt;&gt;(
+        q_in.data_ptr&lt;float&gt;(),
+        q_out.data_ptr&lt;float&gt;(),
+        accepted_out.data_ptr&lt;bool&gt;(),
+        batch_size,
+        dim,
+        num_leapfrog_steps,
+        step_size,
+        seed
+    );
+}
+&quot;&quot;&quot;
+
+hmc_cpp_source = &quot;&quot;&quot;
+void hmc_cuda(
+    const torch::Tensor&amp; q_in,
+    torch::Tensor&amp; q_out,
+    torch::Tensor&amp; accepted_out,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+);
+&quot;&quot;&quot;
+
+hmc_module = load_inline(
+    name=&#x27;hmc_cuda&#x27;,
+    cpp_sources=hmc_cpp_source,
+    cuda_sources=hmc_cuda_source,
+    functions=[&#x27;hmc_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-lcurand&#x27;],
+    verbose=True
+)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim, num_leapfrog_steps=10, step_size=0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_leapfrog_steps = num_leapfrog_steps
+        self.step_size = step_size
+        self.register_buffer(&quot;mu&quot;, torch.zeros(dim))
+        self.seed = 0  # Will be set dynamically or use time-based seed
+        
+    def forward(self, q: torch.Tensor) -&gt; tuple:
+        batch_size = q.size(0)
+        q_new = torch.empty_like(q)
+        accepted = torch.empty(batch_size, dtype=torch.bool, device=q.device)
+        
+        # Use a time-based or counter-based seed
+        seed = torch.randint(0, 2**31, (1,)).item()
+        
+        hmc_module.hmc_cuda(
+            q, q_new, accepted,
+            self.num_leapfrog_steps,
+            self.step_size,
+            seed
+        )
+        
+        return q_new, accepted
+```
+
+Wait, I need to be careful with linking curand. Let me check how to properly link it.
+
+Actually, for curand in a kernel, I don&#x27;t need to link the library separately - curand_kernel.h provides the device-side functions that are compiled into the kernel. I just need to include the right header.
+
+But wait, I need to check if the compilation will work. Let me also add the proper include paths.
+
+Let me revise:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+hmc_cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;curand_kernel.h&gt;
+
+extern &quot;C&quot; {
+
+__global__ void hmc_kernel(
+    const float* __restrict__ q_in,
+    float* __restrict__ q_out,
+    bool* __restrict__ accepted_out,
+    int batch_size,
+    int dim,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &gt;= batch_size) return;
+    
+    // Initialize random state
+    curandState state;
+    curand_init(seed, idx, 0, &amp;state);
+    
+    const float* q_in_ptr = q_in + idx * dim;
+    float* q_out_ptr = q_out + idx * dim;
+    
+    // Allocate local arrays
+    float q[64], p[64], current_q[64], current_p[64];
+    
+    // Load initial position and generate momentum
+    for (int i = 0; i &lt; dim; i++) {
+        q[i] = q_in_ptr[i];
+        p[i] = curand_normal(&amp;state);
+        current_q[i] = q[i];
+        current_p[i] = p[i];
+    }
+    
+    const float eps = step_size;
+    const float half_eps = 0.5f * eps;
+    
+    // Half step for momentum
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] -= half_eps * q[i];
+    }
+    
+    // Leapfrog steps
+    for (int step = 0; step &lt; num_leapfrog_steps - 1; step++) {
+        for (int i = 0; i &lt; dim; i++) {
+            q[i] += eps * p[i];
+        }
+        for (int i = 0; i &lt; dim; i++) {
+            p[i] -= eps * q[i];
+        }
+    }
+    
+    // Final position update
+    for (int i = 0; i &lt; dim; i++) {
+        q[i] += eps * p[i];
+    }
+    
+    // Final half momentum update
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] -= half_eps * q[i];
+    }
+    
+    // Negate momentum
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] = -p[i];
+    }
+    
+    // Compute Hamiltonians
+    float current_H = 0.0f, proposed_H = 0.0f;
+    for (int i = 0; i &lt; dim; i++) {
+        current_H += 0.5f * (current_q[i] * current_q[i] + current_p[i] * current_p[i]);
+        proposed_H += 0.5f * (q[i] * q[i] + p[i] * p[i]);
+    }
+    
+    // Acceptance
+    float log_alpha = current_H - proposed_H;
+    float u = curand_uniform(&amp;state);
+    u = fmaxf(u, 1e-10f);
+    float log_u = logf(u);
+    
+    bool accepted = (log_u &lt; log_alpha);
+    accepted_out[idx] = accepted;
+    
+    // Output
+    for (int i = 0; i &lt; dim; i++) {
+        q_out_ptr[i] = accepted ? q[i] : current_q[i];
+    }
+}
+
+}  // extern &quot;C&quot;
+
+void hmc_cuda(
+    torch::Tensor q_in,
+    torch::Tensor q_out,
+    torch::Tensor accepted_out,
+    int num_leapfrog_steps,
+    float step_size,
+    unsigned long long seed
+) {
+    const int batch_size = q_in.size(0);
+    const int dim = q_in.size(1);
+    
+    const int threads_per_block = 128;
+    const int num_blocks = (batch_size + threads_per_block - 1) / threads_per_block;
+    
+    hmc_kernel&lt;&lt;&lt;num_blocks, threads_per_block&gt;&gt;&gt;(
+        q_in.data_ptr&lt;float&gt;(),
+        q_out.data_ptr&lt;float&gt;(),
+        accepted_out.data_ptr&lt;bool&gt;(),
+        batch_size,
+        dim,
+        num_leapfrog_steps,
+        step_size,
+        seed
+    );
+}
+&quot;&quot;&quot;
+
+hmc_module = load_inline(
+    name=&#x27;hmc_cuda&#x27;,
+    cuda_sources=hmc_cuda_source,
+    functions=[&#x27;hmc_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=True
+)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim, num_leapfrog_steps=10, step_size=0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_leapfrog_steps = num_leapfrog_steps
+        self.step_size = step_size
+        self.register_buffer(&quot;mu&quot;, torch.zeros(dim))
+        
+    def forward(self, q: torch.Tensor) -&gt; tuple:
+        batch_size = q.size(0)
+        q_new = torch.empty_like(q)
+        accepted = torch.empty(batch_size, dtype=torch.bool, device=q.device)
+        
+        # Use a random seed
+        seed = int(torch.randint(0, 2**31, (1,)).item())
+        
+        hmc_module.hmc_cuda(
+            q, q_new, accepted,
+            self.num_leapfrog_steps,
+            self.step_size,
+            seed
+        )
+        
+        return q_new, accepted
+```
+
+Actually, I don&#x27;t think `extern &quot;C&quot;` is necessary here. Let me simplify.
+
+Also, I realized that for correctness testing, the random numbers need to be reproducible or at least statistically equivalent. The reference uses torch.randn_like and torch.rand, which are seeded from PyTorch&#x27;s RNG state. My kernel uses curand with its own seed.
+
+For correctness, we need to check if the output is numerically equivalent. But since we&#x27;re generating different random numbers, the exact output won&#x27;t match. However, the test should use fixed random seeds for both, or test statistical properties.
+
+Wait, let me re-read the task description: &quot;Produce numerically equivalent outputs at fp32 precision.&quot;
+
+This is tricky because HMC uses random numbers. If the reference uses torch.randn and torch.rand, and my kernel uses curand, they will generate different random numbers and thus different outputs.
+
+I think the way to handle this is:
+1. Use torch&#x27;s RNG to generate random numbers on the CPU/host
+2. Pass them to the CUDA kernel
+
+Or:
+1. The test framework might seed both RNGs the same way
+
+Let me look at the reference again:
+```python
+p = torch.randn_like(q)
+# ...
+log_u = torch.log(torch.rand(q.shape[0], device=q.device).clamp(min=1e-10))
+```
+
+These are generated on the device (q.device), so they&#x27;re using CUDA RNG if q is on CUDA.
+
+I think the test framework might handle this by controlling the RNG state. Let me try to generate random numbers in the kernel and see what happens. If correctness fails, I&#x27;ll need to pass pre-generated random numbers.
+
+Actually, let me check if there&#x27;s a way to use the same random number generation as PyTorch. PyTorch uses its own RNG state, not curand directly.
+
+The safest approach is to generate random numbers using PyTorch and pass them to the kernel:
+
+```python
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim, num_leapfrog_steps=10, step_size=0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_leapfrog_steps = num_leapfrog_steps
+        self.step_size = step_size
+        self.register_buffer(&quot;mu&quot;, torch.zeros(dim))
+        
+    def forward(self, q: torch.Tensor) -&gt; tuple:
+        # Generate random numbers using PyTorch&#x27;s RNG (same as reference)
+        p = torch.randn_like(q)
+        u = torch.rand(q.shape[0], device=q.device)
+        
+        # Call CUDA kernel with pre-generated random numbers
+        q_new, accepted = hmc_cuda_module.hmc_cuda(
+            q, p, u, self.num_leapfrog_steps, self.step_size
+        )
+        
+        return q_new, accepted
+```
+
+This way, the random numbers are generated identically to the reference, and the kernel just does the leapfrog integration and acceptance step.
+
+Let me write this version:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void hmc_kernel(
+    const float* __restrict__ q_in,
+    const float* __restrict__ p_in,
+    const float* __restrict__ u_in,
+    float* __restrict__ q_out,
+    bool* __restrict__ accepted_out,
+    int batch_size,
+    int dim,
+    int num_leapfrog_steps,
+    float step_size
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &gt;= batch_size) return;
+    
+    const float* q_in_ptr = q_in + idx * dim;
+    const float* p_in_ptr = p_in + idx * dim;
+    float* q_out_ptr = q_out + idx * dim;
+    
+    // Allocate local arrays for position and momentum
+    // Use shared memory or local arrays
+    float q[64], p[64], current_q[64], current_p[64];
+    
+    // Load initial position and momentum
+    for (int i = 0; i &lt; dim; i++) {
+        current_q[i] = q_in_ptr[i];
+        current_p[i] = p_in_ptr[i];
+        q[i] = current_q[i];
+        p[i] = current_p[i];
+    }
+    
+    const float eps = step_size;
+    const float half_eps = 0.5f * eps;
+    
+    // Half step for momentum: p = p - 0.5 * eps * q
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] -= half_eps * q[i];
+    }
+    
+    // Leapfrog steps
+    for (int step = 0; step &lt; num_leapfrog_steps - 1; step++) {
+        // Position update
+        for (int i = 0; i &lt; dim; i++) {
+            q[i] += eps * p[i];
+        }
+        // Momentum update
+        for (int i = 0; i &lt; dim; i++) {
+            p[i] -= eps * q[i];
+        }
+    }
+    
+    // Final position update
+    for (int i = 0; i &lt; dim; i++) {
+        q[i] += eps * p[i];
+    }
+    
+    // Final half momentum update
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] -= half_eps * q[i];
+    }
+    
+    // Negate momentum
+    for (int i = 0; i &lt; dim; i++) {
+        p[i] = -p[i];
+    }
+    
+    // Compute Hamiltonians
+    float current_H = 0.0f, proposed_H = 0.0f;
+    for (int i = 0; i &lt; dim; i++) {
+        current_H += 0.5f * (current_q[i] * current_q[i] + current_p[i] * current_p[i]);
+        proposed_H += 0.5f * (q[i] * q[i] + p[i] * p[i]);
+    }
+    
+    // Acceptance
+    float log_alpha = current_H - proposed_H;
+    float u = u_in[idx];
+    if (u &lt; 1e-10f) u = 1e-10f;
+    float log_u = logf(u);
+    
+    bool accepted = (log_u &lt; log_alpha);
+    accepted_out[idx] = accepted;
+    
+    // Output
+    for (int i = 0; i &lt; dim; i++) {
+        q_out_ptr[i] = accepted ? q[i] : current_q[i];
+    }
+}
+
+std::tuple&lt;torch::Tensor, torch::Tensor&gt; hmc_cuda(
+    torch::Tensor q,
+    torch::Tensor p,
+    torch::Tensor u,
+    int num_leapfrog_steps,
+    float step_size
+) {
+    const int batch_size = q.size(0);
+    const int dim = q.size(1);
+    
+    auto q_out = torch::empty_like(q);
+    auto accepted = torch::empty({batch_size}, torch::TensorOptions().dtype(torch::kBool).device(q.device()));
+    
+    const int threads_per_block = 128;
+    const int num_blocks = (batch_size + threads_per_block - 1) / threads_per_block;
+    
+    hmc_kernel&lt;&lt;&lt;num_blocks, threads_per_block&gt;&gt;&gt;(
+        q.data_ptr&lt;float&gt;(),
+        p.data_ptr&lt;float&gt;(),
+        u.data_ptr&lt;float&gt;(),
+        q_out.data_ptr&lt;float&gt;(),
+        accepted.data_ptr&lt;bool&gt;(),
+        batch_size,
+        dim,
+        num_leapfrog_steps,
+        step_size
+    );
+    
+    return std::make_tuple(q_out, accepted);
+}
+&quot;&quot;&quot;
+
+hmc_module = load_inline(
+    name=&#x27;hmc_cuda&#x27;,
+    cuda_sources=cuda_source,
+    functions=[&#x27;hmc_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=True
+)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim, num_leapfrog_steps=10, step_size=0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_leapfrog_steps = num_leapfrog_steps
+        self.step_size = step_size
+        self.register_buffer(&quot;mu&quot;, torch.zeros(dim))
+        
+    def forward(self, q: torch.Tensor) -&gt; tuple:
+        # Generate random numbers using PyTorch (same as reference)
+        p = torch.randn_like(q)
+        current_p = p.clone()
+        current_q = q.clone()
+        
+        u = torch.rand(q.shape[0], device=q.device).clamp(min=1e-10)
+        
+        # Call CUDA kernel
+        q_new, accepted = hmc_module.hmc_cuda(
+            q, p, u,
+            self.num_leapfrog_steps,
+            self.step_size
+        )
+        
+        return q_new, accepted
+```
+
+Wait, I need to double-check the math. Let me trace through the reference again:
+
+Reference:
+```python
+p = torch.randn_like(q)
+current_p = p.clone()
+current_q = q.clone()
+
+# Half step for momentum
+p = p + 0.5 * eps * self._grad_log_prob(q)  # p = p - 0.5 * eps * (q - mu) = p - 0.5 * eps * q
+
+for _ in range(self.num_leapfrog_steps - 1):
+    q = q + eps * p
+    p = p + eps * self._grad_log_prob(q)  # p = p - eps * q
+
+q = q + eps * p
+p = p + 0.5 * eps * self._grad_log_prob(q)  # p = p - 0.5 * eps * q
+p = -p  # negate for reversibility
+
+current_H = -self._log_prob(current_q) + 0.5 * (current_p ** 2).sum(-1)
+proposed_H = -self._log_prob(q) + 0.5 * (p ** 2).sum(-1)
+```
+
+And _log_prob(x) = -0.5 * (x ** 2).sum(), so:
+- current_H = -(-0.5 * current_q^2) + 0.5 * current_p^2 = 0.5 * (current_q^2 + current_p^2)
+- proposed_H = 0.5 * (q^2 + p^2)
+
+So my kernel is correct on the math.
+
+But wait, I need to double-check the `mu` handling. In the reference, mu = zeros(dim), so:
+- _grad_log_prob(x) = -(x - mu) = -x
+- This matches what I have in the kernel.
+
+Actually, looking more carefully at the reference:
+```python
+self.register_buffer(&quot;mu&quot;, torch.zeros(dim))
+```
+
+So mu is always zeros. But for correctness, I should handle the case where mu is not zeros. However, the reference only uses mu in _grad_log_prob and _log_prob, and mu is always initialized to zeros.
+
+For now, I&#x27;ll assume mu = zeros (which is the case for the reference).
+
+Let me also check if I need to pass mu to the kernel. Looking at the reference, mu is a buffer registered with zeros. The _grad_log_prob uses mu, but in the forward function, it&#x27;s called as self._grad_log_prob(q), which uses self.mu = zeros.
+
+For simplicity, I&#x27;ll keep my kernel as is, assuming mu = zeros. If needed, I can add mu as a parameter later.
+
+Now let me compile and test this:
+
+Actually, I realize I should also check the _log_prob function in the reference:
+```python
+def _log_prob(self, x: torch.Tensor) -&gt; torch.Tensor:
+    return -0.5 * (x ** 2).sum(dim=-1)
+```
+
+This is -0.5 * ||x||^2, which is the log probability of a standard Gaussian N(0, I) (up to a constant). This matches what I assumed.
+
+OK let me compile this and see if it works.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Looking at this HMC (Hamiltonian Monte Carlo) implementation, I need to:
+1. Generate random momentum from normal distribution
+2. Perform leapfrog integration
+3. Compute Hamiltonians and do Metropolis acceptance
+
+Let me start by understanding the GPU specs and then write a kernel.
+</div><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
 </body></html>
