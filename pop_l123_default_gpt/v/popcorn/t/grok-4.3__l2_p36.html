@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L2 P36 · popcorn</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 36</a></div><div class="site-subtitle">grok-4.3 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/grok-4.3.html">← grok-4.3</a><span class="meta">generated 2026-05-11 10:48:10 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html">FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html" class=current>grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-in_progress">in_progress</span>
+  <span style="font-size:13px;">36_InvariantPointAttention.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">grok-4.3</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 12</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">6720</div></div>
+  <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-11T10:47:17Z</div></div>
+</div>
+
+
+
+</div><details class="ref-source"><summary>reference PyTorch source (the prompt the agent sees)</summary><pre class="block">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+class Model(nn.Module):
+    &quot;&quot;&quot;
+    Invariant Point Attention (IPA) from AlphaFold2&#x27;s structure module.
+    Combines sequence-space attention with 3-D geometric queries/keys/values
+    expressed in local residue frames.  The attention logits incorporate
+    Euclidean distances in global frame, making it SE(3)-equivariant.
+    &quot;&quot;&quot;
+
+    def __init__(self, node_dim, pair_dim, num_heads, num_query_points, num_value_points):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = node_dim // num_heads
+        self.num_query_points = num_query_points
+        self.num_value_points = num_value_points
+        assert node_dim % num_heads == 0
+
+        d = self.head_dim
+        self.q_proj = nn.Linear(node_dim, num_heads * d, bias=False)
+        self.k_proj = nn.Linear(node_dim, num_heads * d, bias=False)
+        self.v_proj = nn.Linear(node_dim, num_heads * d, bias=False)
+
+        self.q_pts = nn.Linear(node_dim, num_heads * num_query_points * 3, bias=False)
+        self.k_pts = nn.Linear(node_dim, num_heads * num_query_points * 3, bias=False)
+        self.v_pts = nn.Linear(node_dim, num_heads * num_value_points * 3, bias=False)
+
+        self.pair_bias = nn.Linear(pair_dim, num_heads, bias=False)
+
+        self.head_weights = nn.Parameter(torch.zeros(num_heads))
+
+        out_features = num_heads * d + num_heads * num_value_points * 3
+        self.out_proj = nn.Linear(out_features, node_dim)
+
+        self.layer_norm = nn.LayerNorm(node_dim)
+
+    def _apply_frame(self, pts, rotations, translations):
+        &quot;&quot;&quot;Transform local-frame points to global frame.&quot;&quot;&quot;
+        # pts: (B, N, P, 3), rotations: (B, N, 3, 3), translations: (B, N, 3)
+        global_pts = torch.einsum(&quot;bnpc,bncd-&gt;bnpd&quot;, pts, rotations) + translations.unsqueeze(2)
+        return global_pts
+
+    def _apply_inv_frame(self, pts, rotations, translations):
+        &quot;&quot;&quot;Transform global-frame points to local frame.&quot;&quot;&quot;
+        centered = pts - translations.unsqueeze(2)
+        local_pts = torch.einsum(&quot;bnpc,bndc-&gt;bnpd&quot;, centered, rotations)
+        return local_pts
+
+    def forward(
+        self,
+        node_repr: torch.Tensor,
+        pair_repr: torch.Tensor,
+        translations: torch.Tensor,
+        rotations: torch.Tensor,
+    ) -&gt; torch.Tensor:
+        &quot;&quot;&quot;
+        Args:
+            node_repr:    (B, N, node_dim)
+            pair_repr:    (B, N, N, pair_dim)
+            translations: (B, N, 3)
+            rotations:    (B, N, 3, 3)
+        Returns:
+            updated node representation (B, N, node_dim)
+        &quot;&quot;&quot;
+        B, N, D = node_repr.shape
+        h = self.num_heads
+        d = self.head_dim
+        Qp = self.num_query_points
+        Vp = self.num_value_points
+
+        x = self.layer_norm(node_repr)
+
+        q = self.q_proj(x).view(B, N, h, d)
+        k = self.k_proj(x).view(B, N, h, d)
+        v = self.v_proj(x).view(B, N, h, d)
+
+        # Points in local frame, then transform to global
+        q_pts_local = self.q_pts(x).view(B, N, h * Qp, 3)
+        k_pts_local = self.k_pts(x).view(B, N, h * Qp, 3)
+        v_pts_local = self.v_pts(x).view(B, N, h * Vp, 3)
+
+        q_pts = self._apply_frame(q_pts_local, rotations, translations).view(B, N, h, Qp, 3)
+        k_pts = self._apply_frame(k_pts_local, rotations, translations).view(B, N, h, Qp, 3)
+        v_pts = self._apply_frame(v_pts_local, rotations, translations).view(B, N, h, Vp, 3)
+
+        # Scalar attention logits
+        attn_scalar = torch.einsum(&quot;bihd,bjhd-&gt;bhij&quot;, q, k) / math.sqrt(d)
+
+        # Point attention: negative squared distance between query and key points
+        # q_pts: (B, N_i, h, Qp, 3), k_pts: (B, N_j, h, Qp, 3)
+        q_expand = q_pts.unsqueeze(2)  # (B, N, 1, h, Qp, 3)
+        k_expand = k_pts.unsqueeze(1)  # (B, 1, N, h, Qp, 3)
+        pt_dist = ((q_expand - k_expand) ** 2).sum(dim=(-1, -2))  # (B, N, N, h)
+
+        w = F.softplus(self.head_weights)
+        pt_attn = -(w.view(1, 1, 1, h) * pt_dist) / 2.0
+        pt_attn = pt_attn.permute(0, 3, 1, 2)  # (B, h, N, N)
+
+        # Pair bias
+        pair_bias = self.pair_bias(pair_repr).permute(0, 3, 1, 2)  # (B, h, N, N)
+
+        attn = attn_scalar + pt_attn + pair_bias
+        attn = F.softmax(attn, dim=-1)  # (B, h, N_i, N_j)
+
+        # Aggregate scalar values
+        out_scalar = torch.einsum(&quot;bhij,bjhd-&gt;bihd&quot;, attn, v).reshape(B, N, h * d)
+
+        # Aggregate point values in global frame, then transform back to local
+        out_pts = torch.einsum(&quot;bhij,bjhpc-&gt;bihpc&quot;, attn, v_pts)  # (B, N, h, Vp, 3)
+        out_pts = out_pts.reshape(B, N, h * Vp, 3)
+        out_pts_local = self._apply_inv_frame(out_pts, rotations, translations)
+        out_pts_flat = out_pts_local.reshape(B, N, h * Vp * 3)
+
+        out = torch.cat([out_scalar, out_pts_flat], dim=-1)
+        return self.out_proj(out)
+
+
+node_dim = 64
+pair_dim = 32
+num_heads = 4
+num_query_points = 4
+num_value_points = 8
+seq_len = 32
+batch_size = 2
+
+
+def get_inputs():
+    node_repr = torch.randn(batch_size, seq_len, node_dim)
+    pair_repr = torch.randn(batch_size, seq_len, seq_len, pair_dim)
+    translations = torch.randn(batch_size, seq_len, 3)
+    rotations = torch.zeros(batch_size, seq_len, 3, 3)
+    for b in range(batch_size):
+        for n in range(seq_len):
+            rotations[b, n] = torch.eye(3)
+    return [node_repr, pair_repr, translations, rotations]
+
+
+def get_init_inputs():
+    return [node_dim, pair_dim, num_heads, num_query_points, num_value_points]
+</pre></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>5.2s turn · 5.2s LLM · 0.0s tools · <span class="turn-tokens">tokens in=2,815 · out=6 · total=2,975</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">The task is to replace the forward computation of this Invariant Point Attention model with a custom CUDA kernel that&#x27;s faster than the PyTorch reference but numerically equivalent.
+
+</div></details><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>18.2s turn · 18.1s LLM · 0.0s tools · <span class="turn-tokens">tokens in=3,208 · out=160 · total=3,745</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">It&#x27;s an H100, great for CUDA.
+I need to replace the forward computation of a PyTorch model with a custom CUDA kernel. The new `ModelNew` class should take the same inputs as the original `Model`, have the same `forward()` signature, and output numerically equivalent results.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n\ntorch::Tensor dummy_forward(torch::Tensor node_repr, torch::Tensor pair_repr, torch::Tensor translations, torch::Tensor rotations) {\n    return node_repr;\n}\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n    m.def(\&quot;dummy_forward\&quot;, &amp;dummy_forward, \&quot;Dummy forward\&quot;);\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor dummy_forward(torch::Tensor node_repr, torch::Tensor pair_repr, torch::Tensor translations, torch::Tensor rotations);\n\&quot;\&quot;\&quot;\n\n# This is invalid because load_inline expects no PYBIND in cpp, but anyway, this is test.\nprint(\&quot;Skeleton\&quot;)\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: ModelNew class not found or syntax error prevented execution.
+Skeleton
+</div></details></div></div>
+</body></html>
