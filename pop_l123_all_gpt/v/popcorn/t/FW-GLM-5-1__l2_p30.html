@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 30</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 18:58:56 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 30</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 19:00:59 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">30_SelectiveScan_Mamba.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">2838</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">4</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">18542</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -151,5 +151,219 @@ Device: NVIDIA H100 80GB HBM3
 
 Ridge point (FP32): 20.12 FLOPs/byte
   Kernels with arithmetic intensity below the ridge point are
-  memory-bound; above it they are compute-bound.</div></details></div></div>
+  memory-bound; above it they are compute-bound.</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 127.4s turn · 48.5s LLM · tokens in=2,805 · out=4,663 · total=7,468 · 19,115 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>127.4s turn · 48.5s LLM · 78.8s tools · <span class="turn-tokens">tokens in=2,805 · out=4,663 · total=7,468</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me write the initial kernel implementation. The key optimizations I need:
+
+1. Fuse all the operations (projections, discretization, recurrence) into a single kernel
+2. Use shared memory to keep intermediates in SRAM
+3. Process the sequential recurrence efficiently
+
+Let me think about the memory access patterns:
+- Input x: [B, L, D] - need to access all of it
+- Parameters: A_log [D, N], proj_B weights [D, N], proj_C weights [D, N], proj_delta weights [D, D], D [D]
+- Outputs: y [B, L, D]
+
+The projections (proj_delta, proj_B, proj_C) are matrix multiplications:
+- proj_delta(x): [B, L, D] @ [D, D].T = [B, L, D]
+- proj_B(x): [B, L, D] @ [D, N].T = [B, L, N]
+- proj_C(x): [B, L, D] @ [D, N].T = [B, L, N]
+
+These are essentially batched matmuls. The tricky part is that we want to fuse everything.
+
+Given the memory bandwidth is ~2.6 TB/s and we have high FLOPS, this is likely memory-bound.
+
+Let me design the kernel:
+- Each thread block handles one (batch, channel) pair
+- Within a block, threads cooperate on processing the sequence
+- We use shared memory for the hidden state and intermediate values
+
+Actually, let me think more carefully. For each sample in the batch and each channel:
+- We have a hidden state of size N
+- We process L timesteps sequentially
+
+The sequential dependency means we can&#x27;t parallelize across timesteps within a single channel. But we can parallelize across B*D independent channels.
+
+Let me design:
+- Grid: (B * D,) blocks
+- Each block has N threads, one per state dimension
+- Each block processes one (batch, channel) for all L timesteps
+
+This gives us B*D blocks, each processing L timesteps with N threads in parallel for the state update.
+
+Let me write this:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+# Define CUDA source
+cuda_source = &quot;&quot;&quot;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_fp16.h&gt;
+
+__global__ void selective_scan_kernel(
+    const float* __restrict__ x,           // [B, L, D]
+    const float* __restrict__ A_log,       // [D, N]
+    const float* __restrict__ proj_B_w,    // [N, D]
+    const float* __restrict__ proj_C_w,    // [N, D]
+    const float* __restrict__ proj_delta_w, // [D, D]
+    const float* __restrict__ proj_delta_b, // [D]
+    const float* __restrict__ D_param,     // [D]
+    float* __restrict__ y_out,             // [B, L, D]
+    int B, int L, int D, int N
+) {
+    // Each block handles one (batch, channel) pair
+    int bd_idx = blockIdx.x;
+    int b = bd_idx / D;
+    int d = bd_idx % D;
+    int n = threadIdx.x;  // State dimension
+    
+    // Shared memory for hidden state and intermediates
+    extern __shared__ float smem[];
+    float* h_shared = smem;                    // [N]
+    float* dB_shared = smem + N;               // [N]
+    float* C_shared = smem + 2 * N;            // [N]
+    
+    // Initialize hidden state
+    if (n &lt; N) {
+        h_shared[n] = 0.0f;
+    }
+    
+    // Load A for this channel (same for all timesteps)
+    float A_val = -expf(A_log[d * N + n]);
+    
+    // Process each timestep
+    for (int t = 0; t &lt; L; t++) {
+        float x_val = x[b * L * D + t * D + d];
+        
+        // Compute delta for this position
+        // proj_delta is a linear layer: delta = softplus(proj_delta(x))
+        // This requires a dot product across D dimensions
+        // For efficiency, we&#x27;ll compute this differently...
+        
+        // This is getting complex. Let me reconsider the design.
+    }
+}
+&quot;&quot;&quot;
+
+# This approach is complex because computing the projections requires 
+# dot products across the D dimension, which crosses block boundaries.
+```
+
+Let me reconsider. The projections are the tricky part:
+- proj_delta(x[b, t, :]) = x[b, t, :] @ W_delta.T + b_delta -&gt; scalar per channel, vector of size D overall
+- proj_B(x[b, t, :]) = x[b, t, :] @ W_B.T -&gt; vector of size N
+- proj_C(x[b, t, :]) = x[b, t, :] @ W_C.T -&gt; vector of size N
+
+If we have one block per (batch, channel), we need to compute:
+- The delta value for this channel at each timestep
+- The B and C vectors for this channel at each timestep
+
+For delta: we need to compute a dot product of x[b, t, :] with column d of W_delta.T (row d of W_delta)
+For B: we need to compute N dot products of x[b, t, :] with rows of W_B
+For C: we need to compute N dot products of x[b, t, :] with rows of W_C
+
+This means we need access to the full x[b, t, :] vector within each block, which crosses block boundaries.
+
+Alternative approach: Use a 2D grid
+- Block.y handles the batch dimension
+- Block.x handles the channel dimension (or vice versa)
+- Within a block, threads handle the state dimension and timestep
+
+But the timestep is sequential, so we can&#x27;t parallelize across it.
+
+Let me think of another approach:
+
+Approach 2: Two-stage kernel
+1. First kernel: Compute all projections (delta, B, C) -&gt; materialize these
+2. Second kernel: Run the recurrence using precomputed values
+
+But this defeats the purpose of fusion.
+
+Approach 3: Block per (batch, timestep)
+- Each block computes all D channels for one (batch, timestep)
+- Use shared memory to share x[b, t, :] across threads in the block
+- Each thread handles multiple channels and state dimensions
+
+Wait, but the recurrence is sequential across timesteps, so this doesn&#x27;t work directly.
+
+Approach 4: Warp-level cooperation
+- Each warp handles one (batch, channel) pair
+- Warp threads cooperate to compute the projections
+- Process timesteps sequentially
+
+With warps, we have 32 threads per warp. If N=16, we can use 16 threads for state dimension.
+For projections, we can use warp reduce to compute dot products.
+
+Let me try this:
+
+Actually, let me simplify. Let&#x27;s have each thread handle one (batch, channel, state) triple and compute the full sequence:
+
+Grid: (B * D * N / 128,) blocks
+Block: 128 threads
+
+Each thread:
+- Handles one (batch, channel, state) triple
+- Processes all L timesteps sequentially
+- Needs to cooperate with other threads in the same (batch, channel) for reductions
+
+Wait, the issue is that after computing h for each state dimension, we need to sum them:
+y_t = sum_n(h[n] * C_t[n])
+
+This is a reduction across N dimensions, so threads handling the same (batch, channel) but different state dimensions need to cooperate.
+
+Let me design more carefully:
+
+Block: (B * D) blocks
+Threads per block: &gt;= N (say 32 or 64)
+
+Each block handles one (batch, channel) pair.
+- Threads in the block handle different state dimensions (tid &lt; N)
+- They cooperate to compute the projections and run the recurrence
+
+For projections:
+- delta for this channel: needs a dot product across D dimensions
+- B for this channel: needs N dot products, each across D dimensions
+- C for this channel: needs N dot products, each across D dimensions
+
+This requires access to x[b, t, :] and the projection weights.
+
+Let me try a simpler approach first: multiple kernels with some fusion.
+
+Actually, the reference implementation does:
+1. Projections (matmuls) - these are efficient already
+2. Parameter discretization - element-wise ops
+3. Sequential scan - the core loop
+4. Output computation and skip connection
+
+The expensive part is the sequential scan. Let me focus on optimizing that while keeping the projections separate.
+
+Let me write a kernel that:
+1. Takes precomputed projections (delta, B, C) and discretized parameters
+2. Runs the sequential scan efficiently
+
+Then I can try to fuse more later.
+
+Actually, let me look at this more carefully. The key insight is that the sequential scan is the bottleneck, but it&#x27;s inherently sequential. The best we can do is:
+1. Parallelize across (B, D) independent scans
+2. Within each scan, use parallelism for operations across N
+
+Let me write a first version:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me write the initial kernel implementation. This is a Mamba-style selective scan where the key optimization is fusing all operations to keep intermediates in registers/shared memory rather than materializing to global memory.
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nfrom torch.utils.cpp_extension import load_inline\n\n# CUDA source for selective scan\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cuda_fp16.h&gt;\n#include &lt;cmath&gt;\n\n// Softplus function\n__device__ __forceinline__ float softplus(float x) {\n    // softplus(x) = log(1 + exp(x))\n    // Use log1p for numerical stability\n    if (x &gt; 20.0f) return x;  // Avoid overflow\n    if (x &lt; -20.0f) return expf(x);  // Avoid underflow\n    return log1pf(expf(x));\n}\n\n// Block-level selective scan kernel\n// Each block handles one (batch, channel) pair\n// Threads in block handle state dimension N\n__global__ void selective_scan_kernel(\n    const float* __restrict__ x,           // [B, L, D]\n    const float* __restrict__ A_log,       // [D, N]\n    const float* __restrict__ proj_B_w,    // [N, D] - weight matrix\n    const float* __restrict__ proj_C_w,    // [N, D] - weight matrix  \n    const float* __restrict__ proj_delta_w, // [D, D] - weight matrix\n    const float* __restrict__ proj_delta_b, // [D] - bias\n    const float* __restrict__ D_param,     // [D]\n    float* __restrict__ y_out,             // [B, L, D]\n    int B, int L, int D, int N\n) {\n    // Each block handles one (batch, channel) pair\n    int bd_idx = blockIdx.x;\n    if (bd_idx &gt;= B * D) return;\n    \n    int b = bd_idx / D;\n    int d = bd_idx % D;\n    int tid = threadIdx.x;\n    int lane_id = tid &amp; 31;\n    int warp_id = tid &gt;&gt; 5;\n    \n    // Shared memory for hidden state\n    extern __shared__ float smem[];\n    float* h_shared = smem;                    // [N] - hidden state\n    float* B_shared = smem + N;               // [N] - B_t values  \n    float* C_shared = smem + N + N;           // [N] - C_t values\n    float* delta_shared = smem + N + N + N;   // [1] - delta value (broadcast)\n    float* x_shared = smem + N + N + N + 1;   // [D] - x[b,t,:] cached\n    \n    // Initialize hidden state to 0\n    if (tid &lt; N) {\n        h_shared[tid] = 0.0f;\n    }\n    __syncthreads();\n    \n    // Load A for this channel (constant across timesteps)\n    // A[d, n] = -exp(A_log[d, n])\n    float A_val = 0.0f;\n    if (tid &lt; N) {\n        A_val = -expf(A_log[d * N + tid]);\n    }\n    \n    // Process each timestep sequentially\n    for (int t = 0; t &lt; L; t++) {\n        // Load x[b, t, :] into shared memory\n        // Each thread loads multiple elements if needed\n        for (int i = tid; i &lt; D; i += blockDim.x) {\n            x_shared[i] = x[b * L * D + t * D + i];\n        }\n        __syncthreads();\n        \n        // Compute delta[b, t, d] = softplus(sum_i(x_shared[i] * proj_delta_w[d, i]) + proj_delta_b[d])\n        // This is a dot product across D dimensions\n        float delta_sum = proj_delta_b[d];  // bias\n        for (int i = tid; i &lt; D; i += blockDim.x) {\n            delta_sum += x_shared[i] * proj_delta_w[d * D + i];\n        }\n        \n        // Reduce within block to get single delta value\n        // Use warp reduction then block reduction\n        #pragma unroll\n        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n            delta_sum += __shfl_down_sync(0xffffffff, delta_sum, offset);\n        }\n        \n        // Broadcast from lane 0 to all threads\n        if (lane_id == 0) {\n            // Store partial sums from each warp\n            // Simple case: assume single warp or use atomic\n        }\n        \n        // For simplicity with single warp, just use shfl\n        // For multiple warps, need shared memory reduction\n        if (blockDim.x &lt;= 32) {\n            if (tid == 0) {\n                delta_shared[0] = softplus(delta_sum);\n            }\n        } else {\n            // Multi-warp reduction\n            __shared__ float warp_sums[32];\n            if (lane_id == 0) {\n                warp_sums[warp_id] = delta_sum;\n            }\n            __syncthreads();\n            \n            if (warp_id == 0 &amp;&amp; lane_id &lt; (blockDim.x + 31) / 32) {\n                float val = warp_sums[lane_id];\n                #pragma unroll\n                for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n                    val += __shfl_down_sync(0xffffffff, val, offset);\n                }\n                if (lane_id == 0) {\n                    delta_shared[0] = softplus(val);\n                }\n            }\n        }\n        __syncthreads();\n        \n        float delta_val = delta_shared[0];\n        \n        // Compute dB[b, t, d, n] = delta * B_t[n]\n        // where B_t[n] = sum_i(x_shared[i] * proj_B_w[n, i])\n        if (tid &lt; N) {\n            float B_sum = 0.0f;\n            for (int i = 0; i &lt; D; i++) {\n                B_sum += x_shared[i] * proj_B_w[tid * D + i];\n            }\n            B_shared[tid] = B_sum * delta_val;\n        }\n        \n        // Compute C_t[n] = sum_i(x_shared[i] * proj_C_w[n, i])\n        if (tid &lt; N) {\n            float C_sum = 0.0f;\n            for (int i = 0; i &lt; D; i++) {\n                C_sum += x_shared[i] * proj_C_w[tid * D + i];\n            }\n            C_shared[tid] = C_sum;\n        }\n        __syncthreads();\n        \n        // Update hidden state: h = dA * h + x * dB\n        // dA = exp(delta * A)\n        if (tid &lt; N) {\n            float dA_val = expf(delta_val * A_val);\n            float x_val = x_shared[d];\n            h_shared[tid] = dA_val * h_shared[tid] + x_val * B_shared[tid];\n        }\n        __syncthreads();\n        \n        // Compute output: y_t = sum_n(h[n] * C_t[n])\n        float y_sum = 0.0f;\n        if (tid &lt; N) {\n            y_sum = h_shared[tid] * C_shared[tid];\n        }\n        \n        // Reduce across N\n        #pragma unroll\n        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n            y_sum += __shfl_down_sync(0xffffffff, y_sum, offset);\n        }\n        \n        if (blockDim.x &lt;= 32) {\n            if (tid == 0) {\n                // Add skip connection and write output\n                y_out[b * L * D + t * D + d] = y_sum + x_shared[d] * D_param[d];\n            }\n        } else {\n            // Multi-warp reduction for y\n            __shared__ float y_warp_sums[32];\n            if (lane_id == 0) {\n                y_warp_sums[warp_id] = y_sum;\n            }\n            __syncthreads();\n            \n            if (warp_id == 0 &amp;&amp; lane_id &lt; (blockDim.x + 31) / 32) {\n                float val = y_warp_sums[lane_id];\n                #pragma unroll\n                for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n                    val += __shfl_down_sync(0xffffffff, val, offset);\n                }\n                if (lane_id == 0) {\n                    y_out[b * L * D + t * D + d] = val + x_shared[d] * D_param[d];\n                }\n            }\n        }\n    }\n}\n\n// Host function wrapper\nvoid selective_scan_cuda(\n    const float* x,\n    const float* A_log,\n    const float* proj_B_w,\n    const float* proj_C_w,\n    const float* proj_delta_w,\n    const float* proj_delta_b,\n    const float* D_param,\n    float* y_out,\n    int B, int L, int D, int N\n) {\n    int num_blocks = B * D;\n    int threads_per_block = max(32, ((N + 31) / 32) * 32);  // Round up to warp size\n    size_t shared_mem_size = (N + N + N + 1 + D) * sizeof(float);\n    \n    selective_scan_kernel&lt;&lt;&lt;num_blocks, threads_per_block, shared_mem_size&gt;&gt;&gt;(\n        x, A_log, proj_B_w, proj_C_w, proj_delta_w, proj_delta_b, D_param, y_out,\n        B, L, D, N\n    );\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\nvoid selective_scan_cuda(\n    const float* x,\n    const float* A_log,\n    const float* proj_B_w,\n    const float* proj_C_w,\n    const float* proj_delta_w,\n    const float* proj_delta_b,\n    const float* D_param,\n    float* y_out,\n    int B, int L, int D, int N\n);\n\&quot;\&quot;\&quot;\n\n# Load the CUDA extension\nselective_scan_ext = load_inline(\n    name=&#x27;selective_scan_ext&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;selective_scan_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],\n    verbose=False\n)\n\nimport torch\nimport torch.nn as nn\n\nclass ModelNew(nn.Module):\n    def __init__(self, d_model: int, d_state: int):\n        super(ModelNew, self).__init__()\n        self.d_model = d_model\n        self.d_state = d_state\n        self.A_log = nn.Parameter(torch.randn(d_model, d_state))\n        self.proj_B = nn.Linear(d_model, d_state, bias=False)\n        self.proj_C = nn.Linear(d_model, d_state, bias=False)\n        self.proj_delta = nn.Linear(d_model, d_model, bias=True)\n        self.D = nn.Parameter(torch.ones(d_model))\n        \n        # Compile extension on module load\n        self.ext_loaded = False\n\n    def _ensure_ext(self):\n        if not self.ext_loaded:\n            global selective_scan_ext\n            self.ext = selective_scan_ext\n            self.ext_loaded = True\n\n    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:\n        self._ensure_ext()\n        \n        B, L, D = x.shape\n        N = self.d_state\n        \n        # Ensure contiguous float32 tensors\n        x_f = x.contiguous().float()\n        A_log_f = self.A_log.contiguous().float()\n        proj_B_w = self.proj_B.weight.contiguous().float()  # [N, D]\n        proj_C_w = self.proj_C.weight.contiguous().float()  # [N, D]\n        proj_delta_w = self.proj_delta.weight.contiguous().float()  # [D, D]\n        proj_delta_b = self.proj_delta.bias.contiguous().float() if self.proj_delta.bias is not None else torch.zeros(D, dtype=torch.float32, device=x.device)\n        D_param = self.D.contiguous().float()\n        \n        # Allocate output\n        y_out = torch.empty_like(x_f)\n        \n        # Call CUDA kernel\n        self.ext.selective_scan_cuda(\n            x_f.data_ptr(),\n            A_log_f.data_ptr(),\n            proj_B_w.data_ptr(),\n            proj_C_w.data_ptr(),\n            proj_delta_w.data_ptr(),\n            proj_delta_b.data_ptr(),\n            D_param.data_ptr(),\n            y_out.data_ptr(),\n            B, L, D, N\n        )\n        \n        return y_out&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details><details class="turn-collapse"><summary><b>turn 2</b> · 1 tool call(s) · 29.8s turn · 21.9s LLM · tokens in=5,531 · out=2,705 · total=8,236 · 11,730 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>29.8s turn · 21.9s LLM · 7.9s tools · <span class="turn-tokens">tokens in=5,531 · out=2,705 · total=8,236</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">The compilation succeeded. Now let me run the correctness check to see if my implementation produces the correct output.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Good, compilation passed. Now let me check correctness:
+</div><details><summary>call → run_correctness</summary><div class="block tool-args"><span class="role-tag">call</span><b>run_correctness</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nfrom torch.utils.cpp_extension import load_inline\n\n# CUDA source for selective scan\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cuda_fp16.h&gt;\n#include &lt;cmath&gt;\n\n// Softplus function\n__device__ __forceinline__ float softplus(float x) {\n    // softplus(x) = log(1 + exp(x))\n    // Use log1p for numerical stability\n    if (x &gt; 20.0f) return x;  // Avoid overflow\n    if (x &lt; -20.0f) return expf(x);  // Avoid underflow\n    return log1pf(expf(x));\n}\n\n// Block-level selective scan kernel\n// Each block handles one (batch, channel) pair\n// Threads in block handle state dimension N\n__global__ void selective_scan_kernel(\n    const float* __restrict__ x,           // [B, L, D]\n    const float* __restrict__ A_log,       // [D, N]\n    const float* __restrict__ proj_B_w,    // [N, D] - weight matrix\n    const float* __restrict__ proj_C_w,    // [N, D] - weight matrix  \n    const float* __restrict__ proj_delta_w, // [D, D] - weight matrix\n    const float* __restrict__ proj_delta_b, // [D] - bias\n    const float* __restrict__ D_param,     // [D]\n    float* __restrict__ y_out,             // [B, L, D]\n    int B, int L, int D, int N\n) {\n    // Each block handles one (batch, channel) pair\n    int bd_idx = blockIdx.x;\n    if (bd_idx &gt;= B * D) return;\n    \n    int b = bd_idx / D;\n    int d = bd_idx % D;\n    int tid = threadIdx.x;\n    int lane_id = tid &amp; 31;\n    int warp_id = tid &gt;&gt; 5;\n    \n    // Shared memory for hidden state\n    extern __shared__ float smem[];\n    float* h_shared = smem;                    // [N] - hidden state\n    float* B_shared = smem + N;               // [N] - B_t values  \n    float* C_shared = smem + N + N;           // [N] - C_t values\n    float* delta_shared = smem + N + N + N;   // [1] - delta value (broadcast)\n    float* x_shared = smem + N + N + N + 1;   // [D] - x[b,t,:] cached\n    \n    // Initialize hidden state to 0\n    if (tid &lt; N) {\n        h_shared[tid] = 0.0f;\n    }\n    __syncthreads();\n    \n    // Load A for this channel (constant across timesteps)\n    // A[d, n] = -exp(A_log[d, n])\n    float A_val = 0.0f;\n    if (tid &lt; N) {\n        A_val = -expf(A_log[d * N + tid]);\n    }\n    \n    // Process each timestep sequentially\n    for (int t = 0; t &lt; L; t++) {\n        // Load x[b, t, :] into shared memory\n        // Each thread loads multiple elements if needed\n        for (int i = tid; i &lt; D; i += blockDim.x) {\n            x_shared[i] = x[b * L * D + t * D + i];\n        }\n        __syncthreads();\n        \n        // Compute delta[b, t, d] = softplus(sum_i(x_shared[i] * proj_delta_w[d, i]) + proj_delta_b[d])\n        // This is a dot product across D dimensions\n        float delta_sum = proj_delta_b[d];  // bias\n        for (int i = tid; i &lt; D; i += blockDim.x) {\n            delta_sum += x_shared[i] * proj_delta_w[d * D + i];\n        }\n        \n        // Reduce within block to get single delta value\n        // Use warp reduction then block reduction\n        #pragma unroll\n        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n            delta_sum += __shfl_down_sync(0xffffffff, delta_sum, offset);\n        }\n        \n        // Broadcast from lane 0 to all threads\n        if (lane_id == 0) {\n            // Store partial sums from each warp\n            // Simple case: assume single warp or use atomic\n        }\n        \n        // For simplicity with single warp, just use shfl\n        // For multiple warps, need shared memory reduction\n        if (blockDim.x &lt;= 32) {\n            if (tid == 0) {\n                delta_shared[0] = softplus(delta_sum);\n            }\n        } else {\n            // Multi-warp reduction\n            __shared__ float warp_sums[32];\n            if (lane_id == 0) {\n                warp_sums[warp_id] = delta_sum;\n            }\n            __syncthreads();\n            \n            if (warp_id == 0 &amp;&amp; lane_id &lt; (blockDim.x + 31) / 32) {\n                float val = warp_sums[lane_id];\n                #pragma unroll\n                for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n                    val += __shfl_down_sync(0xffffffff, val, offset);\n                }\n                if (lane_id == 0) {\n                    delta_shared[0] = softplus(val);\n                }\n            }\n        }\n        __syncthreads();\n        \n        float delta_val = delta_shared[0];\n        \n        // Compute dB[b, t, d, n] = delta * B_t[n]\n        // where B_t[n] = sum_i(x_shared[i] * proj_B_w[n, i])\n        if (tid &lt; N) {\n            float B_sum = 0.0f;\n            for (int i = 0; i &lt; D; i++) {\n                B_sum += x_shared[i] * proj_B_w[tid * D + i];\n            }\n            B_shared[tid] = B_sum * delta_val;\n        }\n        \n        // Compute C_t[n] = sum_i(x_shared[i] * proj_C_w[n, i])\n        if (tid &lt; N) {\n            float C_sum = 0.0f;\n            for (int i = 0; i &lt; D; i++) {\n                C_sum += x_shared[i] * proj_C_w[tid * D + i];\n            }\n            C_shared[tid] = C_sum;\n        }\n        __syncthreads();\n        \n        // Update hidden state: h = dA * h + x * dB\n        // dA = exp(delta * A)\n        if (tid &lt; N) {\n            float dA_val = expf(delta_val * A_val);\n            float x_val = x_shared[d];\n            h_shared[tid] = dA_val * h_shared[tid] + x_val * B_shared[tid];\n        }\n        __syncthreads();\n        \n        // Compute output: y_t = sum_n(h[n] * C_t[n])\n        float y_sum = 0.0f;\n        if (tid &lt; N) {\n            y_sum = h_shared[tid] * C_shared[tid];\n        }\n        \n        // Reduce across N\n        #pragma unroll\n        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n            y_sum += __shfl_down_sync(0xffffffff, y_sum, offset);\n        }\n        \n        if (blockDim.x &lt;= 32) {\n            if (tid == 0) {\n                // Add skip connection and write output\n                y_out[b * L * D + t * D + d] = y_sum + x_shared[d] * D_param[d];\n            }\n        } else {\n            // Multi-warp reduction for y\n            __shared__ float y_warp_sums[32];\n            if (lane_id == 0) {\n                y_warp_sums[warp_id] = y_sum;\n            }\n            __syncthreads();\n            \n            if (warp_id == 0 &amp;&amp; lane_id &lt; (blockDim.x + 31) / 32) {\n                float val = y_warp_sums[lane_id];\n                #pragma unroll\n                for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n                    val += __shfl_down_sync(0xffffffff, val, offset);\n                }\n                if (lane_id == 0) {\n                    y_out[b * L * D + t * D + d] = val + x_shared[d] * D_param[d];\n                }\n            }\n        }\n    }\n}\n\n// Host function wrapper\nvoid selective_scan_cuda(\n    const float* x,\n    const float* A_log,\n    const float* proj_B_w,\n    const float* proj_C_w,\n    const float* proj_delta_w,\n    const float* proj_delta_b,\n    const float* D_param,\n    float* y_out,\n    int B, int L, int D, int N\n) {\n    int num_blocks = B * D;\n    int threads_per_block = max(32, ((N + 31) / 32) * 32);  // Round up to warp size\n    size_t shared_mem_size = (N + N + N + 1 + D) * sizeof(float);\n    \n    selective_scan_kernel&lt;&lt;&lt;num_blocks, threads_per_block, shared_mem_size&gt;&gt;&gt;(\n        x, A_log, proj_B_w, proj_C_w, proj_delta_w, proj_delta_b, D_param, y_out,\n        B, L, D, N\n    );\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\nvoid selective_scan_cuda(\n    const float* x,\n    const float* A_log,\n    const float* proj_B_w,\n    const float* proj_C_w,\n    const float* proj_delta_w,\n    const float* proj_delta_b,\n    const float* D_param,\n    float* y_out,\n    int B, int L, int D, int N\n);\n\&quot;\&quot;\&quot;\n\n# Load the CUDA extension\nselective_scan_ext = load_inline(\n    name=&#x27;selective_scan_ext&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;selective_scan_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],\n    verbose=False\n)\n\nimport torch\nimport torch.nn as nn\n\nclass ModelNew(nn.Module):\n    def __init__(self, d_model: int, d_state: int):\n        super(ModelNew, self).__init__()\n        self.d_model = d_model\n        self.d_state = d_state\n        self.A_log = nn.Parameter(torch.randn(d_model, d_state))\n        self.proj_B = nn.Linear(d_model, d_state, bias=False)\n        self.proj_C = nn.Linear(d_model, d_state, bias=False)\n        self.proj_delta = nn.Linear(d_model, d_model, bias=True)\n        self.D = nn.Parameter(torch.ones(d_model))\n        \n        # Compile extension on module load\n        self.ext_loaded = False\n\n    def _ensure_ext(self):\n        if not self.ext_loaded:\n            global selective_scan_ext\n            self.ext = selective_scan_ext\n            self.ext_loaded = True\n\n    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:\n        self._ensure_ext()\n        \n        B, L, D = x.shape\n        N = self.d_state\n        \n        # Ensure contiguous float32 tensors\n        x_f = x.contiguous().float()\n        A_log_f = self.A_log.contiguous().float()\n        proj_B_w = self.proj_B.weight.contiguous().float()  # [N, D]\n        proj_C_w = self.proj_C.weight.contiguous().float()  # [N, D]\n        proj_delta_w = self.proj_delta.weight.contiguous().float()  # [D, D]\n        proj_delta_b = self.proj_delta.bias.contiguous().float() if self.proj_delta.bias is not None else torch.zeros(D, dtype=torch.float32, device=x.device)\n        D_param = self.D.contiguous().float()\n        \n        # Allocate output\n        y_out = torch.empty_like(x_f)\n        \n        # Call CUDA kernel\n        self.ext.selective_scan_cuda(\n            x_f.data_ptr(),\n            A_log_f.data_ptr(),\n            proj_B_w.data_ptr(),\n            proj_C_w.data_ptr(),\n            proj_delta_w.data_ptr(),\n            proj_delta_b.data_ptr(),\n            D_param.data_ptr(),\n            y_out.data_ptr(),\n            B, L, D, N\n        )\n        \n        return y_out&quot;
+}</div></details><details open><summary>result ← run_correctness (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>run_correctness</b>
+correctness_kernel FAILED: AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress&#x27; in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+</div></details></div></details></div>
 </body></html>
