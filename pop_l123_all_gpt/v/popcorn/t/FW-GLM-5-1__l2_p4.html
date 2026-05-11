@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 4</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 20:50:57 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 4</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 20:53:02 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">4_GFVLA_FusedSceneGraphUpdate.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">11 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">12</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">282878</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">12 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">13</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">338152</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -1097,5 +1097,316 @@ Let me try yet another approach: I&#x27;ll write the kernel with simpler, more e
 run_correctness FAILED: (0 / 3) trials did not all match.
 correctness_issue: Output mismatch
 max_difference: [&#x27;0.565297&#x27;, &#x27;0.524978&#x27;, &#x27;2.547038&#x27;]
-avg_difference: [&#x27;0.113427&#x27;, &#x27;0.084145&#x27;, &#x27;0.454677&#x27;]</div></details></div></details></div>
+avg_difference: [&#x27;0.113427&#x27;, &#x27;0.084145&#x27;, &#x27;0.454677&#x27;]</div></details></div></details><details class="turn-collapse"><summary><b>turn 11</b> · 1 tool call(s) · 170.9s turn · 76.4s LLM · tokens in=47,131 · out=8,143 · total=55,274 · 30,449 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 11</span><span>170.9s turn · 76.4s LLM · 94.5s tools · <span class="turn-tokens">tokens in=47,131 · out=8,143 · total=55,274</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">The error is still similar. Let me check the rel_mlp kernel more carefully. The issue could be:
+1. The weight indexing for w2 might be wrong
+2. The intermediate sharing between threads might be incorrect
+
+Wait, I see the problem now! In the reference:
+```python
+self.rel_mlp = nn.Sequential(
+    nn.Linear(pair_dim, pair_dim),  # w1
+    nn.SiLU(),
+    nn.Linear(pair_dim, num_heads),  # w2
+)
+```
+
+The second Linear layer has shape `(num_heads, pair_dim)`. But in PyTorch, `nn.Linear(out_features, in_features)` stores weight as `(out_features, in_features)`. So `w2` is `(num_heads, pair_dim)`.
+
+But in my kernel, I access it as `w2[h * P + p]`, which assumes w2 is `(num_heads, P)` where each row is for a head, and each column is for the intermediate value p. That should be correct.
+
+Wait, but the intermediate values are being computed incorrectly. Let me trace through:
+- We have `num_heads` threads (4)
+- Each thread iterates `p = threadIdx.x, threadIdx.x + blockDim.x, ...` but `blockDim.x = num_heads = 4` and P = 16
+- So thread 0 computes p=0,4,8,12; thread 1 computes p=1,5,9,13; etc.
+
+That&#x27;s correct - each thread computes a subset of the intermediate values.
+
+After `__syncthreads()`, all intermediate values should be available.
+
+Then for the second linear, each thread h reads from all p and multiplies by w2[h * P + p].
+
+Hmm, this should be correct.
+
+Let me check the issue with the linear projection weights again. In PyTorch:
+```python
+self.q_proj = nn.Linear(dim, dim, bias=False)
+```
+This creates a weight of shape `(dim, dim)`. The forward is `output = input @ weight.T`.
+
+So `q_proj.weight` is `(dim, dim)` and the computation is:
+```python
+q = h @ q_proj.weight.T  # h is (B, N, D), weight is (D, D)
+```
+
+This means `q[b, n, d] = sum_i h[b, n, i] * weight[d, i]` where `weight[d, i]` is the (d, i) element.
+
+In my kernel, I do:
+```cpp
+q_val += norm_val * static_cast&lt;float&gt;(q_weight[out_idx * D + i]);
+```
+where `out_idx` is the output dimension and `i` is the input dimension. This accesses `q_weight[out_idx * D + i]` which is row `out_idx`, column `i`. This matches the weight storage!
+
+So the q/k/v projections should be correct.
+
+Let me check the out_proj kernel. In the reference:
+```python
+ctx = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, D)
+return nodes + self.out_proj(ctx)
+```
+
+So `ctx` is `(B, N, D)` and `out_proj(ctx)` is `ctx @ out_proj.weight.T`.
+
+In my kernel, I have `attn_out` in `(B, H, N, head_dim)` format, and I&#x27;m trying to compute:
+```cpp
+proj_val += static_cast&lt;float&gt;(attn_out[attn_offset]) * static_cast&lt;float&gt;(out_weight[d * D + i]);
+```
+
+where `d` is the output dimension and `i` is the input dimension. But `attn_offset` accesses the correct element.
+
+Wait, let me think about this more carefully. In the reference:
+- `ctx` after transpose and reshape has shape `(B, N, D)` where `ctx[b, n, d] = attn_out[b, d//head_dim, n, d%head_dim]`
+- Then `out = ctx @ out_proj.weight.T` which means `out[b, n, d] = sum_i ctx[b, n, i] * weight[d, i]`
+
+In my kernel:
+- `attn_out[b, h, n, hd]` stores the attention output
+- I&#x27;m computing `proj_val = sum_i attn_out[b, i//head_dim, n, i%head_dim] * out_weight[d, i]`
+
+This is correct!
+
+Let me check the LayerNorm. In PyTorch, `nn.LayerNorm(dim)` computes:
+```python
+output = (input - mean) / sqrt(var + eps) * weight + bias
+```
+
+My kernel does:
+```cpp
+float val = (static_cast&lt;float&gt;(input_ptr[i]) - mean) * inv_std;
+float w = static_cast&lt;float&gt;(weight[i]);
+float b = bias ? static_cast&lt;float&gt;(bias[i]) : 0.0f;
+norm_vals[i] = val * w + b;
+```
+
+Where `inv_std = rsqrtf(var_shared + eps)`. This should be correct.
+
+Hmm, let me check the attention softmax more carefully. I use `-FLT_MAX` for masked-out positions, but PyTorch uses `float(&quot;-inf&quot;)`. Let me verify this works correctly.
+
+Actually, let me check if `-FLT_MAX` causes issues with the softmax. When we do `expf(logits[j] - max_logit)`, if `logits[j] = -FLT_MAX`, then `logits[j] - max_logit` is still a very negative number, and `expf` of that should be essentially 0. So this should be fine.
+
+Let me check the Q/K/V transpose. In the reference:
+```python
+q = self.q_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+```
+
+This creates q of shape `(B, num_heads, N, head_dim)`.
+
+My kernel stores q in the same format `(B, num_heads, N, head_dim)`.
+
+Actually wait - there&#x27;s a subtle issue. In PyTorch, after `view(B, N, num_heads, head_dim)`, the data is stored in a specific order. Let me trace this:
+
+- `q_proj(h)` produces output of shape `(B, N, D)` with layout `(B, N, num_heads * head_dim)`
+- `view(B, N, num_heads, head_dim)` interprets the same memory as `(B, N, num_heads, head_dim)` where `q[b, n, h, d]` accesses the element at position `b * N * D + n * D + h * head_dim + d`
+- `transpose(1, 2)` swaps dimensions 1 and 2, so the output is `(B, num_heads, N, head_dim)` with `q[b, h, n, d]` accessing `b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + d`
+
+But in my kernel, I store directly in `(B, num_heads, N, head_dim)` format, computing:
+```cpp
+int out_offset = b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + d;
+q_out[out_offset] = static_cast&lt;scalar_t&gt;(q_val);
+```
+
+Where `h = out_idx / head_dim` and `d = out_idx % head_dim`, and `out_idx` is the linear output index.
+
+In PyTorch&#x27;s linear:
+- `q_proj(h)` has shape `(B, N, D)` where `q_proj.weight` is `(D, D)`
+- For each position `(b, n)`, the output `q[b, n, out_idx] = sum_i h[b, n, i] * weight[out_idx, i]`
+- After view and transpose, this becomes `q_final[b, h, n, d]` where `h = out_idx // head_dim` and `d = out_idx % head_dim`
+
+My kernel does exactly this! So it should be correct.
+
+Let me think about what else could be wrong...
+
+Oh wait! I think I see the issue. In the reference model, the LayerNorm has `eps=1e-5` by default, and I&#x27;m passing `self.eps = 1e-5` to the kernel. But let me verify that `nn.LayerNorm` in PyTorch uses `eps=1e-5` by default.
+
+According to PyTorch docs, `nn.LayerNorm(normalized_shape, eps=1e-5, ...)` - yes, the default is `1e-5`.
+
+Hmm, let me check if there&#x27;s something wrong with the block reduction functions. In my `block_reduce_max` function, I return the max value but it&#x27;s only correct in the first warp. Let me fix this:
+
+```cpp
+__device__ __forceinline__ float block_reduce_max(float val) {
+    __shared__ float shared[32];  // One per warp
+    int lane = threadIdx.x &amp; 31;
+    int wid = threadIdx.x &gt;&gt; 5;
+    
+    val = warp_reduce_max(val);
+    
+    if (lane == 0) {
+        shared[wid] = val;
+    }
+    __syncthreads();
+    
+    if (wid == 0) {
+        val = (lane &lt; (BLOCK_SIZE + 31) / 32) ? shared[lane] : -FLT_MAX;
+        val = warp_reduce_max(val);
+    }
+    __syncthreads();
+    
+    return val;  // &lt;-- This only has the correct value in wid==0 threads!
+}
+```
+
+The returned value `val` is only correct for threads in warp 0. Other threads still have their old `val` after the warp-level max reduction. But they haven&#x27;t updated `val` after the final warp_reduce_max.
+
+This is the bug! Let me fix the block_reduce functions to properly broadcast the result.
+
+Actually, looking at the attention kernel usage:
+```cpp
+float max_logit = block_reduce_max(local_max);
+__shared__ float max_logit_shared;
+if (threadIdx.x == 0) {
+    max_logit_shared = max_logit;
+}
+__syncthreads();
+max_logit = max_logit_shared;
+```
+
+I store the result in shared memory from thread 0 and then all threads read it. So this should actually work correctly because thread 0 will have the correct max value.
+
+Wait, but thread 0 might not be in warp 0... Actually, threadIdx.x == 0 is lane 0 of warp 0, so it should have the correct value.
+
+Let me think more carefully. After `block_reduce_max`, the result is in the first warp&#x27;s threads (specifically, the correct max is in lane 0 after the final warp_reduce_max). Thread 0 is in lane 0 of warp 0, so it should have the correct value.
+
+Actually no, let me trace through again:
+1. Each thread computes its `local_max`
+2. Warp-level max: each thread now has the max of its warp in its `val`
+3. Lane 0 of each warp stores its `val` in `shared[wid]`
+4. Warp 0 reads from shared and computes max across all warps
+5. Threads in warp 0 now have the correct max in their `val`
+6. Threads NOT in warp 0 still have their warp-level max in their `val`, NOT the global max
+
+So when I return `val`, only threads in warp 0 have the correct global max. Threads in other warps have their warp-local max.
+
+Then:
+```cpp
+if (threadIdx.x == 0) {  // This is thread 0, which IS in warp 0
+    max_logit_shared = max_logit;
+}
+```
+
+Thread 0 is in warp 0, so it has the correct value. Then all threads read from shared memory. This should work!
+
+Let me add some debug output or simplify the kernel to verify correctness piece by piece.
+
+Actually, let me just try a simpler approach - use a single block with fewer threads or ensure all threads have the correct value by broadcasting.
+
+Actually, I think the issue might be in the rel_mlp kernel. Let me check if the intermediate values are being computed correctly.
+
+In the rel_mlp kernel:
+- num_heads = 4 threads per block
+- P = 16 intermediate values to compute
+- Each thread computes 4 intermediate values (p = h, h+4, h+8, h+12)
+
+This seems correct. After syncthreads, all 16 intermediate values should be available.
+
+Then each thread h computes its output:
+```cpp
+float out_val = 0.0f;
+for (int p = 0; p &lt; P; ++p) {
+    out_val += intermediate[p] * static_cast&lt;float&gt;(w2[h * P + p]);
+}
+```
+
+This computes `sum_p intermediate[p] * w2[h, p]`, which is correct for the second linear.
+
+Wait, I need to double-check the w2 weight layout. In PyTorch:
+```python
+nn.Linear(pair_dim, num_heads)  # in_features=pair_dim, out_features=num_heads
+```
+
+The weight has shape `(num_heads, pair_dim)` = `(num_heads, P)`.
+
+So `w2[h, p]` is the weight connecting intermediate p to output h.
+
+In memory, this is stored as `w2[h * P + p]` (row-major). This matches my kernel access!
+
+Hmm, let me also check w1. In PyTorch:
+```python
+nn.Linear(pair_dim, pair_dim)  # in_features=pair_dim, out_features=pair_dim
+```
+
+Weight has shape `(pair_dim, pair_dim)` = `(P, P)`.
+
+For the first linear: `output = input @ w1.T`, so `output[p] = sum_k input[k] * w1[p, k]`.
+
+In my kernel:
+```cpp
+for (int k = 0; k &lt; P; ++k) {
+    val += static_cast&lt;float&gt;(pair_ptr[k]) * static_cast&lt;float&gt;(w1[p * P + k]);
+}
+```
+
+This computes `sum_k pair_ptr[k] * w1[p, k]`. But wait, the weight should be transposed!
+
+In PyTorch, `nn.Linear(in, out)` has weight of shape `(out, in)`. For `nn.Linear(P, P)`, weight is `(P, P)`.
+
+The computation is `output = input @ weight.T`, so:
+```
+output[p] = sum_k input[k] * weight[p, k]  # after transpose, weight[p, k] becomes weight.T[k, p]
+```
+
+Wait no. Let me be more careful. For a linear layer `y = x @ W.T`:
+- `x` is `(batch, in_features)`
+- `W` is `(out_features, in_features)`  
+- `y = x @ W.T` is `(batch, out_features)`
+- Element-wise: `y[i, j] = sum_k x[i, k] * W[j, k]` (note: W[j, k] not W[k, j])
+
+So `output[p] = sum_k input[k] * W[p, k]`.
+
+In my kernel, I access `w1[p * P + k]` which is `W[p, k]`. This is correct!
+
+So the rel_mlp kernel should be correct too.
+
+Let me look at what else might be different. Maybe the issue is with how I&#x27;m handling the Q/K/V output layout...
+
+Actually, let me reconsider. The reference does:
+```python
+q = self.q_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+```
+
+This means:
+1. `q_proj(h)` -&gt; shape (B, N, D), memory layout: q_proj_out[b, n, d] at position b*N*D + n*D + d
+2. `.view(B, N, num_heads, head_dim)` -&gt; same memory, but now q_view[b, n, h, hd] accesses position b*N*D + n*D + h*head_dim + hd
+3. `.transpose(1, 2)` -&gt; new tensor q[b, h, n, hd] which accesses the same element as q_view[b, n, h, hd]
+
+So `q[b, h, n, hd]` comes from `q_proj_out[b, n, h*head_dim + hd]`.
+
+In my kernel, I compute:
+```cpp
+int out_offset = b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + d;
+q_out[out_offset] = static_cast&lt;scalar_t&gt;(q_val);
+```
+
+where `h = out_idx / head_dim` and `d = out_idx % head_dim`.
+
+So for linear output index `out_idx`, the value is `q_proj_out[b, n, out_idx]`.
+
+In my storage, this becomes `q_out[b, h, n, d]` with `h = out_idx / head_dim`, `d = out_idx % head_dim`.
+
+After transpose, the reference&#x27;s `q[b, h, n, hd]` = `q_proj_out[b, n, h*head_dim + hd]`.
+
+My `q_out[b, h, n, d]` with `h = out_idx / head_dim`, `d = out_idx % head_dim` = `q_proj_out[b, n, out_idx]` where `out_idx = h*head_dim + d`.
+
+So my `q_out[b, h, n, d]` = `q_proj_out[b, n, h*head_dim + d]`. This matches exactly!
+
+Hmm, so the Q/K/V layout should be correct.
+
+Let me try a different approach - I&#x27;ll add a print statement or test with specific values to debug.
+
+Actually, let me just make the kernel simpler by using PyTorch for some parts and only customizing the critical parts. Or let me check if the issue is the block_reduce functions not working correctly.
+
+Let me try using a simpler reduction that definitely works:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me debug by checking the block reduction. The issue is likely in the block_reduce_max - the result isn&#x27;t broadcast to all threads. Let me fix this:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import math\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cuda_bf16.h&gt;\n#include &lt;vector&gt;\n#include &lt;cfloat&gt;\n\nconstexpr int BLOCK_SIZE = 256;\n\ntemplate &lt;typename scalar_t&gt;\n__device__ __forceinline__ scalar_t warp_reduce_sum(scalar_t val) {\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        val += __shfl_down_sync(0xffffffff, val, offset);\n    }\n    return val;\n}\n\n__device__ __forceinline__ float warp_reduce_max(float val) {\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));\n    }\n    return val;\n}\n\n// Fused LayerNorm + Q/K/V projection kernel\ntemplate &lt;typename scalar_t&gt;\n__global__ void layernorm_qkv_kernel(\n    const scalar_t* __restrict__ input,      // (B, N, D)\n    const scalar_t* __restrict__ weight,     // (D,) for LayerNorm\n    const scalar_t* __restrict__ bias,       // (D,) for LayerNorm (can be null)\n    const scalar_t* __restrict__ q_weight,   // (D, D) - output_dim x input_dim\n    const scalar_t* __restrict__ k_weight,   // (D, D)\n    const scalar_t* __restrict__ v_weight,   // (D, D)\n    scalar_t* __restrict__ q_out,            // (B, num_heads, N, head_dim)\n    scalar_t* __restrict__ k_out,            // (B, num_heads, N, head_dim)\n    scalar_t* __restrict__ v_out,            // (B, num_heads, N, head_dim)\n    int B, int N, int D, int num_heads, int head_dim, float eps) {\n    \n    int b = blockIdx.y;\n    int n = blockIdx.x;\n    int tid = threadIdx.x;\n    \n    if (b &gt;= B || n &gt;= N) return;\n    \n    const scalar_t* input_ptr = input + (b * N + n) * D;\n    \n    // Compute mean using shared memory reduction\n    __shared__ float s_mean;\n    __shared__ float s_var;\n    \n    float sum = 0.0f;\n    for (int i = tid; i &lt; D; i += blockDim.x) {\n        sum += static_cast&lt;float&gt;(input_ptr[i]);\n    }\n    \n    // Block reduction for sum\n    for (int offset = blockDim.x / 2; offset &gt; 0; offset &gt;&gt;= 1) {\n        sum += __shfl_down_sync(0xffffffff, sum, offset);\n    }\n    \n    if (tid == 0) {\n        s_mean = sum / D;\n    }\n    __syncthreads();\n    float mean = s_mean;\n    \n    // Compute variance\n    float var_sum = 0.0f;\n    for (int i = tid; i &lt; D; i += blockDim.x) {\n        float diff = static_cast&lt;float&gt;(input_ptr[i]) - mean;\n        var_sum += diff * diff;\n    }\n    \n    for (int offset = blockDim.x / 2; offset &gt; 0; offset &gt;&gt;= 1) {\n        var_sum += __shfl_down_sync(0xffffffff, var_sum, offset);\n    }\n    \n    if (tid == 0) {\n        s_var = var_sum / D;\n    }\n    __syncthreads();\n    float inv_std = rsqrtf(s_var + eps);\n    \n    // LayerNorm + store normalized values in shared memory\n    extern __shared__ float norm_vals[];\n    for (int i = tid; i &lt; D; i += blockDim.x) {\n        float val = (static_cast&lt;float&gt;(input_ptr[i]) - mean) * inv_std;\n        float w = static_cast&lt;float&gt;(weight[i]);\n        float b = bias ? static_cast&lt;float&gt;(bias[i]) : 0.0f;\n        norm_vals[i] = val * w + b;\n    }\n    __syncthreads();\n    \n    // Q/K/V projections\n    for (int out_idx = tid; out_idx &lt; D; out_idx += blockDim.x) {\n        int h = out_idx / head_dim;\n        int d = out_idx % head_dim;\n        \n        float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;\n        for (int i = 0; i &lt; D; ++i) {\n            float norm_val = norm_vals[i];\n            q_val += norm_val * static_cast&lt;float&gt;(q_weight[out_idx * D + i]);\n            k_val += norm_val * static_cast&lt;float&gt;(k_weight[out_idx * D + i]);\n            v_val += norm_val * static_cast&lt;float&gt;(v_weight[out_idx * D + i]);\n        }\n        int out_offset = b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + d;\n        q_out[out_offset] = static_cast&lt;scalar_t&gt;(q_val);\n        k_out[out_offset] = static_cast&lt;scalar_t&gt;(k_val);\n        v_out[out_offset] = static_cast&lt;scalar_t&gt;(v_val);\n    }\n}\n\n// Rel MLP kernel: pair_feats (B, N, N, P) -&gt; rel_bias (B, H, N, N)\ntemplate &lt;typename scalar_t&gt;\n__global__ void rel_mlp_kernel(\n    const scalar_t* __restrict__ pair_feats,  // (B, N, N, P)\n    const scalar_t* __restrict__ w1,          // (P, P)\n    const scalar_t* __restrict__ w2,          // (num_heads, P)\n    scalar_t* __restrict__ rel_bias,          // (B, H, N, N)\n    int B, int N, int P, int num_heads) {\n    \n    int b = blockIdx.z;\n    int i = blockIdx.y;\n    int j = blockIdx.x;\n    int h = threadIdx.x;\n    \n    if (b &gt;= B || i &gt;= N || j &gt;= N || h &gt;= num_heads) return;\n    \n    const scalar_t* pair_ptr = pair_feats + (b * N * N + i * N + j) * P;\n    \n    // First linear + SiLU: compute intermediate values in shared memory\n    extern __shared__ float intermediate[];\n    \n    // Each thread computes a subset of intermediate values\n    for (int p = threadIdx.x; p &lt; P; p += blockDim.x) {\n        float val = 0.0f;\n        for (int k = 0; k &lt; P; ++k) {\n            val += static_cast&lt;float&gt;(pair_ptr[k]) * static_cast&lt;float&gt;(w1[p * P + k]);\n        }\n        // SiLU activation: x * sigmoid(x)\n        intermediate[p] = val * (1.0f / (1.0f + expf(-val)));\n    }\n    __syncthreads();\n    \n    // Second linear: each thread computes output for its head\n    float out_val = 0.0f;\n    for (int p = 0; p &lt; P; ++p) {\n        out_val += intermediate[p] * static_cast&lt;float&gt;(w2[h * P + p]);\n    }\n    \n    // Store with permute: (b, h, i, j)\n    rel_bias[b * num_heads * N * N + h * N * N + i * N + j] = static_cast&lt;scalar_t&gt;(out_val);\n}\n\n// Attention kernel with edge mask\ntemplate &lt;typename scalar_t&gt;\n__global__ void attention_kernel(\n    const scalar_t* __restrict__ q,           // (B, H, N, head_dim)\n    const scalar_t* __restrict__ k,           // (B, H, N, head_dim)\n    const scalar_t* __restrict__ v,           // (B, H, N, head_dim)\n    const scalar_t* __restrict__ rel_bias,    // (B, H, N, N)\n    const float* __restrict__ edge_mask,      // (B, N, N)\n    scalar_t* __restrict__ out,               // (B, H, N, head_dim)\n    int B, int N, int num_heads, int head_dim, float scale) {\n    \n    int b = blockIdx.z;\n    int i = blockIdx.y;  // query index\n    int h = blockIdx.x;  // head index\n    \n    if (b &gt;= B || i &gt;= N || h &gt;= num_heads) return;\n    \n    int q_offset = b * num_heads * N * head_dim + h * N * head_dim + i * head_dim;\n    \n    // Shared memory for logits and reduction\n    extern __shared__ float smem[];\n    float* logits = smem;\n    \n    // Step 1: Compute logits\n    for (int j = threadIdx.x; j &lt; N; j += blockDim.x) {\n        int k_offset = b * num_heads * N * head_dim + h * N * head_dim + j * head_dim;\n        \n        float qk = 0.0f;\n        for (int d = 0; d &lt; head_dim; ++d) {\n            qk += static_cast&lt;float&gt;(q[q_offset + d]) * static_cast&lt;float&gt;(k[k_offset + d]);\n        }\n        qk *= scale;\n        \n        // Add relative bias\n        int bias_offset = b * num_heads * N * N + h * N * N + i * N + j;\n        qk += static_cast&lt;float&gt;(rel_bias[bias_offset]);\n        \n        // Apply edge mask\n        float mask = edge_mask[b * N * N + i * N + j];\n        logits[j] = (mask &gt;= 0.5f) ? qk : -FLT_MAX;\n    }\n    __syncthreads();\n    \n    // Step 2: Find max (using parallel reduction)\n    __shared__ float s_max;\n    float local_max = -FLT_MAX;\n    for (int j = threadIdx.x; j &lt; N; j += blockDim.x) {\n        local_max = fmaxf(local_max, logits[j]);\n    }\n    \n    // Warp-level max reduction\n    local_max = warp_reduce_max(local_max);\n    \n    if (threadIdx.x % 32 == 0) {\n        // First lane of each warp writes to shared memory\n        // Using simple approach since we likely have few warps\n        atomicMax((int*)&amp;s_max, __float_as_int(local_max));\n    }\n    // Initialize s_max before any atomicMax\n    if (threadIdx.x == 0) {\n        s_max = -FLT_MAX;\n    }\n    __syncthreads();\n    float max_logit = s_max;\n    \n    // Step 3: Compute exp and sum\n    __shared__ float s_sum;\n    float local_sum = 0.0f;\n    for (int j = threadIdx.x; j &lt; N; j += blockDim.x) {\n        logits[j] = expf(logits[j] - max_logit);\n        local_sum += logits[j];\n    }\n    \n    local_sum = warp_reduce_sum(local_sum);\n    \n    if (threadIdx.x % 32 == 0) {\n        atomicAdd(&amp;s_sum, local_sum);\n    }\n    if (threadIdx.x == 0) {\n        s_sum = 0.0f;\n    }\n    __syncthreads();\n    \n    // Step 4: Normalize and compute weighted sum\n    for (int d = threadIdx.x; d &lt; head_dim; d += blockDim.x) {\n        float out_val = 0.0f;\n        for (int j = 0; j &lt; N; ++j) {\n            float attn_weight = logits[j] / s_sum;\n            int v_offset = b * num_heads * N * head_dim + h * N * head_dim + j * head_dim;\n            out_val += attn_weight * static_cast&lt;float&gt;(v[v_offset + d]);\n        }\n        int out_offset = b * num_heads * N * head_dim + h * N * head_dim + i * head_dim;\n        out[out_offset] = static_cast&lt;scalar_t&gt;(out_val);\n    }\n}\n\n// Output projection and residual add kernel\ntemplate &lt;typename scalar_t&gt;\n__global__ void out_proj_residual_kernel(\n    const scalar_t* __restrict__ attn_out,    // (B, H, N, head_dim)\n    const scalar_t* __restrict__ out_weight,  // (D, D)\n    const scalar_t* __restrict__ nodes,      // (B, N, D)\n    scalar_t* __restrict__ result,           // (B, N, D)\n    int B, int N, int D, int num_heads, int head_dim) {\n    \n    int b = blockIdx.y;\n    int n = blockIdx.x;\n    int d = threadIdx.x;\n    \n    if (b &gt;= B || n &gt;= N || d &gt;= D) return;\n    \n    // Compute output projection\n    float proj_val = 0.0f;\n    for (int i = 0; i &lt; D; ++i) {\n        int h = i / head_dim;\n        int hd = i % head_dim;\n        int attn_offset = b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + hd;\n        proj_val += static_cast&lt;float&gt;(attn_out[attn_offset]) * static_cast&lt;float&gt;(out_weight[d * D + i]);\n    }\n    \n    // Residual add\n    int nodes_offset = b * N * D + n * D;\n    result[nodes_offset + d] = static_cast&lt;scalar_t&gt;(static_cast&lt;float&gt;(nodes[nodes_offset + d]) + proj_val);\n}\n\ntorch::Tensor gfvla_forward(\n    torch::Tensor nodes,\n    torch::Tensor pair_feats,\n    torch::Tensor edge_mask,\n    torch::Tensor ln_weight,\n    torch::Tensor ln_bias,\n    torch::Tensor q_weight,\n    torch::Tensor k_weight,\n    torch::Tensor v_weight,\n    torch::Tensor rel_w1,\n    torch::Tensor rel_w2,\n    torch::Tensor out_weight,\n    int num_heads,\n    float eps) {\n    \n    int B = nodes.size(0);\n    int N = nodes.size(1);\n    int D = nodes.size(2);\n    int P = pair_feats.size(3);\n    int head_dim = D / num_heads;\n    float scale = 1.0f / sqrtf((float)head_dim);\n    \n    auto options = nodes.options();\n    auto q_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto k_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto v_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto rel_bias = torch::empty({B, num_heads, N, N}, options);\n    auto attn_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto result = torch::empty({B, N, D}, options);\n    \n    dim3 grid(N, B);\n    int smem = D * sizeof(float);\n    \n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;layernorm_qkv\&quot;, ([&amp;] {\n        layernorm_qkv_kernel&lt;scalar_t&gt;&lt;&lt;&lt;grid, BLOCK_SIZE, smem&gt;&gt;&gt;(\n            nodes.data_ptr&lt;scalar_t&gt;(),\n            ln_weight.data_ptr&lt;scalar_t&gt;(),\n            ln_bias.defined() ? ln_bias.data_ptr&lt;scalar_t&gt;() : nullptr,\n            q_weight.data_ptr&lt;scalar_t&gt;(),\n            k_weight.data_ptr&lt;scalar_t&gt;(),\n            v_weight.data_ptr&lt;scalar_t&gt;(),\n            q_out.data_ptr&lt;scalar_t&gt;(),\n            k_out.data_ptr&lt;scalar_t&gt;(),\n            v_out.data_ptr&lt;scalar_t&gt;(),\n            B, N, D, num_heads, head_dim, eps);\n    }));\n    \n    // Rel MLP kernel\n    dim3 rel_grid(N, N, B);\n    int rel_smem = P * sizeof(float);\n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;rel_mlp\&quot;, ([&amp;] {\n        rel_mlp_kernel&lt;scalar_t&gt;&lt;&lt;&lt;rel_grid, num_heads, rel_smem&gt;&gt;&gt;(\n            pair_feats.data_ptr&lt;scalar_t&gt;(),\n            rel_w1.data_ptr&lt;scalar_t&gt;(),\n            rel_w2.data_ptr&lt;scalar_t&gt;(),\n            rel_bias.data_ptr&lt;scalar_t&gt;(),\n            B, N, P, num_heads);\n    }));\n    \n    // Attention kernel\n    dim3 attn_grid(num_heads, N, B);\n    int attn_smem = N * sizeof(float);\n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;attention\&quot;, ([&amp;] {\n        attention_kernel&lt;scalar_t&gt;&lt;&lt;&lt;attn_grid, BLOCK_SIZE, attn_smem&gt;&gt;&gt;(\n            q_out.data_ptr&lt;scalar_t&gt;(),\n            k_out.data_ptr&lt;scalar_t&gt;(),\n            v_out.data_ptr&lt;scalar_t&gt;(),\n            rel_bias.data_ptr&lt;scalar_t&gt;(),\n            edge_mask.data_ptr&lt;float&gt;(),\n            attn_out.data_ptr&lt;scalar_t&gt;(),\n            B, N, num_heads, head_dim, scale);\n    }));\n    \n    // Output projection and residual\n    dim3 out_grid(N, B);\n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;out_proj_residual\&quot;, ([&amp;] {\n        out_proj_residual_kernel&lt;scalar_t&gt;&lt;&lt;&lt;out_grid, D, 0&gt;&gt;&gt;(\n            attn_out.data_ptr&lt;scalar_t&gt;(),\n            out_weight.data_ptr&lt;scalar_t&gt;(),\n            nodes.data_ptr&lt;scalar_t&gt;(),\n            result.data_ptr&lt;scalar_t&gt;(),\n            B, N, D, num_heads, head_dim);\n    }));\n    \n    return result;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor gfvla_forward(\n    torch::Tensor nodes,\n    torch::Tensor pair_feats,\n    torch::Tensor edge_mask,\n    torch::Tensor ln_weight,\n    torch::Tensor ln_bias,\n    torch::Tensor q_weight,\n    torch::Tensor k_weight,\n    torch::Tensor v_weight,\n    torch::Tensor rel_w1,\n    torch::Tensor rel_w2,\n    torch::Tensor out_weight,\n    int num_heads,\n    float eps);\n\&quot;\&quot;\&quot;\n\ngfvla_module = load_inline(\n    name=\&quot;gfvla_module\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[\&quot;gfvla_forward\&quot;],\n    verbose=True,\n    extra_cuda_cflags=[\&quot;-O3\&quot;],\n)\n\nimport torch.nn as nn\nimport math\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim: int, pair_dim: int, num_heads: int):\n        super().__init__()\n        self.dim = dim\n        self.pair_dim = pair_dim\n        self.num_heads = num_heads\n        self.head_dim = dim // num_heads\n        \n        # Create parameters same as reference\n        self.norm = nn.LayerNorm(dim)\n        self.q_proj = nn.Linear(dim, dim, bias=False)\n        self.k_proj = nn.Linear(dim, dim, bias=False)\n        self.v_proj = nn.Linear(dim, dim, bias=False)\n        self.rel_mlp = nn.Sequential(\n            nn.Linear(pair_dim, pair_dim),\n            nn.SiLU(),\n            nn.Linear(pair_dim, num_heads),\n        )\n        self.out_proj = nn.Linear(dim, dim, bias=False)\n        \n        # Register for easy access\n        self.eps = 1e-5\n\n    def forward(self, nodes: torch.Tensor, pair_feats: torch.Tensor, edge_mask: torch.Tensor) -&gt; torch.Tensor:\n        # Ensure contiguous\n        nodes = nodes.contiguous()\n        pair_feats = pair_feats.contiguous()\n        edge_mask = edge_mask.contiguous()\n        \n        result = gfvla_module.gfvla_forward(\n            nodes,\n            pair_feats,\n            edge_mask,\n            self.norm.weight,\n            self.norm.bias,\n            self.q_proj.weight,\n            self.k_proj.weight,\n            self.v_proj.weight,\n            self.rel_mlp[0].weight,\n            self.rel_mlp[2].weight,\n            self.out_proj.weight,\n            self.num_heads,\n            self.eps,\n        )\n        return result&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
