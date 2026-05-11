@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 4</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 20:46:46 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 4</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 20:48:51 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">4_GFVLA_FusedSceneGraphUpdate.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">10 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">11</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">229179</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">11 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">12</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">282878</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -559,5 +559,543 @@ Let me fix the rel_mlp kernel.
 {
   &quot;kernel_code&quot;: &quot;import math\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cuda_bf16.h&gt;\n#include &lt;vector&gt;\n#include &lt;cfloat&gt;\n\nconstexpr int BLOCK_SIZE = 256;\n\ntemplate &lt;typename scalar_t&gt;\n__device__ __forceinline__ scalar_t warp_reduce_sum(scalar_t val) {\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        val += __shfl_down_sync(0xffffffff, val, offset);\n    }\n    return val;\n}\n\n__device__ __forceinline__ float warp_reduce_max(float val) {\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));\n    }\n    return val;\n}\n\n// Block-wide reduce max\n__device__ __forceinline__ float block_reduce_max(float val) {\n    __shared__ float shared[32];  // One per warp\n    int lane = threadIdx.x &amp; 31;\n    int wid = threadIdx.x &gt;&gt; 5;\n    \n    val = warp_reduce_max(val);\n    \n    if (lane == 0) {\n        shared[wid] = val;\n    }\n    __syncthreads();\n    \n    if (wid == 0) {\n        val = (lane &lt; (BLOCK_SIZE + 31) / 32) ? shared[lane] : -FLT_MAX;\n        val = warp_reduce_max(val);\n    }\n    __syncthreads();\n    \n    return val;\n}\n\n// Block-wide reduce sum\n__device__ __forceinline__ float block_reduce_sum(float val) {\n    __shared__ float shared[32];\n    int lane = threadIdx.x &amp; 31;\n    int wid = threadIdx.x &gt;&gt; 5;\n    \n    val = warp_reduce_sum(val);\n    \n    if (lane == 0) {\n        shared[wid] = val;\n    }\n    __syncthreads();\n    \n    if (wid == 0) {\n        val = (lane &lt; (BLOCK_SIZE + 31) / 32) ? shared[lane] : 0.0f;\n        val = warp_reduce_sum(val);\n    }\n    __syncthreads();\n    \n    return val;\n}\n\n// Fused LayerNorm + Q/K/V projection kernel\ntemplate &lt;typename scalar_t&gt;\n__global__ void layernorm_qkv_kernel(\n    const scalar_t* __restrict__ input,      // (B, N, D)\n    const scalar_t* __restrict__ weight,     // (D,) for LayerNorm\n    const scalar_t* __restrict__ bias,       // (D,) for LayerNorm (can be null)\n    const scalar_t* __restrict__ q_weight,   // (D, D) - output_dim x input_dim\n    const scalar_t* __restrict__ k_weight,   // (D, D)\n    const scalar_t* __restrict__ v_weight,   // (D, D)\n    scalar_t* __restrict__ q_out,            // (B, num_heads, N, head_dim)\n    scalar_t* __restrict__ k_out,            // (B, num_heads, N, head_dim)\n    scalar_t* __restrict__ v_out,            // (B, num_heads, N, head_dim)\n    int B, int N, int D, int num_heads, int head_dim, float eps) {\n    \n    int b = blockIdx.y;\n    int n = blockIdx.x;\n    int tid = threadIdx.x;\n    \n    if (b &gt;= B || n &gt;= N) return;\n    \n    const scalar_t* input_ptr = input + (b * N + n) * D;\n    \n    // Compute mean\n    float sum = 0.0f;\n    for (int i = tid; i &lt; D; i += blockDim.x) {\n        sum += static_cast&lt;float&gt;(input_ptr[i]);\n    }\n    sum = block_reduce_sum(sum);\n    __shared__ float mean_shared;\n    if (tid == 0) {\n        mean_shared = sum / D;\n    }\n    __syncthreads();\n    float mean = mean_shared;\n    \n    // Compute variance\n    float var_sum = 0.0f;\n    for (int i = tid; i &lt; D; i += blockDim.x) {\n        float diff = static_cast&lt;float&gt;(input_ptr[i]) - mean;\n        var_sum += diff * diff;\n    }\n    var_sum = block_reduce_sum(var_sum);\n    __shared__ float var_shared;\n    if (tid == 0) {\n        var_shared = var_sum / D;\n    }\n    __syncthreads();\n    float inv_std = rsqrtf(var_shared + eps);\n    \n    // LayerNorm + store normalized values\n    extern __shared__ float norm_vals[];\n    for (int i = tid; i &lt; D; i += blockDim.x) {\n        float val = (static_cast&lt;float&gt;(input_ptr[i]) - mean) * inv_std;\n        float w = static_cast&lt;float&gt;(weight[i]);\n        float b = bias ? static_cast&lt;float&gt;(bias[i]) : 0.0f;\n        norm_vals[i] = val * w + b;\n    }\n    __syncthreads();\n    \n    // Q/K/V projections\n    for (int out_idx = tid; out_idx &lt; D; out_idx += blockDim.x) {\n        int h = out_idx / head_dim;\n        int d = out_idx % head_dim;\n        \n        float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;\n        for (int i = 0; i &lt; D; ++i) {\n            float norm_val = norm_vals[i];\n            q_val += norm_val * static_cast&lt;float&gt;(q_weight[out_idx * D + i]);\n            k_val += norm_val * static_cast&lt;float&gt;(k_weight[out_idx * D + i]);\n            v_val += norm_val * static_cast&lt;float&gt;(v_weight[out_idx * D + i]);\n        }\n        int out_offset = b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + d;\n        q_out[out_offset] = static_cast&lt;scalar_t&gt;(q_val);\n        k_out[out_offset] = static_cast&lt;scalar_t&gt;(k_val);\n        v_out[out_offset] = static_cast&lt;scalar_t&gt;(v_val);\n    }\n}\n\n// Rel MLP kernel: pair_feats (B, N, N, P) -&gt; rel_bias (B, H, N, N)\ntemplate &lt;typename scalar_t&gt;\n__global__ void rel_mlp_kernel(\n    const scalar_t* __restrict__ pair_feats,  // (B, N, N, P)\n    const scalar_t* __restrict__ w1,          // (P, P)\n    const scalar_t* __restrict__ w2,          // (num_heads, P)\n    scalar_t* __restrict__ rel_bias,          // (B, H, N, N)\n    int B, int N, int P, int num_heads) {\n    \n    int b = blockIdx.z;\n    int i = blockIdx.y;\n    int j = blockIdx.x;\n    int h = threadIdx.x;\n    \n    if (b &gt;= B || i &gt;= N || j &gt;= N || h &gt;= num_heads) return;\n    \n    const scalar_t* pair_ptr = pair_feats + (b * N * N + i * N + j) * P;\n    \n    // First linear + SiLU: shared intermediate values\n    extern __shared__ float intermediate[];\n    \n    // Each thread computes part of the first linear\n    for (int p = threadIdx.x; p &lt; P; p += blockDim.x) {\n        float val = 0.0f;\n        for (int k = 0; k &lt; P; ++k) {\n            val += static_cast&lt;float&gt;(pair_ptr[k]) * static_cast&lt;float&gt;(w1[p * P + k]);\n        }\n        // SiLU activation: x * sigmoid(x)\n        intermediate[p] = val * (1.0f / (1.0f + expf(-val)));\n    }\n    __syncthreads();\n    \n    // Second linear: each thread computes one output for its head\n    float out_val = 0.0f;\n    for (int p = 0; p &lt; P; ++p) {\n        out_val += intermediate[p] * static_cast&lt;float&gt;(w2[h * P + p]);\n    }\n    \n    // Store with permute: (b, h, i, j)\n    rel_bias[b * num_heads * N * N + h * N * N + i * N + j] = static_cast&lt;scalar_t&gt;(out_val);\n}\n\n// Attention kernel with edge mask\ntemplate &lt;typename scalar_t&gt;\n__global__ void attention_kernel(\n    const scalar_t* __restrict__ q,           // (B, H, N, head_dim)\n    const scalar_t* __restrict__ k,           // (B, H, N, head_dim)\n    const scalar_t* __restrict__ v,           // (B, H, N, head_dim)\n    const scalar_t* __restrict__ rel_bias,    // (B, H, N, N)\n    const float* __restrict__ edge_mask,      // (B, N, N)\n    scalar_t* __restrict__ out,               // (B, H, N, head_dim)\n    int B, int N, int num_heads, int head_dim, float scale) {\n    \n    int b = blockIdx.z;\n    int i = blockIdx.y;  // query index\n    int h = blockIdx.x;  // head index\n    \n    if (b &gt;= B || i &gt;= N || h &gt;= num_heads) return;\n    \n    int q_offset = b * num_heads * N * head_dim + h * N * head_dim + i * head_dim;\n    \n    // Compute attention logits for this (b, h, i) across all j\n    extern __shared__ float logits[];\n    float local_max = -FLT_MAX;\n    \n    for (int j = threadIdx.x; j &lt; N; j += blockDim.x) {\n        int k_offset = b * num_heads * N * head_dim + h * N * head_dim + j * head_dim;\n        \n        float qk = 0.0f;\n        for (int d = 0; d &lt; head_dim; ++d) {\n            qk += static_cast&lt;float&gt;(q[q_offset + d]) * static_cast&lt;float&gt;(k[k_offset + d]);\n        }\n        qk *= scale;\n        \n        // Add relative bias\n        int bias_offset = b * num_heads * N * N + h * N * N + i * N + j;\n        qk += static_cast&lt;float&gt;(rel_bias[bias_offset]);\n        \n        // Apply edge mask\n        float mask = edge_mask[b * N * N + i * N + j];\n        logits[j] = (mask &gt;= 0.5f) ? qk : -FLT_MAX;\n        local_max = fmaxf(local_max, logits[j]);\n    }\n    __syncthreads();\n    \n    // Reduce max_logit across threads\n    float max_logit = block_reduce_max(local_max);\n    __shared__ float max_logit_shared;\n    if (threadIdx.x == 0) {\n        max_logit_shared = max_logit;\n    }\n    __syncthreads();\n    max_logit = max_logit_shared;\n    \n    // Compute softmax\n    float sum_exp = 0.0f;\n    for (int j = threadIdx.x; j &lt; N; j += blockDim.x) {\n        logits[j] = expf(logits[j] - max_logit);\n        sum_exp += logits[j];\n    }\n    sum_exp = block_reduce_sum(sum_exp);\n    __shared__ float sum_exp_shared;\n    if (threadIdx.x == 0) {\n        sum_exp_shared = sum_exp;\n    }\n    __syncthreads();\n    float inv_sum = 1.0f / (sum_exp_shared + 1e-10f);\n    \n    // Compute weighted sum of values\n    for (int d = threadIdx.x; d &lt; head_dim; d += blockDim.x) {\n        float out_val = 0.0f;\n        for (int j = 0; j &lt; N; ++j) {\n            float attn_weight = logits[j] * inv_sum;\n            int v_offset = b * num_heads * N * head_dim + h * N * head_dim + j * head_dim;\n            out_val += attn_weight * static_cast&lt;float&gt;(v[v_offset + d]);\n        }\n        int out_offset = b * num_heads * N * head_dim + h * N * head_dim + i * head_dim;\n        out[out_offset] = static_cast&lt;scalar_t&gt;(out_val);\n    }\n}\n\n// Output projection and residual add kernel\ntemplate &lt;typename scalar_t&gt;\n__global__ void out_proj_residual_kernel(\n    const scalar_t* __restrict__ attn_out,    // (B, H, N, head_dim)\n    const scalar_t* __restrict__ out_weight,  // (D, D)\n    const scalar_t* __restrict__ nodes,      // (B, N, D)\n    scalar_t* __restrict__ result,           // (B, N, D)\n    int B, int N, int D, int num_heads, int head_dim) {\n    \n    int b = blockIdx.y;\n    int n = blockIdx.x;\n    int d = threadIdx.x;\n    \n    if (b &gt;= B || n &gt;= N || d &gt;= D) return;\n    \n    // Compute output projection\n    float proj_val = 0.0f;\n    for (int i = 0; i &lt; D; ++i) {\n        int h = i / head_dim;\n        int hd = i % head_dim;\n        int attn_offset = b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + hd;\n        proj_val += static_cast&lt;float&gt;(attn_out[attn_offset]) * static_cast&lt;float&gt;(out_weight[d * D + i]);\n    }\n    \n    // Residual add\n    int nodes_offset = b * N * D + n * D;\n    result[nodes_offset + d] = static_cast&lt;scalar_t&gt;(static_cast&lt;float&gt;(nodes[nodes_offset + d]) + proj_val);\n}\n\ntorch::Tensor gfvla_forward(\n    torch::Tensor nodes,\n    torch::Tensor pair_feats,\n    torch::Tensor edge_mask,\n    torch::Tensor ln_weight,\n    torch::Tensor ln_bias,\n    torch::Tensor q_weight,\n    torch::Tensor k_weight,\n    torch::Tensor v_weight,\n    torch::Tensor rel_w1,\n    torch::Tensor rel_w2,\n    torch::Tensor out_weight,\n    int num_heads,\n    float eps) {\n    \n    int B = nodes.size(0);\n    int N = nodes.size(1);\n    int D = nodes.size(2);\n    int P = pair_feats.size(3);\n    int head_dim = D / num_heads;\n    float scale = 1.0f / sqrtf((float)head_dim);\n    \n    auto options = nodes.options();\n    auto q_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto k_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto v_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto rel_bias = torch::empty({B, num_heads, N, N}, options);\n    auto attn_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto result = torch::empty({B, N, D}, options);\n    \n    dim3 grid(N, B);\n    int smem = D * sizeof(float);\n    \n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;layernorm_qkv\&quot;, ([&amp;] {\n        layernorm_qkv_kernel&lt;scalar_t&gt;&lt;&lt;&lt;grid, BLOCK_SIZE, smem&gt;&gt;&gt;(\n            nodes.data_ptr&lt;scalar_t&gt;(),\n            ln_weight.data_ptr&lt;scalar_t&gt;(),\n            ln_bias.defined() ? ln_bias.data_ptr&lt;scalar_t&gt;() : nullptr,\n            q_weight.data_ptr&lt;scalar_t&gt;(),\n            k_weight.data_ptr&lt;scalar_t&gt;(),\n            v_weight.data_ptr&lt;scalar_t&gt;(),\n            q_out.data_ptr&lt;scalar_t&gt;(),\n            k_out.data_ptr&lt;scalar_t&gt;(),\n            v_out.data_ptr&lt;scalar_t&gt;(),\n            B, N, D, num_heads, head_dim, eps);\n    }));\n    \n    // Rel MLP kernel\n    dim3 rel_grid(N, N, B);\n    int rel_smem = P * sizeof(float);  // Just P floats for intermediate\n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;rel_mlp\&quot;, ([&amp;] {\n        rel_mlp_kernel&lt;scalar_t&gt;&lt;&lt;&lt;rel_grid, num_heads, rel_smem&gt;&gt;&gt;(\n            pair_feats.data_ptr&lt;scalar_t&gt;(),\n            rel_w1.data_ptr&lt;scalar_t&gt;(),\n            rel_w2.data_ptr&lt;scalar_t&gt;(),\n            rel_bias.data_ptr&lt;scalar_t&gt;(),\n            B, N, P, num_heads);\n    }));\n    \n    // Attention kernel\n    dim3 attn_grid(num_heads, N, B);\n    int attn_smem = N * sizeof(float);\n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;attention\&quot;, ([&amp;] {\n        attention_kernel&lt;scalar_t&gt;&lt;&lt;&lt;attn_grid, BLOCK_SIZE, attn_smem&gt;&gt;&gt;(\n            q_out.data_ptr&lt;scalar_t&gt;(),\n            k_out.data_ptr&lt;scalar_t&gt;(),\n            v_out.data_ptr&lt;scalar_t&gt;(),\n            rel_bias.data_ptr&lt;scalar_t&gt;(),\n            edge_mask.data_ptr&lt;float&gt;(),\n            attn_out.data_ptr&lt;scalar_t&gt;(),\n            B, N, num_heads, head_dim, scale);\n    }));\n    \n    // Output projection and residual\n    dim3 out_grid(N, B);\n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;out_proj_residual\&quot;, ([&amp;] {\n        out_proj_residual_kernel&lt;scalar_t&gt;&lt;&lt;&lt;out_grid, D, 0&gt;&gt;&gt;(\n            attn_out.data_ptr&lt;scalar_t&gt;(),\n            out_weight.data_ptr&lt;scalar_t&gt;(),\n            nodes.data_ptr&lt;scalar_t&gt;(),\n            result.data_ptr&lt;scalar_t&gt;(),\n            B, N, D, num_heads, head_dim);\n    }));\n    \n    return result;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor gfvla_forward(\n    torch::Tensor nodes,\n    torch::Tensor pair_feats,\n    torch::Tensor edge_mask,\n    torch::Tensor ln_weight,\n    torch::Tensor ln_bias,\n    torch::Tensor q_weight,\n    torch::Tensor k_weight,\n    torch::Tensor v_weight,\n    torch::Tensor rel_w1,\n    torch::Tensor rel_w2,\n    torch::Tensor out_weight,\n    int num_heads,\n    float eps);\n\&quot;\&quot;\&quot;\n\ngfvla_module = load_inline(\n    name=\&quot;gfvla_module\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[\&quot;gfvla_forward\&quot;],\n    verbose=True,\n    extra_cuda_cflags=[\&quot;-O3\&quot;],\n)\n\nimport torch.nn as nn\nimport math\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim: int, pair_dim: int, num_heads: int):\n        super().__init__()\n        self.dim = dim\n        self.pair_dim = pair_dim\n        self.num_heads = num_heads\n        self.head_dim = dim // num_heads\n        \n        # Create parameters same as reference\n        self.norm = nn.LayerNorm(dim)\n        self.q_proj = nn.Linear(dim, dim, bias=False)\n        self.k_proj = nn.Linear(dim, dim, bias=False)\n        self.v_proj = nn.Linear(dim, dim, bias=False)\n        self.rel_mlp = nn.Sequential(\n            nn.Linear(pair_dim, pair_dim),\n            nn.SiLU(),\n            nn.Linear(pair_dim, num_heads),\n        )\n        self.out_proj = nn.Linear(dim, dim, bias=False)\n        \n        # Register for easy access\n        self.eps = 1e-5\n\n    def forward(self, nodes: torch.Tensor, pair_feats: torch.Tensor, edge_mask: torch.Tensor) -&gt; torch.Tensor:\n        # Ensure contiguous\n        nodes = nodes.contiguous()\n        pair_feats = pair_feats.contiguous()\n        edge_mask = edge_mask.contiguous()\n        \n        result = gfvla_module.gfvla_forward(\n            nodes,\n            pair_feats,\n            edge_mask,\n            self.norm.weight,\n            self.norm.bias,\n            self.q_proj.weight,\n            self.k_proj.weight,\n            self.v_proj.weight,\n            self.rel_mlp[0].weight,\n            self.rel_mlp[2].weight,\n            self.out_proj.weight,\n            self.num_heads,\n            self.eps,\n        )\n        return result&quot;
 }</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
-compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details><details class="turn-collapse"><summary><b>turn 10</b> · 1 tool call(s) · 174.1s turn · 106.6s LLM · tokens in=42,677 · out=11,022 · total=53,699 · 42,150 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 10</span><span>174.1s turn · 106.6s LLM · 67.5s tools · <span class="turn-tokens">tokens in=42,677 · out=11,022 · total=53,699</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">I suspect the issue might be with the block_reduce functions. The shared memory arrays in the device functions might conflict with the extern shared memory in the kernel. Let me investigate the issue more carefully.
+
+Actually wait, the block_reduce functions use static shared memory arrays (not extern), so they should be separate from the dynamic shared memory. But the issue is that in CUDA, all these shared memory declarations end up in the same shared memory space.
+
+Let me rethink the approach. The issue might be:
+1. The rel_mlp kernel with P=16 and num_heads=4, each thread block has 4 threads. Each thread loads the pair_feats and computes the linear. But the shared memory is shared by all threads.
+
+Actually the issue is clear now. In the rel_mlp kernel, I have `num_heads` threads (4 threads). The shared memory `intermediate[P]` needs to be filled by these 4 threads. Since P=16 and num_heads=4, the loop `for (int p = threadIdx.x; p &lt; P; p += blockDim.x)` would have thread 0 compute p=0,4,8,12, thread 1 compute p=1,5,9,13, etc. So all P=16 values get computed by the 4 threads.
+
+Then each thread reads all P values for the second linear. This should work.
+
+But the issue might be in the block_reduce_max/sum functions. These functions use static shared memory arrays of size 32. But my block size is 256, so I have 8 warps (256/32=8). The shared arrays in block_reduce functions need to have enough space.
+
+Wait, I see the issue! In my block_reduce_max function:
+```cpp
+__shared__ float shared[32];  // One per warp
+```
+
+With BLOCK_SIZE=256, there are 8 warps. The condition `lane &lt; (BLOCK_SIZE + 31) / 32` evaluates to `lane &lt; 8`, which is fine for the 32-element array.
+
+But actually the bigger issue is that these static shared memory arrays in the device functions might interfere with each other or with the dynamic shared memory in the kernels.
+
+Actually wait, in CUDA, static shared memory and dynamic (extern) shared memory are separate. Static shared is allocated at compile time, dynamic at runtime. They should not overlap.
+
+Let me check another possibility: the block_reduce_max/sum functions have __syncthreads() calls, and if not all threads call the function (e.g., due to early returns), there could be a deadlock.
+
+Looking at my attention kernel:
+- The kernel returns early if b, i, or h are out of bounds
+- This means some threads might not call block_reduce_max, causing a deadlock
+
+But wait, each block is launched with grid dimensions, so all threads in a block should hit the same condition. The block (b, i, h) is launched only if all indices are valid.
+
+Actually, looking more carefully at the grid launch:
+```cpp
+dim3 attn_grid(num_heads, N, B);  // (x, y, z)
+```
+So blockIdx.x = h (0 to num_heads-1), blockIdx.y = i (0 to N-1), blockIdx.z = b (0 to B-1).
+
+The early return check is `if (b &gt;= B || i &gt;= N || h &gt;= num_heads) return;`. But since blocks are only launched for valid indices, this should never trigger.
+
+Hmm, let me think about what else could be wrong...
+
+Actually, let me reconsider the rel_mlp kernel. The issue might be that with only 4 threads (num_heads=4), the block reduction functions might not work correctly. The warp_reduce_max only works within a warp of 32 threads. With only 4 threads, it might still work, but let me verify.
+
+Actually, the rel_mlp kernel doesn&#x27;t use block_reduce functions, so that&#x27;s not the issue.
+
+Wait, I just realized something! The rel_mlp kernel has blockDim.x = num_heads = 4 threads. But the block_reduce_max function uses warp-level operations and expects the shared memory to be shared across all warps in a block. With only 4 threads, there&#x27;s only 1 partial warp.
+
+But again, rel_mlp doesn&#x27;t use block_reduce.
+
+Let me focus on the actual correctness issue. The errors are:
+- max_difference: ~0.5-2.5
+- avg_difference: ~0.08-0.45
+
+These are not NaN anymore, which is good. The issue is numerical precision or an algorithmic error.
+
+Let me trace through the computations step by step:
+1. LayerNorm + Q/K/V projection: should produce (B, num_heads, N, head_dim)
+2. Rel MLP: should produce (B, num_heads, N, N)
+3. Attention: uses Q, K, V, rel_bias
+4. Output projection + residual
+
+The key thing I might have wrong is the transpose operation. In the reference:
+```python
+q = self.q_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+```
+
+This produces (B, num_heads, N, head_dim). But the view then transpose is equivalent to reshaping the tensor. Let me check if my indexing is correct.
+
+In PyTorch, for a tensor of shape (B, N, D) where D = num_heads * head_dim:
+- view(B, N, num_heads, head_dim) produces a tensor where element [b, n, h, d] corresponds to original element at [b, n, h * head_dim + d]
+- transpose(1, 2) swaps axes 1 and 2, so shape becomes (B, num_heads, N, head_dim)
+- Element [b, h, n, d] corresponds to the original [b, n, h * head_dim + d]
+
+So the mapping is:
+- Original: input[b, n, h * head_dim + d]
+- After view+transpose: q[b, h, n, d]
+
+Now in my kernel, I compute:
+```cpp
+int out_idx = h * head_dim + d;
+q_val = sum_{i} norm[i] * q_weight[out_idx * D + i]
+```
+And store at:
+```cpp
+int out_offset = b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + d;
+```
+
+Let me verify this indexing:
+- For tensor shape (B, num_heads, N, head_dim)
+- Linear index for [b, h, n, d] should be: b * (num_heads * N * head_dim) + h * (N * head_dim) + n * head_dim + d
+
+That matches my formula! So the indexing should be correct.
+
+Let me check the rel_mlp kernel more carefully. The reference does:
+```python
+rel_bias = self.rel_mlp(pair_feats).permute(0, 3, 1, 2)
+```
+
+rel_mlp(pair_feats) produces shape (B, N, N, num_heads). Then permute(0, 3, 1, 2) gives (B, num_heads, N, N).
+
+So rel_mlp is:
+- Input: pair_feats of shape (B, N, N, P)
+- First linear: (P,) @ (P, P) -&gt; (P,)  -- the weight is (P, P) meaning out_features=P, in_features=P
+- SiLU activation
+- Second linear: (P,) @ (P, num_heads) -&gt; (num_heads,) -- the weight is (num_heads, P) meaning out_features=num_heads, in_features=P
+
+Wait, I need to check the linear weight shapes in PyTorch. In nn.Linear(in_features, out_features), the weight has shape (out_features, in_features).
+
+So for rel_mlp:
+- First layer: nn.Linear(pair_dim, pair_dim), weight shape is (pair_dim, pair_dim) = (P, P)
+- Second layer: nn.Linear(pair_dim, num_heads), weight shape is (num_heads, pair_dim) = (num_heads, P)
+
+So the computation is:
+- After first linear: (B, N, N, P) @ (P, P)^T = (B, N, N, P) ... wait, let me think about this more carefully.
+
+For a linear layer y = Linear(x) with weight W of shape (out_features, in_features):
+y = x @ W.T
+or equivalently, y[i] = sum_j x[j] * W[out_idx, j]
+
+So for the first linear:
+- Input x of shape (..., P) where ... = (B, N, N)
+- Output y of shape (..., P)
+- y[..., p] = sum_{k} x[..., k] * w1[p, k]
+
+This is what I have in my kernel: `val += pair_ptr[k] * w1[p * P + k]`. That looks correct.
+
+For the second linear:
+- Input of shape (..., P)
+- Output of shape (..., num_heads)
+- y[..., h] = sum_{p} x[..., p] * w2[h, p]
+
+In my kernel: `out_val += intermediate[p] * w2[h * P + p]`. That also looks correct.
+
+Hmm, let me check if there&#x27;s an issue with the block_reduce_max function. Maybe the issue is that not all threads participate in the reduction.
+
+In my attention kernel:
+```cpp
+float local_max = -FLT_MAX;
+for (int j = threadIdx.x; j &lt; N; j += blockDim.x) {
+    ...
+    local_max = fmaxf(local_max, logits[j]);
+}
+```
+
+With N=24 and BLOCK_SIZE=256, each thread computes j = threadIdx.x only (since 24 &lt; 256). So most threads don&#x27;t compute any logits and their local_max stays at -FLT_MAX.
+
+This is fine because block_reduce_max should handle this. The max of valid values and -FLT_MAX values will be the max of the valid values.
+
+But wait, there&#x27;s a subtle issue. After the loop, threads with threadIdx.x &gt;= N don&#x27;t write to logits[j]. So logits[j] for j &gt;= N is undefined!
+
+But since N=24 and I allocate shared memory of size N=24, indices j &gt;= N are out of bounds anyway. And the loop only touches j in [0, N), so this should be fine.
+
+Actually, let me check again:
+```cpp
+extern __shared__ float logits[];
+```
+
+This allocates exactly `attn_smem = N * sizeof(float)` bytes. So logits has exactly N elements. The loop `for (int j = threadIdx.x; j &lt; N; j += blockDim.x)` only accesses indices j in [0, N), which is within bounds.
+
+But wait, what about threads that don&#x27;t participate in the loop? They don&#x27;t initialize `local_max` from logits, but they do participate in block_reduce_max with their initialized value of -FLT_MAX.
+
+Actually, I just realized the issue might be in how block_reduce_max works. Let me trace through it:
+
+1. Each thread has a `val` (local_max)
+2. warp_reduce_max: for a warp of 32 threads, reduces to thread 0 of the warp
+3. Threads with lane=0 store their warp&#x27;s max in shared[wid]
+4. __syncthreads() to ensure all writes are visible
+5. Threads with wid=0 read from shared and do another warp_reduce_max
+6. __syncthreads() to ensure all threads see the result
+
+But the problem is: the second __syncthreads() doesn&#x27;t return the max value to all threads! After step 5, only threads with wid=0 (i.e., threads 0-31) have the final max value in `val`. Other threads still have their old `val`.
+
+Actually, looking more carefully at my code:
+```cpp
+float max_logit = block_reduce_max(local_max);
+__shared__ float max_logit_shared;
+if (threadIdx.x == 0) {
+    max_logit_shared = max_logit;
+}
+__syncthreads();
+max_logit = max_logit_shared;
+```
+
+I&#x27;m using `max_logit` which is the return value of `block_reduce_max`. But the return value of `block_reduce_max` is only correct for thread 0! For other threads, it&#x27;s their partial result.
+
+Wait no, let me look at block_reduce_max again:
+```cpp
+__device__ __forceinline__ float block_reduce_max(float val) {
+    ...
+    if (wid == 0) {
+        val = (lane &lt; (BLOCK_SIZE + 31) / 32) ? shared[lane] : -FLT_MAX;
+        val = warp_reduce_max(val);
+    }
+    __syncthreads();
+    
+    return val;
+}
+```
+
+After this function, only threads in wid=0 have the correct max. Other threads have garbage. So I need to broadcast the result!
+
+Actually, the issue is that after block_reduce_max, I assign to `max_logit_shared` from thread 0, then read from all threads. This should work because thread 0 has the correct value.
+
+Hmm, but let me trace through more carefully for a small example:
+- BLOCK_SIZE = 256, so 8 warps
+- Threads 0-31 are wid=0, threads 32-63 are wid=1, etc.
+- After step 3 (storing to shared), thread 0 stores the max of warp 0, thread 32 stores the max of warp 1, etc.
+- In step 5, only threads 0-31 (wid=0) read from shared. Thread 0 reads shared[0] (max of warp 0), thread 1 reads shared[1] (max of warp 1), etc.
+- Then warp_reduce_max reduces these to thread 0.
+
+So after block_reduce_max:
+- Thread 0 has the correct global max
+- Threads 1-255 have undefined values (their old val or intermediate results)
+
+In my code:
+```cpp
+float max_logit = block_reduce_max(local_max);
+__shared__ float max_logit_shared;
+if (threadIdx.x == 0) {
+    max_logit_shared = max_logit;  // Thread 0 writes the correct max
+}
+__syncthreads();
+max_logit = max_logit_shared;  // All threads read the correct max
+```
+
+This should work! Thread 0 writes the correct max to shared memory, then all threads read it.
+
+OK let me look at other potential issues. The softmax computation:
+```cpp
+float sum_exp = 0.0f;
+for (int j = threadIdx.x; j &lt; N; j += blockDim.x) {
+    logits[j] = expf(logits[j] - max_logit);
+    sum_exp += logits[j];
+}
+```
+
+This looks correct. Then:
+```cpp
+sum_exp = block_reduce_sum(sum_exp);
+__shared__ float sum_exp_shared;
+if (threadIdx.x == 0) {
+    sum_exp_shared = sum_exp;
+}
+__syncthreads();
+float inv_sum = 1.0f / (sum_exp_shared + 1e-10f);
+```
+
+Same pattern as max_logit. Should work.
+
+Wait, but there&#x27;s an issue! The logits shared memory contains the original QK values. I&#x27;m overwriting them with exp(logits - max). This is correct, but I need to make sure the overwrite is complete before reading.
+
+Actually, the __syncthreads() in block_reduce_sum ensures all threads have finished writing. Then the broadcast should work.
+
+Let me look at the value aggregation:
+```cpp
+for (int d = threadIdx.x; d &lt; head_dim; d += blockDim.x) {
+    float out_val = 0.0f;
+    for (int j = 0; j &lt; N; ++j) {
+        float attn_weight = logits[j] * inv_sum;
+        ...
+    }
+}
+```
+
+This iterates over all j from 0 to N. But the logits array was only filled by threads with threadIdx.x &lt; N. Threads with threadIdx.x &gt;= N didn&#x27;t write to logits, so their logits entries are undefined!
+
+That&#x27;s the bug! When N=24 and BLOCK_SIZE=256:
+- Threads 0-23 compute logits[j] for j=0-23
+- Threads 24-255 don&#x27;t compute any logits
+- But all threads read logits[j] in the value aggregation loop!
+
+Wait, actually let me look at the value aggregation loop more carefully:
+```cpp
+for (int d = threadIdx.x; d &lt; head_dim; d += blockDim.x) {
+```
+
+With head_dim=24 and BLOCK_SIZE=256, each thread computes one d value. So thread 0 computes d=0, thread 1 computes d=1, ..., thread 23 computes d=23. Threads 24-255 don&#x27;t compute any d values.
+
+But even for threads that compute d values, they all read from logits[j] for j in [0, N). The issue is that logits[j] was only written by threads 0-23 in the softmax loop.
+
+But wait, the __syncthreads() before the value aggregation should ensure all writes are visible! Let me check the sequence:
+1. Softmax computation loop: threads 0-23 write to logits[0-23]
+2. block_reduce_sum: has __syncthreads() inside
+3. Broadcast sum_exp: has __syncthreads()
+4. Value aggregation loop: all threads read logits
+
+After step 3, the __syncthreads() ensures all previous writes (from step 1) are visible to all threads. So the value aggregation should see the correct logits.
+
+Hmm, unless the issue is that block_reduce_sum has a __syncthreads() at the end, but threads 24-255 never enter the softmax loop, so their `sum_exp` is 0. Then the reduction might be wrong?
+
+Let me trace block_reduce_sum:
+1. Threads 0-23 have sum_exp from the softmax loop, threads 24-255 have sum_exp=0
+2. warp_reduce_sum: for each warp, reduces to lane 0
+3. For warp 0 (threads 0-31): lane 0 (thread 0) gets the sum of all 32 thread values
+   - But threads 0-23 have their softmax contributions, threads 24-31 have 0
+   - So thread 0 correctly gets the sum of threads 0-23&#x27;s contributions
+4. For warps 1-7: all threads have sum_exp=0, so lane 0 (threads 32, 64, etc.) gets 0
+5. Threads with lane=0 store their warp&#x27;s sum in shared[wid]
+6. wid=0 threads read from shared and reduce: thread 0 gets the total sum
+
+This should work correctly!
+
+Let me think about other issues...
+
+Actually, wait. I just noticed that my block_reduce_max function has a __syncthreads() at the end, but the issue is that only threads with wid=0 have the correct max value after the function. For all other threads, `val` is undefined (or rather, it&#x27;s whatever they computed locally).
+
+In my attention kernel:
+```cpp
+float max_logit = block_reduce_max(local_max);
+```
+
+After this call:
+- Thread 0 has max_logit = global max
+- Threads 1-255 have max_logit = their local_max or intermediate value
+
+Then:
+```cpp
+if (threadIdx.x == 0) {
+    max_logit_shared = max_logit;  // Thread 0 writes correct max
+}
+```
+
+This should work because only thread 0 writes.
+
+```cpp
+__syncthreads();
+max_logit = max_logit_shared;
+```
+
+All threads read the correct max.
+
+OK, so this logic should be fine.
+
+Let me think about what else could be different...
+
+Actually, I wonder if there&#x27;s a floating-point precision issue. The reference uses float32, and I&#x27;m using float throughout. But maybe the order of operations is different?
+
+Or maybe there&#x27;s an issue with the output projection kernel. Let me check:
+```cpp
+for (int i = 0; i &lt; D; ++i) {
+    int h = i / head_dim;
+    int hd = i % head_dim;
+    int attn_offset = b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + hd;
+    proj_val += static_cast&lt;float&gt;(attn_out[attn_offset]) * static_cast&lt;float&gt;(out_weight[d * D + i]);
+}
+```
+
+This iterates i from 0 to D-1, computing the linear projection. The output projection weight has shape (D, D), and the computation is:
+y[d] = sum_{i} attn[i] * weight[d, i]
+
+This should be correct.
+
+Hmm, let me try a different approach. Let me trace through a single element computation manually.
+
+For the attention computation, after layer norm and Q/K/V projection:
+- q[b, h, n, d] = sum_{i} norm[b, n, i] * q_weight[h * head_dim + d, i]
+
+In the reference:
+- h = layer_norm(nodes) produces h[b, n, i]
+- q = q_proj(h) produces q_proj[b, n, d&#x27;] where d&#x27; in [0, D)
+- q = q.view(B, N, num_heads, head_dim).transpose(1, 2)
+- q[b, h, n, d] = q_proj[b, n, h * head_dim + d]
+
+So q[b, h, n, d] = sum_{i} h[b, n, i] * q_weight[h * head_dim + d, i]
+
+This matches my kernel!
+
+Let me check the rel_mlp output. The reference does:
+```python
+rel_bias = self.rel_mlp(pair_feats).permute(0, 3, 1, 2)
+```
+
+Let me trace through:
+- pair_feats has shape (B, N, N, P)
+- rel_mlp[0] is Linear(P, P) with weight w1 of shape (P, P)
+- rel_mlp[0](pair_feats) has shape (B, N, N, P), computed as pair_feats @ w1.T
+- Then SiLU activation
+- rel_mlp[2] is Linear(P, num_heads) with weight w2 of shape (num_heads, P)
+- rel_mlp[2](silu_out) has shape (B, N, N, num_heads), computed as silu_out @ w2.T
+- permute(0, 3, 1, 2) gives shape (B, num_heads, N, N)
+
+In my kernel:
+- intermediate[p] = sum_k pair_feats[k] * w1[p, k]
+- out_val[h] = sum_p intermediate[p] * w2[h, p]
+
+This is equivalent to:
+- intermediate = pair_feats @ w1.T (correct)
+- out_val = intermediate @ w2.T (correct)
+
+And the output is stored at rel_bias[b, h, i, j], which matches the permuted layout.
+
+OK so the rel_mlp should be correct.
+
+Let me verify the attention logits:
+- Reference: logits = q @ k.T * scale + rel_bias
+- My kernel: computes qk = qk * scale + rel_bias
+
+The qk computation is:
+```cpp
+for (int d = 0; d &lt; head_dim; ++d) {
+    qk += q[q_offset + d] * k[k_offset + d];
+}
+```
+
+This computes dot(q, k), not dot(q, k.T). Wait, but q has shape (B, H, N, head_dim) and k has shape (B, H, N, head_dim). The reference computes:
+```python
+logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+```
+
+This computes q @ k.T, which is (B, H, N, head_dim) @ (B, H, head_dim, N) = (B, H, N, N).
+
+So for a specific (b, h, i, j) position:
+logits[b, h, i, j] = sum_d q[b, h, i, d] * k[b, h, j, d] * scale
+
+In my kernel:
+```cpp
+int q_offset = b * num_heads * N * head_dim + h * N * head_dim + i * head_dim;
+int k_offset = b * num_heads * N * head_dim + h * N * head_dim + j * head_dim;
+qk = 0;
+for (int d = 0; d &lt; head_dim; ++d) {
+    qk += q[q_offset + d] * k[k_offset + d];
+}
+```
+
+q_offset points to q[b, h, i, :]
+k_offset points to k[b, h, j, :]
+
+So qk = sum_d q[b, h, i, d] * k[b, h, j, d], which is correct!
+
+Hmm, so all the computations seem correct. Let me check if there might be an issue with the shared memory sizes.
+
+For the attention kernel, I allocate `attn_smem = N * sizeof(float)` for the logits. With N=24, this is 24 * 4 = 96 bytes. This should fit fine in shared memory.
+
+For the block_reduce functions, I use `__shared__ float shared[32]` which is 128 bytes. This is separate from the dynamic shared memory.
+
+Actually wait, there might be a conflict! In CUDA, when you have multiple __shared__ declarations (static or dynamic), they all occupy the same shared memory region. The static shared memory starts at the beginning of the shared memory space, and the dynamic shared memory starts after it.
+
+So the layout might be:
+- shared[32] from block_reduce_max (128 bytes)
+- shared[32] from block_reduce_sum (but these might overlap with the first!)
+
+This is a problem! The two __shared__ declarations in the device functions might alias!
+
+Actually, in CUDA, device functions with __shared__ variables... hmm, I&#x27;m not sure how this works. Let me think...
+
+Actually, I think each __shared__ declaration in a function creates its own shared memory allocation. But if two functions are called from the same kernel, their shared memory might overlap.
+
+In my attention kernel, I call block_reduce_max first, then block_reduce_sum. The shared memory from both functions might overlap, but since I call them sequentially and each one has its own __syncthreads() to ensure completion before returning, this should be fine.
+
+But wait, there&#x27;s another issue. The block_reduce functions have __syncthreads() inside them. If not all threads call the function (due to early return or conditional), there could be a deadlock.
+
+In my attention kernel, all threads call block_reduce_max and block_reduce_sum. So this should be fine.
+
+Let me try a different approach: remove the device functions and inline the reductions directly.
+
+Actually, let me first try to simplify and debug. I&#x27;ll use a simpler version with a single reduction approach.
+
+Hmm, let me look at the actual differences. The max difference is around 0.5-2.5, and avg is around 0.08-0.45. These are relatively large errors for float32 computations.
+
+Could there be an issue with the edge mask? Let me check:
+- Reference: `logits = logits.masked_fill(edge_mask.unsqueeze(1) &lt; 0.5, float(&quot;-inf&quot;))`
+- This unsqueezes edge_mask from (B, N, N) to (B, 1, N, N), then broadcasts to (B, H, N, N)
+- My kernel: `float mask = edge_mask[b * N * N + i * N + j]; logits[j] = (mask &gt;= 0.5f) ? qk : -FLT_MAX;`
+
+The edge_mask indexing looks correct. Using -FLT_MAX instead of -INFINITY should produce the same softmax result (both will have exp(-inf) = 0).
+
+Actually wait, there&#x27;s a subtle issue. -FLT_MAX is not -infinity, it&#x27;s the most negative finite float. exp(-FLT_MAX) is essentially 0 but not exactly 0. -INFINITY would give exactly 0.
+
+But the reference uses Python&#x27;s float(&quot;-inf&quot;), which corresponds to C&#x27;s -INFINITY. Let me try using -INFINITY in my kernel.
+
+Actually, looking at my kernel, I use `-FLT_MAX` which is around -3.4e38. exp(-FLT_MAX) is essentially 0, so this should be fine.
+
+Let me think about what else could cause the discrepancy...
+
+Oh wait, I think I found the issue! Let me look at the block_reduce_max function again:
+
+```cpp
+__device__ __forceinline__ float block_reduce_max(float val) {
+    __shared__ float shared[32];
+    int lane = threadIdx.x &amp; 31;
+    int wid = threadIdx.x &gt;&gt; 5;
+    
+    val = warp_reduce_max(val);
+    
+    if (lane == 0) {
+        shared[wid] = val;
+    }
+    __syncthreads();
+    
+    if (wid == 0) {
+        val = (lane &lt; (BLOCK_SIZE + 31) / 32) ? shared[lane] : -FLT_MAX;
+        val = warp_reduce_max(val);
+    }
+    __syncthreads();
+    
+    return val;
+}
+```
+
+The issue is that after the second __syncthreads(), only threads with wid=0 have the correct max. Other threads still have their local warp max. But the return value is `val`, which is different for different threads!
+
+Actually, this is fine because I broadcast the value from thread 0 after the function call. Let me verify this is actually happening...
+
+In my kernel:
+```cpp
+float max_logit = block_reduce_max(local_max);
+__shared__ float max_logit_shared;
+if (threadIdx.x == 0) {
+    max_logit_shared = max_logit;
+}
+__syncthreads();
+max_logit = max_logit_shared;
+```
+
+Yes, I&#x27;m reading from thread 0 and broadcasting. This should work.
+
+Hmm, let me try a completely different approach. Let me simplify the attention kernel by using fewer threads per block and avoiding the complex reduction.
+
+Actually, let me first check if the error is systematic or random. If it&#x27;s systematic, maybe there&#x27;s an algorithmic issue. If it&#x27;s random (varies per trial), it could be a race condition or memory error.
+
+Looking at the error output:
+- Trial 1: max_diff=0.572483, avg_diff=0.113815
+- Trial 2: max_diff=0.559117, avg_diff=0.085687
+- Trial 3: max_diff=2.526847, avg_diff=0.455094
+
+The errors vary significantly across trials. This could indicate random initialization differences (since inputs are random), or it could indicate a race condition.
+
+Actually, the inputs are regenerated each trial, so the different errors could just be due to different inputs. The magnitude of the errors is concerning though.
+
+Let me try yet another approach: I&#x27;ll write the kernel with simpler, more explicit code, and avoid the device functions with their complex shared memory handling.
+</div></details><details><summary>call → run_correctness</summary><div class="block tool-args"><span class="role-tag">call</span><b>run_correctness</b>
+{
+  &quot;kernel_code&quot;: &quot;import math\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cuda_bf16.h&gt;\n#include &lt;vector&gt;\n#include &lt;cfloat&gt;\n\nconstexpr int BLOCK_SIZE = 256;\n\ntemplate &lt;typename scalar_t&gt;\n__device__ __forceinline__ scalar_t warp_reduce_sum(scalar_t val) {\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        val += __shfl_down_sync(0xffffffff, val, offset);\n    }\n    return val;\n}\n\n__device__ __forceinline__ float warp_reduce_max(float val) {\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));\n    }\n    return val;\n}\n\n// Block-wide reduce max\n__device__ __forceinline__ float block_reduce_max(float val) {\n    __shared__ float shared[32];  // One per warp\n    int lane = threadIdx.x &amp; 31;\n    int wid = threadIdx.x &gt;&gt; 5;\n    \n    val = warp_reduce_max(val);\n    \n    if (lane == 0) {\n        shared[wid] = val;\n    }\n    __syncthreads();\n    \n    if (wid == 0) {\n        val = (lane &lt; (BLOCK_SIZE + 31) / 32) ? shared[lane] : -FLT_MAX;\n        val = warp_reduce_max(val);\n    }\n    __syncthreads();\n    \n    return val;\n}\n\n// Block-wide reduce sum\n__device__ __forceinline__ float block_reduce_sum(float val) {\n    __shared__ float shared[32];\n    int lane = threadIdx.x &amp; 31;\n    int wid = threadIdx.x &gt;&gt; 5;\n    \n    val = warp_reduce_sum(val);\n    \n    if (lane == 0) {\n        shared[wid] = val;\n    }\n    __syncthreads();\n    \n    if (wid == 0) {\n        val = (lane &lt; (BLOCK_SIZE + 31) / 32) ? shared[lane] : 0.0f;\n        val = warp_reduce_sum(val);\n    }\n    __syncthreads();\n    \n    return val;\n}\n\n// Fused LayerNorm + Q/K/V projection kernel\ntemplate &lt;typename scalar_t&gt;\n__global__ void layernorm_qkv_kernel(\n    const scalar_t* __restrict__ input,      // (B, N, D)\n    const scalar_t* __restrict__ weight,     // (D,) for LayerNorm\n    const scalar_t* __restrict__ bias,       // (D,) for LayerNorm (can be null)\n    const scalar_t* __restrict__ q_weight,   // (D, D) - output_dim x input_dim\n    const scalar_t* __restrict__ k_weight,   // (D, D)\n    const scalar_t* __restrict__ v_weight,   // (D, D)\n    scalar_t* __restrict__ q_out,            // (B, num_heads, N, head_dim)\n    scalar_t* __restrict__ k_out,            // (B, num_heads, N, head_dim)\n    scalar_t* __restrict__ v_out,            // (B, num_heads, N, head_dim)\n    int B, int N, int D, int num_heads, int head_dim, float eps) {\n    \n    int b = blockIdx.y;\n    int n = blockIdx.x;\n    int tid = threadIdx.x;\n    \n    if (b &gt;= B || n &gt;= N) return;\n    \n    const scalar_t* input_ptr = input + (b * N + n) * D;\n    \n    // Compute mean\n    float sum = 0.0f;\n    for (int i = tid; i &lt; D; i += blockDim.x) {\n        sum += static_cast&lt;float&gt;(input_ptr[i]);\n    }\n    sum = block_reduce_sum(sum);\n    __shared__ float mean_shared;\n    if (tid == 0) {\n        mean_shared = sum / D;\n    }\n    __syncthreads();\n    float mean = mean_shared;\n    \n    // Compute variance\n    float var_sum = 0.0f;\n    for (int i = tid; i &lt; D; i += blockDim.x) {\n        float diff = static_cast&lt;float&gt;(input_ptr[i]) - mean;\n        var_sum += diff * diff;\n    }\n    var_sum = block_reduce_sum(var_sum);\n    __shared__ float var_shared;\n    if (tid == 0) {\n        var_shared = var_sum / D;\n    }\n    __syncthreads();\n    float inv_std = rsqrtf(var_shared + eps);\n    \n    // LayerNorm + store normalized values\n    extern __shared__ float norm_vals[];\n    for (int i = tid; i &lt; D; i += blockDim.x) {\n        float val = (static_cast&lt;float&gt;(input_ptr[i]) - mean) * inv_std;\n        float w = static_cast&lt;float&gt;(weight[i]);\n        float b = bias ? static_cast&lt;float&gt;(bias[i]) : 0.0f;\n        norm_vals[i] = val * w + b;\n    }\n    __syncthreads();\n    \n    // Q/K/V projections\n    for (int out_idx = tid; out_idx &lt; D; out_idx += blockDim.x) {\n        int h = out_idx / head_dim;\n        int d = out_idx % head_dim;\n        \n        float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;\n        for (int i = 0; i &lt; D; ++i) {\n            float norm_val = norm_vals[i];\n            q_val += norm_val * static_cast&lt;float&gt;(q_weight[out_idx * D + i]);\n            k_val += norm_val * static_cast&lt;float&gt;(k_weight[out_idx * D + i]);\n            v_val += norm_val * static_cast&lt;float&gt;(v_weight[out_idx * D + i]);\n        }\n        int out_offset = b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + d;\n        q_out[out_offset] = static_cast&lt;scalar_t&gt;(q_val);\n        k_out[out_offset] = static_cast&lt;scalar_t&gt;(k_val);\n        v_out[out_offset] = static_cast&lt;scalar_t&gt;(v_val);\n    }\n}\n\n// Rel MLP kernel: pair_feats (B, N, N, P) -&gt; rel_bias (B, H, N, N)\ntemplate &lt;typename scalar_t&gt;\n__global__ void rel_mlp_kernel(\n    const scalar_t* __restrict__ pair_feats,  // (B, N, N, P)\n    const scalar_t* __restrict__ w1,          // (P, P)\n    const scalar_t* __restrict__ w2,          // (num_heads, P)\n    scalar_t* __restrict__ rel_bias,          // (B, H, N, N)\n    int B, int N, int P, int num_heads) {\n    \n    int b = blockIdx.z;\n    int i = blockIdx.y;\n    int j = blockIdx.x;\n    int h = threadIdx.x;\n    \n    if (b &gt;= B || i &gt;= N || j &gt;= N || h &gt;= num_heads) return;\n    \n    const scalar_t* pair_ptr = pair_feats + (b * N * N + i * N + j) * P;\n    \n    // First linear + SiLU: shared intermediate values\n    extern __shared__ float intermediate[];\n    \n    // Each thread computes part of the first linear\n    for (int p = threadIdx.x; p &lt; P; p += blockDim.x) {\n        float val = 0.0f;\n        for (int k = 0; k &lt; P; ++k) {\n            val += static_cast&lt;float&gt;(pair_ptr[k]) * static_cast&lt;float&gt;(w1[p * P + k]);\n        }\n        // SiLU activation: x * sigmoid(x)\n        intermediate[p] = val * (1.0f / (1.0f + expf(-val)));\n    }\n    __syncthreads();\n    \n    // Second linear: each thread computes one output for its head\n    float out_val = 0.0f;\n    for (int p = 0; p &lt; P; ++p) {\n        out_val += intermediate[p] * static_cast&lt;float&gt;(w2[h * P + p]);\n    }\n    \n    // Store with permute: (b, h, i, j)\n    rel_bias[b * num_heads * N * N + h * N * N + i * N + j] = static_cast&lt;scalar_t&gt;(out_val);\n}\n\n// Attention kernel with edge mask\ntemplate &lt;typename scalar_t&gt;\n__global__ void attention_kernel(\n    const scalar_t* __restrict__ q,           // (B, H, N, head_dim)\n    const scalar_t* __restrict__ k,           // (B, H, N, head_dim)\n    const scalar_t* __restrict__ v,           // (B, H, N, head_dim)\n    const scalar_t* __restrict__ rel_bias,    // (B, H, N, N)\n    const float* __restrict__ edge_mask,      // (B, N, N)\n    scalar_t* __restrict__ out,               // (B, H, N, head_dim)\n    int B, int N, int num_heads, int head_dim, float scale) {\n    \n    int b = blockIdx.z;\n    int i = blockIdx.y;  // query index\n    int h = blockIdx.x;  // head index\n    \n    if (b &gt;= B || i &gt;= N || h &gt;= num_heads) return;\n    \n    int q_offset = b * num_heads * N * head_dim + h * N * head_dim + i * head_dim;\n    \n    // Compute attention logits for this (b, h, i) across all j\n    extern __shared__ float logits[];\n    float local_max = -FLT_MAX;\n    \n    for (int j = threadIdx.x; j &lt; N; j += blockDim.x) {\n        int k_offset = b * num_heads * N * head_dim + h * N * head_dim + j * head_dim;\n        \n        float qk = 0.0f;\n        for (int d = 0; d &lt; head_dim; ++d) {\n            qk += static_cast&lt;float&gt;(q[q_offset + d]) * static_cast&lt;float&gt;(k[k_offset + d]);\n        }\n        qk *= scale;\n        \n        // Add relative bias\n        int bias_offset = b * num_heads * N * N + h * N * N + i * N + j;\n        qk += static_cast&lt;float&gt;(rel_bias[bias_offset]);\n        \n        // Apply edge mask\n        float mask = edge_mask[b * N * N + i * N + j];\n        logits[j] = (mask &gt;= 0.5f) ? qk : -FLT_MAX;\n        local_max = fmaxf(local_max, logits[j]);\n    }\n    __syncthreads();\n    \n    // Reduce max_logit across threads\n    float max_logit = block_reduce_max(local_max);\n    __shared__ float max_logit_shared;\n    if (threadIdx.x == 0) {\n        max_logit_shared = max_logit;\n    }\n    __syncthreads();\n    max_logit = max_logit_shared;\n    \n    // Compute softmax\n    float sum_exp = 0.0f;\n    for (int j = threadIdx.x; j &lt; N; j += blockDim.x) {\n        logits[j] = expf(logits[j] - max_logit);\n        sum_exp += logits[j];\n    }\n    sum_exp = block_reduce_sum(sum_exp);\n    __shared__ float sum_exp_shared;\n    if (threadIdx.x == 0) {\n        sum_exp_shared = sum_exp;\n    }\n    __syncthreads();\n    float inv_sum = 1.0f / (sum_exp_shared + 1e-10f);\n    \n    // Compute weighted sum of values\n    for (int d = threadIdx.x; d &lt; head_dim; d += blockDim.x) {\n        float out_val = 0.0f;\n        for (int j = 0; j &lt; N; ++j) {\n            float attn_weight = logits[j] * inv_sum;\n            int v_offset = b * num_heads * N * head_dim + h * N * head_dim + j * head_dim;\n            out_val += attn_weight * static_cast&lt;float&gt;(v[v_offset + d]);\n        }\n        int out_offset = b * num_heads * N * head_dim + h * N * head_dim + i * head_dim;\n        out[out_offset] = static_cast&lt;scalar_t&gt;(out_val);\n    }\n}\n\n// Output projection and residual add kernel\ntemplate &lt;typename scalar_t&gt;\n__global__ void out_proj_residual_kernel(\n    const scalar_t* __restrict__ attn_out,    // (B, H, N, head_dim)\n    const scalar_t* __restrict__ out_weight,  // (D, D)\n    const scalar_t* __restrict__ nodes,      // (B, N, D)\n    scalar_t* __restrict__ result,           // (B, N, D)\n    int B, int N, int D, int num_heads, int head_dim) {\n    \n    int b = blockIdx.y;\n    int n = blockIdx.x;\n    int d = threadIdx.x;\n    \n    if (b &gt;= B || n &gt;= N || d &gt;= D) return;\n    \n    // Compute output projection\n    float proj_val = 0.0f;\n    for (int i = 0; i &lt; D; ++i) {\n        int h = i / head_dim;\n        int hd = i % head_dim;\n        int attn_offset = b * num_heads * N * head_dim + h * N * head_dim + n * head_dim + hd;\n        proj_val += static_cast&lt;float&gt;(attn_out[attn_offset]) * static_cast&lt;float&gt;(out_weight[d * D + i]);\n    }\n    \n    // Residual add\n    int nodes_offset = b * N * D + n * D;\n    result[nodes_offset + d] = static_cast&lt;scalar_t&gt;(static_cast&lt;float&gt;(nodes[nodes_offset + d]) + proj_val);\n}\n\ntorch::Tensor gfvla_forward(\n    torch::Tensor nodes,\n    torch::Tensor pair_feats,\n    torch::Tensor edge_mask,\n    torch::Tensor ln_weight,\n    torch::Tensor ln_bias,\n    torch::Tensor q_weight,\n    torch::Tensor k_weight,\n    torch::Tensor v_weight,\n    torch::Tensor rel_w1,\n    torch::Tensor rel_w2,\n    torch::Tensor out_weight,\n    int num_heads,\n    float eps) {\n    \n    int B = nodes.size(0);\n    int N = nodes.size(1);\n    int D = nodes.size(2);\n    int P = pair_feats.size(3);\n    int head_dim = D / num_heads;\n    float scale = 1.0f / sqrtf((float)head_dim);\n    \n    auto options = nodes.options();\n    auto q_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto k_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto v_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto rel_bias = torch::empty({B, num_heads, N, N}, options);\n    auto attn_out = torch::empty({B, num_heads, N, head_dim}, options);\n    auto result = torch::empty({B, N, D}, options);\n    \n    dim3 grid(N, B);\n    int smem = D * sizeof(float);\n    \n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;layernorm_qkv\&quot;, ([&amp;] {\n        layernorm_qkv_kernel&lt;scalar_t&gt;&lt;&lt;&lt;grid, BLOCK_SIZE, smem&gt;&gt;&gt;(\n            nodes.data_ptr&lt;scalar_t&gt;(),\n            ln_weight.data_ptr&lt;scalar_t&gt;(),\n            ln_bias.defined() ? ln_bias.data_ptr&lt;scalar_t&gt;() : nullptr,\n            q_weight.data_ptr&lt;scalar_t&gt;(),\n            k_weight.data_ptr&lt;scalar_t&gt;(),\n            v_weight.data_ptr&lt;scalar_t&gt;(),\n            q_out.data_ptr&lt;scalar_t&gt;(),\n            k_out.data_ptr&lt;scalar_t&gt;(),\n            v_out.data_ptr&lt;scalar_t&gt;(),\n            B, N, D, num_heads, head_dim, eps);\n    }));\n    \n    // Rel MLP kernel\n    dim3 rel_grid(N, N, B);\n    int rel_smem = P * sizeof(float);  // Just P floats for intermediate\n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;rel_mlp\&quot;, ([&amp;] {\n        rel_mlp_kernel&lt;scalar_t&gt;&lt;&lt;&lt;rel_grid, num_heads, rel_smem&gt;&gt;&gt;(\n            pair_feats.data_ptr&lt;scalar_t&gt;(),\n            rel_w1.data_ptr&lt;scalar_t&gt;(),\n            rel_w2.data_ptr&lt;scalar_t&gt;(),\n            rel_bias.data_ptr&lt;scalar_t&gt;(),\n            B, N, P, num_heads);\n    }));\n    \n    // Attention kernel\n    dim3 attn_grid(num_heads, N, B);\n    int attn_smem = N * sizeof(float);\n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;attention\&quot;, ([&amp;] {\n        attention_kernel&lt;scalar_t&gt;&lt;&lt;&lt;attn_grid, BLOCK_SIZE, attn_smem&gt;&gt;&gt;(\n            q_out.data_ptr&lt;scalar_t&gt;(),\n            k_out.data_ptr&lt;scalar_t&gt;(),\n            v_out.data_ptr&lt;scalar_t&gt;(),\n            rel_bias.data_ptr&lt;scalar_t&gt;(),\n            edge_mask.data_ptr&lt;float&gt;(),\n            attn_out.data_ptr&lt;scalar_t&gt;(),\n            B, N, num_heads, head_dim, scale);\n    }));\n    \n    // Output projection and residual\n    dim3 out_grid(N, B);\n    AT_DISPATCH_FLOATING_TYPES(nodes.scalar_type(), \&quot;out_proj_residual\&quot;, ([&amp;] {\n        out_proj_residual_kernel&lt;scalar_t&gt;&lt;&lt;&lt;out_grid, D, 0&gt;&gt;&gt;(\n            attn_out.data_ptr&lt;scalar_t&gt;(),\n            out_weight.data_ptr&lt;scalar_t&gt;(),\n            nodes.data_ptr&lt;scalar_t&gt;(),\n            result.data_ptr&lt;scalar_t&gt;(),\n            B, N, D, num_heads, head_dim);\n    }));\n    \n    return result;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor gfvla_forward(\n    torch::Tensor nodes,\n    torch::Tensor pair_feats,\n    torch::Tensor edge_mask,\n    torch::Tensor ln_weight,\n    torch::Tensor ln_bias,\n    torch::Tensor q_weight,\n    torch::Tensor k_weight,\n    torch::Tensor v_weight,\n    torch::Tensor rel_w1,\n    torch::Tensor rel_w2,\n    torch::Tensor out_weight,\n    int num_heads,\n    float eps);\n\&quot;\&quot;\&quot;\n\ngfvla_module = load_inline(\n    name=\&quot;gfvla_module\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[\&quot;gfvla_forward\&quot;],\n    verbose=True,\n    extra_cuda_cflags=[\&quot;-O3\&quot;],\n)\n\nimport torch.nn as nn\nimport math\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim: int, pair_dim: int, num_heads: int):\n        super().__init__()\n        self.dim = dim\n        self.pair_dim = pair_dim\n        self.num_heads = num_heads\n        self.head_dim = dim // num_heads\n        \n        # Create parameters same as reference\n        self.norm = nn.LayerNorm(dim)\n        self.q_proj = nn.Linear(dim, dim, bias=False)\n        self.k_proj = nn.Linear(dim, dim, bias=False)\n        self.v_proj = nn.Linear(dim, dim, bias=False)\n        self.rel_mlp = nn.Sequential(\n            nn.Linear(pair_dim, pair_dim),\n            nn.SiLU(),\n            nn.Linear(pair_dim, num_heads),\n        )\n        self.out_proj = nn.Linear(dim, dim, bias=False)\n        \n        # Register for easy access\n        self.eps = 1e-5\n\n    def forward(self, nodes: torch.Tensor, pair_feats: torch.Tensor, edge_mask: torch.Tensor) -&gt; torch.Tensor:\n        # Ensure contiguous\n        nodes = nodes.contiguous()\n        pair_feats = pair_feats.contiguous()\n        edge_mask = edge_mask.contiguous()\n        \n        result = gfvla_module.gfvla_forward(\n            nodes,\n            pair_feats,\n            edge_mask,\n            self.norm.weight,\n            self.norm.bias,\n            self.q_proj.weight,\n            self.k_proj.weight,\n            self.v_proj.weight,\n            self.rel_mlp[0].weight,\n            self.rel_mlp[2].weight,\n            self.out_proj.weight,\n            self.num_heads,\n            self.eps,\n        )\n        return result&quot;
+}</div></details><details open><summary>result ← run_correctness (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>run_correctness</b>
+run_correctness FAILED: (0 / 3) trials did not all match.
+correctness_issue: Output mismatch
+max_difference: [&#x27;0.565297&#x27;, &#x27;0.524978&#x27;, &#x27;2.547038&#x27;]
+avg_difference: [&#x27;0.113427&#x27;, &#x27;0.084145&#x27;, &#x27;0.454677&#x27;]</div></details></div></details></div>
 </body></html>
