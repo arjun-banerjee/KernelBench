@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 16</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 17:08:09 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 16</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 17:09:49 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">16_DeepSeekMoECombineScatter.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 12</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">1686</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 12</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">7837</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -106,5 +106,116 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 92.3s turn · 13.2s LLM · tokens in=1,766 · out=1,442 · total=3,208 · 7,228 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>92.3s turn · 13.2s LLM · 79.1s tools · <span class="turn-tokens">tokens in=1,766 · out=1,442 · total=3,208</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me write the CUDA kernel for this operation. The task is a scatter-add with scaling:
+- `out[token_idx[row]] += gates[row] * expert_hidden[row]`
+
+This is essentially a gather-scatter operation with weights. I need to handle atomic adds since multiple rows may map to the same token (fanout=2 means each token has 2 expert contributions).
+
+Let me write the kernel:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;c10/cuda/CUDAStream.h&gt;
+
+template &lt;typename scalar_t&gt;
+__global__ void scatter_add_kernel(
+    const scalar_t* __restrict__ expert_hidden,
+    const int* __restrict__ token_idx,
+    const scalar_t* __restrict__ gates,
+    scalar_t* __restrict__ out,
+    int num_rows,
+    int hidden_dim) {
+    
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= num_rows) return;
+    
+    int token = token_idx[row];
+    scalar_t gate = gates[row];
+    const scalar_t* src = expert_hidden + row * hidden_dim;
+    scalar_t* dst = out + token * hidden_dim;
+    
+    for (int i = 0; i &lt; hidden_dim; i++) {
+        atomicAdd(&amp;dst[i], gate * src[i]);
+    }
+}
+
+torch::Tensor scatter_add_cuda(
+    torch::Tensor expert_hidden,
+    torch::Tensor token_idx,
+    torch::Tensor gates,
+    int num_tokens) {
+    
+    int num_rows = expert_hidden.size(0);
+    int hidden_dim = expert_hidden.size(1);
+    
+    auto out = torch::zeros({num_tokens, hidden_dim}, expert_hidden.options());
+    
+    const int threads = 256;
+    const int blocks = (num_rows + threads - 1) / threads;
+    
+    AT_DISPATCH_FLOATING_TYPES(expert_hidden.scalar_type(), &quot;scatter_add_kernel&quot;, ([&amp;] {
+        scatter_add_kernel&lt;scalar_t&gt;&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+            expert_hidden.data_ptr&lt;scalar_t&gt;(),
+            token_idx.data_ptr&lt;int&gt;(),
+            gates.data_ptr&lt;scalar_t&gt;(),
+            out.data_ptr&lt;scalar_t&gt;(),
+            num_rows,
+            hidden_dim);
+    }));
+    
+    return out;
+}
+&quot;&quot;&quot;
+
+cpp_source = &quot;torch::Tensor scatter_add_cuda(torch::Tensor expert_hidden, torch::Tensor token_idx, torch::Tensor gates, int num_tokens);&quot;
+
+scatter_ops = load_inline(
+    name=&#x27;scatter_ops&#x27;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&#x27;scatter_add_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, expert_hidden, token_idx, gates, num_tokens):
+        return scatter_ops.scatter_add_cuda(expert_hidden, token_idx, gates, num_tokens)
+```
+
+But wait, this has an issue - the atomic add approach is going to be slow because we have many threads potentially writing to the same output location. With fanout=2 and 1536 tokens, each token receives exactly 2 contributions.
+
+Let me think about a better approach. Since each token has exactly `fanout` contributions, we could potentially use a different strategy. But the problem is that we don&#x27;t know fanout at compile time, and the mapping could be arbitrary.
+
+Actually, looking at the reference code more carefully:
+- `token_idx = torch.arange(num_tokens, dtype=torch.int32).repeat_interleave(fanout)` 
+- This means token 0 gets rows 0 and 1, token 1 gets rows 2 and 3, etc.
+- So the pattern is: rows 2*i and 2*i+1 both go to token i (with fanout=2)
+
+But this is just the test data - the kernel should work for any valid token_idx.
+
+Let me try the atomic approach first and see if it works, then optimize:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me analyze this problem. It&#x27;s a scatter-add operation where expert outputs are combined back into token-major order with scaling by routing weights. Each token can receive multiple contributions, so we need atomic operations or careful handling.
+
+Let me start with a straightforward CUDA kernel:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\ntemplate &lt;typename scalar_t&gt;\n__global__ void scatter_add_kernel(\n    const scalar_t* __restrict__ expert_hidden,\n    const int* __restrict__ token_idx,\n    const scalar_t* __restrict__ gates,\n    scalar_t* __restrict__ out,\n    int num_rows,\n    int hidden_dim) {\n    \n    int row = blockIdx.x * blockDim.x + threadIdx.x;\n    if (row &gt;= num_rows) return;\n    \n    int token = token_idx[row];\n    scalar_t gate = gates[row];\n    const scalar_t* src = expert_hidden + row * hidden_dim;\n    scalar_t* dst = out + token * hidden_dim;\n    \n    for (int i = 0; i &lt; hidden_dim; i++) {\n        atomicAdd(&amp;dst[i], gate * src[i]);\n    }\n}\n\ntorch::Tensor scatter_add_cuda(\n    torch::Tensor expert_hidden,\n    torch::Tensor token_idx,\n    torch::Tensor gates,\n    int64_t num_tokens) {\n    \n    int64_t num_rows = expert_hidden.size(0);\n    int64_t hidden_dim = expert_hidden.size(1);\n    \n    auto out = torch::zeros({num_tokens, hidden_dim}, expert_hidden.options());\n    \n    const int threads = 256;\n    const int blocks = (num_rows + threads - 1) / threads;\n    \n    AT_DISPATCH_FLOATING_TYPES(expert_hidden.scalar_type(), \&quot;scatter_add_kernel\&quot;, ([&amp;] {\n        scatter_add_kernel&lt;scalar_t&gt;&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(\n            expert_hidden.data_ptr&lt;scalar_t&gt;(),\n            token_idx.data_ptr&lt;int&gt;(),\n            gates.data_ptr&lt;scalar_t&gt;(),\n            out.data_ptr&lt;scalar_t&gt;(),\n            num_rows,\n            hidden_dim);\n    }));\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;torch::Tensor scatter_add_cuda(torch::Tensor expert_hidden, torch::Tensor token_idx, torch::Tensor gates, int64_t num_tokens);\&quot;\n\nscatter_ops = load_inline(\n    name=&#x27;scatter_ops_v1&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;scatter_add_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=False\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, expert_hidden, token_idx, gates, num_tokens):\n        return scatter_ops.scatter_add_cuda(expert_hidden, token_idx, gates, num_tokens)&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>20.8s turn · 5.6s LLM · 15.2s tools · <span class="turn-tokens">tokens in=2,381 · out=562 · total=2,943</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Good, the kernel compiled. Now let me check correctness.
+</div></details><details><summary>call → run_correctness</summary><div class="block tool-args"><span class="role-tag">call</span><b>run_correctness</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\ntemplate &lt;typename scalar_t&gt;\n__global__ void scatter_add_kernel(\n    const scalar_t* __restrict__ expert_hidden,\n    const int* __restrict__ token_idx,\n    const scalar_t* __restrict__ gates,\n    scalar_t* __restrict__ out,\n    int num_rows,\n    int hidden_dim) {\n    \n    int row = blockIdx.x * blockDim.x + threadIdx.x;\n    if (row &gt;= num_rows) return;\n    \n    int token = token_idx[row];\n    scalar_t gate = gates[row];\n    const scalar_t* src = expert_hidden + row * hidden_dim;\n    scalar_t* dst = out + token * hidden_dim;\n    \n    for (int i = 0; i &lt; hidden_dim; i++) {\n        atomicAdd(&amp;dst[i], gate * src[i]);\n    }\n}\n\ntorch::Tensor scatter_add_cuda(\n    torch::Tensor expert_hidden,\n    torch::Tensor token_idx,\n    torch::Tensor gates,\n    int64_t num_tokens) {\n    \n    int64_t num_rows = expert_hidden.size(0);\n    int64_t hidden_dim = expert_hidden.size(1);\n    \n    auto out = torch::zeros({num_tokens, hidden_dim}, expert_hidden.options());\n    \n    const int threads = 256;\n    const int blocks = (num_rows + threads - 1) / threads;\n    \n    AT_DISPATCH_FLOATING_TYPES(expert_hidden.scalar_type(), \&quot;scatter_add_kernel\&quot;, ([&amp;] {\n        scatter_add_kernel&lt;scalar_t&gt;&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(\n            expert_hidden.data_ptr&lt;scalar_t&gt;(),\n            token_idx.data_ptr&lt;int&gt;(),\n            gates.data_ptr&lt;scalar_t&gt;(),\n            out.data_ptr&lt;scalar_t&gt;(),\n            num_rows,\n            hidden_dim);\n    }));\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;torch::Tensor scatter_add_cuda(torch::Tensor expert_hidden, torch::Tensor token_idx, torch::Tensor gates, int64_t num_tokens);\&quot;\n\nscatter_ops = load_inline(\n    name=&#x27;scatter_ops_v1&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;scatter_add_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=False\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, expert_hidden, token_idx, gates, num_tokens):\n        return scatter_ops.scatter_add_cuda(expert_hidden, token_idx, gates, num_tokens)&quot;
+}</div></details><details open><summary>result ← run_correctness (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>run_correctness</b>
+run_correctness FAILED: ? trials did not all match.
+runtime_error: expected scalar type Int but found Float</div></details></div></div>
 </body></html>
