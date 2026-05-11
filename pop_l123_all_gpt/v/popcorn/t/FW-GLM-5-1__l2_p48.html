@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 48</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 20:44:42 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 48</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 20:46:46 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">48_ParticleFilter.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">3005</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">11408</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -193,5 +193,347 @@ Device: NVIDIA H100 80GB HBM3
 
 Ridge point (FP32): 20.12 FLOPs/byte
   Kernels with arithmetic intensity below the ridge point are
-  memory-bound; above it they are compute-bound.</div></details></div></div>
+  memory-bound; above it they are compute-bound.</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 500.2s turn · 52.2s LLM · tokens in=3,015 · out=5,388 · total=8,403 · 21,209 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>500.2s turn · 52.2s LLM · 448.0s tools · <span class="turn-tokens">tokens in=3,015 · out=5,388 · total=8,403</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Great, H100 with 67 TFLOPS FP32 and 3.35 TB/s memory bandwidth. The ridge point is 20.12 FLOPs/byte.
+
+Let me think about the kernel design:
+
+1. **Predict step**: `pred = particles @ A.T + process_noise * randn_like(particles)`
+   - Matrix multiply: (B, P, D) @ (D, D) -&gt; (B, P, D)
+   - This is relatively small: B=16, P=1024, D=4
+   - A is 4x4, so it&#x27;s tiny
+
+2. **Weight computation**: `obs_pred = pred @ C.T` (C is obs_dim x state_dim = 2x4)
+   - diff = observation.unsqueeze(1) - obs_pred (broadcasting)
+   - log_lik = -0.5 * (diff ** 2).sum(-1) / obs_noise^2
+
+3. **Logsumexp normalization**: Need a warp/block reduction
+
+4. **Systematic resampling**: 
+   - weights = exp(new_log_w)
+   - cumsum
+   - Generate u = (arange(P) + rand(B, 1)) / P
+   - searchsorted to find indices
+   - Gather particles
+
+Key considerations:
+- P=1024 particles - this fits nicely in a block (1024 threads)
+- D=4 is small, so each thread handles one particle
+- Batch dimension can be handled by separate blocks or separate kernels
+
+For the systematic resampling, I need:
+1. Compute weights from log_weights
+2. Cumulative sum (prefix sum)
+3. Generate uniform random numbers
+4. Binary search for indices
+5. Gather particles
+
+The main challenge is the prefix sum and searchsorted operations.
+
+Let me design a kernel that:
+1. Uses one block per batch element
+2. Each thread handles one particle
+3. Uses shared memory for intermediate results
+
+Actually, let me think more carefully. The problem dimensions are:
+- B=16 (batch)
+- P=1024 (particles)
+- D=4 (state dim)
+- obs_dim=2
+
+So total particles = 16 * 1024 = 16384, which is small.
+
+For the predict step (matrix multiply):
+- particles: (16, 1024, 4)
+- A: (4, 4)
+- Result: (16, 1024, 4)
+
+This is a small GEMM. I can use a simple approach where each thread handles one particle and does the full matvec.
+
+For weight computation:
+- pred @ C.T: (16, 1024, 4) @ (2, 4).T = (16, 1024, 2)
+- Then diff computation and likelihood
+
+For systematic resampling:
+- Need efficient prefix sum (can use warp-level primitives or shared memory)
+- Binary search for indices
+
+Let me start with a straightforward implementation and optimize later.
+
+Actually, for cuRAND, I need to handle random number generation. There are a few options:
+1. Use cuRAND library (device API)
+2. Use a simple XORWOW or Philox RNG
+3. Pass random numbers from host
+
+For simplicity, let me use a simple Philox-based RNG on the device.
+
+Let me write the kernel:
+
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;curand_kernel.h&gt;
+
+// Philox-based RNG
+__device__ float philox_rand(uint4 *state) {
+    // Simple implementation
+    state-&gt;x += 0x9E3779B9;
+    state-&gt;y += 0xBB67AE85;
+    
+    unsigned int k = state-&gt;x * 0x85EBCA6B;
+    unsigned int l = state-&gt;y * 0xC2B2AE35;
+    
+    return (float)(k ^ l) / (float)0xFFFFFFFF;
+}
+
+// ... kernel code
+```
+
+Actually, let me use a simpler approach. I&#x27;ll generate random numbers on the host and pass them to the kernel. Or better yet, use curand_kernel.h.
+
+Let me write the full kernel:
+
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;curand_kernel.h&gt;
+
+__global__ void particle_filter_kernel(
+    const float* particles,  // (B, P, D)
+    const float* log_weights, // (B, P)
+    const float* observation, // (B, obs_dim)
+    const float* A,  // (D, D)
+    const float* C,  // (obs_dim, D)
+    const float* randn_buffer, // (B, P, D) random numbers for process noise
+    const float* rand_u, // (B) random numbers for resampling
+    float* out_particles, // (B, P, D)
+    float* out_log_weights, // (B, P)
+    int B, int P, int D, int obs_dim,
+    float process_noise, float obs_noise
+) {
+    // Implementation
+}
+```
+
+Actually, I realize I should think about this more carefully. Let me write a simpler version first that uses PyTorch for random number generation and focuses on the core compute.
+
+For the random numbers, I can:
+1. Generate them on the CPU/host and pass to kernel
+2. Use cuRAND device API
+
+Let me try a hybrid approach: use PyTorch for RNG (since it&#x27;s fast and well-tested), and focus the CUDA kernel on the deterministic computations. Then I can gradually move more to CUDA.
+
+Actually, looking at the problem again, the main computational parts are:
+1. Matrix multiply (predict): particles @ A.T
+2. Observation prediction: pred @ C.T  
+3. Log likelihood computation
+4. Logsumexp reduction
+5. Prefix sum (cumsum)
+6. Binary search
+7. Gather (resampling)
+
+Parts 1-3 are straightforward. Part 4 (logsumexp) needs a reduction. Part 5 (prefix sum) is the trickiest. Parts 6-7 are straightforward.
+
+For a first implementation, let me:
+- Use PyTorch for random number generation
+- Implement the core computation in CUDA
+
+Wait, but if I use PyTorch for some parts, I lose the benefit of a single kernel launch. Let me think...
+
+Actually, the cleanest approach is:
+1. Generate all random numbers in a single tensor on GPU
+2. Launch a single kernel that does everything
+
+Let me write this kernel step by step.
+
+For curand, I need to initialize states. This can be done in a separate kernel or in the main kernel.
+
+Let me write a comprehensive kernel:
+
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;curand_kernel.h&gt;
+
+// Block size
+#define BLOCK_SIZE 256
+
+// Warp-level reduce max
+__device__ float warp_reduce_max(float val) {
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        val = max(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+    }
+    return val;
+}
+
+// Block-level reduce max
+__device__ float block_reduce_max(float val) {
+    static __shared__ float shared[32];
+    int lane = threadIdx.x % 32;
+    int wid = threadIdx.x / 32;
+    
+    val = warp_reduce_max(val);
+    
+    if (lane == 0) {
+        shared[wid] = val;
+    }
+    __syncthreads();
+    
+    if (wid == 0) {
+        val = lane &lt; (blockDim.x / 32) ? shared[lane] : -INFINITY;
+        val = warp_reduce_max(val);
+    }
+    return val;
+}
+
+// Similar for reduce sum
+__device__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+__device__ float block_reduce_sum(float val) {
+    static __shared__ float shared[32];
+    int lane = threadIdx.x % 32;
+    int wid = threadIdx.x / 32;
+    
+    val = warp_reduce_sum(val);
+    
+    if (lane == 0) {
+        shared[wid] = val;
+    }
+    __syncthreads();
+    
+    if (wid == 0) {
+        val = lane &lt; (blockDim.x / 32) ? shared[lane] : 0.0f;
+        val = warp_reduce_sum(val);
+    }
+    return val;
+}
+
+// Main kernel
+__global__ void particle_filter_kernel(
+    const float* __restrict__ particles,
+    const float* __restrict__ log_weights,
+    const float* __restrict__ observation,
+    const float* __restrict__ A,
+    const float* __restrict__ C,
+    float* __restrict__ out_particles,
+    float* __restrict__ out_log_weights,
+    curandState* states,
+    int B, int P, int D, int obs_dim,
+    float process_noise, float obs_noise
+) {
+    int b = blockIdx.x;
+    int p = threadIdx.x;
+    
+    if (b &gt;= B) return;
+    
+    extern __shared__ float smem[];
+    float* pred_shared = smem;  // P * D floats
+    float* weights_shared = smem + P * D;  // P floats
+    float* cumsum_shared = smem + P * D + P;  // P floats
+    
+    // Initialize curand for this thread
+    curandState local_state = states[b * P + p];
+    
+    // ... computation
+    
+    states[b * P + p] = local_state;
+}
+```
+
+Hmm, this is getting complex. Let me simplify.
+
+Given that P=1024 and each block has 1024 threads, I can use:
+- One block per batch element
+- One thread per particle
+
+This allows efficient use of shared memory for the prefix sum and searchsorted operations.
+
+Let me write a cleaner version:
+
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;curand_kernel.h&gt;
+
+// Initialize RNG states
+__global__ void init_curand(curandState* states, unsigned long long seed, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        curand_init(seed, idx, 0, &amp;states[idx]);
+    }
+}
+
+// Main particle filter kernel
+__global__ void particle_filter_kernel(
+    const float* __restrict__ particles,
+    const float* __restrict__ log_weights,
+    const float* __restrict__ observation,
+    const float* __restrict__ A,
+    const float* __restrict__ C,
+    float* __restrict__ out_particles,
+    float* __restrict__ out_log_weights,
+    curandState* states,
+    int B, int P, int D, int obs_dim,
+    float process_noise, float obs_noise
+) {
+    int b = blockIdx.x;  // batch index
+    int p = threadIdx.x; // particle index
+    
+    if (b &gt;= B || p &gt;= P) return;
+    
+    // ... rest of computation
+}
+```
+
+Actually, wait. If I use 1024 threads per block, I need to make sure that&#x27;s valid. The maximum threads per block is 1024 on modern GPUs, so this should work.
+
+But for shared memory, I need:
+- pred: P * D = 1024 * 4 = 4096 floats = 16KB
+- weights: P = 1024 floats = 4KB
+- cumsum: P = 1024 floats = 4KB
+- Total: 24KB, which fits in 227KB per block
+
+Great, let me write the full kernel.
+
+Actually, let me reconsider the approach. The RNG initialization is expensive if done every forward pass. Let me:
+1. Initialize RNG states once at module load time
+2. Reuse them in each forward pass
+
+Or, I could use a simpler approach: generate random numbers on the host side using PyTorch and pass them to the kernel. This is simpler and might be just as fast for small tensors.
+
+Let me write the kernel with random numbers passed as input:
+
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+// ... kernel implementation
+```
+
+Actually, for the particle filter, the main bottleneck is likely the prefix sum (cumsum) and searchsorted. Let me focus on optimizing those.
+
+For prefix sum within a block, I can use the Blelloch algorithm or the Hillis-Steele algorithm.
+
+For searchsorted, since we&#x27;re searching for P values in a sorted array of P elements, we can use binary search.
+
+Let me write the kernel now:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me write a CUDA kernel for this particle filter. The key operations are:
+1. Predict: matrix multiply + noise
+2. Weight: observation likelihood
+3. Normalize: logsumexp
+4. Resample: systematic resampling with cumsum and searchsorted
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;curand_kernel.h&gt;\n\n#define BLOCK_SIZE 1024\n\n// Warp-level reduce max for logsumexp stability\n__device__ float warp_reduce_max(float val) {\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));\n    }\n    return val;\n}\n\n// Block-level reduce max\n__device__ float block_reduce_max(float val, float* shared) {\n    int lane = threadIdx.x % 32;\n    int wid = threadIdx.x / 32;\n    \n    val = warp_reduce_max(val);\n    \n    if (lane == 0) {\n        shared[wid] = val;\n    }\n    __syncthreads();\n    \n    if (wid == 0) {\n        val = (lane &lt; (blockDim.x / 32)) ? shared[lane] : -INFINITY;\n        val = warp_reduce_max(val);\n    }\n    return val;\n}\n\n// Warp-level reduce sum\n__device__ float warp_reduce_sum(float val) {\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        val += __shfl_down_sync(0xffffffff, val, offset);\n    }\n    return val;\n}\n\n// Block-level reduce sum\n__device__ float block_reduce_sum(float val, float* shared) {\n    int lane = threadIdx.x % 32;\n    int wid = threadIdx.x / 32;\n    \n    val = warp_reduce_sum(val);\n    \n    if (lane == 0) {\n        shared[wid] = val;\n    }\n    __syncthreads();\n    \n    if (wid == 0) {\n        val = (lane &lt; (blockDim.x / 32)) ? shared[lane] : 0.0f;\n        val = warp_reduce_sum(val);\n    }\n    return val;\n}\n\n// Block-level inclusive prefix sum using Blelloch scan (work-efficient)\n__device__ void block_inclusive_scan(float* data, int n) {\n    int t = threadIdx.x;\n    if (t &gt;= n) return;\n    \n    // Up-sweep (reduce)\n    int offset = 1;\n    for (int d = n &gt;&gt; 1; d &gt; 0; d &gt;&gt;= 1) {\n        __syncthreads();\n        if (t &lt; d) {\n            int ai = offset * (2 * t + 1) - 1;\n            int bi = offset * (2 * t + 2) - 1;\n            if (bi &lt; n) {\n                data[bi] += data[ai];\n            }\n        }\n        offset &lt;&lt;= 1;\n    }\n    \n    __syncthreads();\n}\n\n// Main particle filter kernel - one block per batch\n__global__ void particle_filter_kernel(\n    const float* __restrict__ particles,  // (B, P, D)\n    const float* __restrict__ log_weights, // (B, P)\n    const float* __restrict__ observation, // (B, obs_dim)\n    const float* __restrict__ A,  // (D, D)\n    const float* __restrict__ C,  // (obs_dim, D)\n    float* __restrict__ out_particles, // (B, P, D)\n    float* __restrict__ out_log_weights, // (B, P)\n    int B, int P, int D, int obs_dim,\n    float process_noise, float obs_noise,\n    unsigned long long seed\n) {\n    int b = blockIdx.x;  // batch index\n    int p = threadIdx.x; // particle index\n    \n    if (b &gt;= B) return;\n    \n    // Shared memory allocation\n    extern __shared__ float smem[];\n    float* pred = smem;                    // P * D\n    float* new_log_w = pred + P * D;       // P\n    float* weights = new_log_w + P;        // P\n    float* cumsum = weights + P;           // P\n    float* reduce_shared = cumsum + P;     // 32 (for reductions)\n    \n    // Initialize RNG\n    curandState local_state;\n    curand_init(seed, b * P + p, 0, &amp;local_state);\n    \n    // Load A and C matrices into registers (they&#x27;re small: D=4, obs_dim=2)\n    float A_local[16];  // D * D = 16\n    float C_local[8];   // obs_dim * D = 2 * 4 = 8\n    \n    if (p &lt; D * D) {\n        A_local[p] = A[p];\n    }\n    if (p &lt; obs_dim * D) {\n        C_local[p] = C[p];\n    }\n    __syncthreads();\n    \n    // ==================== PREDICT STEP ====================\n    // pred = particles @ A.T + process_noise * randn_like(particles)\n    float pred_local[4];  // D=4\n    \n    for (int d = 0; d &lt; D; d++) {\n        float sum = 0.0f;\n        for (int k = 0; k &lt; D; k++) {\n            sum += particles[b * P * D + k] * A_local[d * D + k];  // A.T[d,k] = A[k,d]\n        }\n        // Add process noise\n        float noise = curand_normal(&amp;local_state) * process_noise;\n        pred_local[d] = sum + noise;\n        pred[p * D + d] = pred_local[d];\n    }\n    \n    __syncthreads();\n    \n    // ==================== WEIGHT STEP ====================\n    // obs_pred = pred @ C.T\n    // diff = observation - obs_pred\n    // log_lik = -0.5 * sum(diff^2) / obs_noise^2\n    \n    float log_lik = 0.0f;\n    for (int o = 0; o &lt; obs_dim; o++) {\n        float obs_pred_o = 0.0f;\n        for (int d = 0; d &lt; D; d++) {\n            obs_pred_o += pred_local[d] * C_local[o * D + d];  // C.T[o,d] = C[o,d]\n        }\n        float diff = observation[b * obs_dim + o] - obs_pred_o;\n        log_lik += diff * diff;\n    }\n    log_lik *= -0.5f / (obs_noise * obs_noise);\n    \n    // new_log_w = log_weights + log_lik\n    new_log_w[p] = log_weights[b * P + p] + log_lik;\n    \n    __syncthreads();\n    \n    // ==================== NORMALIZE (LOGSUMEXP) ====================\n    float max_log_w = block_reduce_max(new_log_w[p], reduce_shared);\n    __syncthreads();\n    \n    float exp_val = expf(new_log_w[p] - max_log_w);\n    weights[p] = exp_val;\n    __syncthreads();\n    \n    float sum_exp = block_reduce_sum(exp_val, reduce_shared);\n    __syncthreads();\n    \n    // Normalize weights\n    float log_sum_exp = max_log_w + logf(sum_exp);\n    new_log_w[p] = new_log_w[p] - log_sum_exp;\n    weights[p] = expf(new_log_w[p]);\n    \n    __syncthreads();\n    \n    // ==================== SYSTEMATIC RESAMPLE ====================\n    // cumsum = torch.cumsum(weights, dim=1)\n    // Use inclusive prefix sum\n    block_inclusive_scan(weights, P);\n    \n    // Copy to cumsum (weights is now the cumsum)\n    cumsum[p] = weights[p];\n    __syncthreads();\n    \n    // Generate u = (arange(P) + rand()) / P\n    float u_base = curand_uniform(&amp;local_state);  // Same for all particles in batch\n    float u = (float(p) + u_base) / float(P);\n    \n    // Binary search for index\n    // Find smallest index where cumsum[idx] &gt;= u\n    int idx = 0;\n    int left = 0, right = P - 1;\n    while (left &lt;= right) {\n        int mid = (left + right) / 2;\n        if (cumsum[mid] &lt; u) {\n            left = mid + 1;\n        } else {\n            right = mid - 1;\n        }\n    }\n    idx = min(left, P - 1);\n    \n    // Now we need to gather pred[idx] for each thread\n    // This requires a second pass since idx varies per thread\n    __syncthreads();\n    \n    // Use shared memory to store which particle each thread needs\n    // Then each thread writes its pred to where it&#x27;s needed\n    // Actually, this is complex. Let&#x27;s use a different approach.\n    \n    // Simpler: atomic operations to mark where each particle&#x27;s data should go\n    // Or: use pred directly with idx\n    \n    // For small D, we can just read directly from shared memory\n    for (int d = 0; d &lt; D; d++) {\n        out_particles[b * P * D + p * D + d] = pred[idx * D + d];\n    }\n    \n    // Uniform log weights\n    out_log_weights[b * P + p] = -logf((float)P);\n}\n\nstd::vector&lt;torch::Tensor&gt; particle_filter_cuda(\n    torch::Tensor particles,\n    torch::Tensor log_weights,\n    torch::Tensor observation,\n    torch::Tensor A,\n    torch::Tensor C,\n    float process_noise,\n    float obs_noise\n) {\n    int B = particles.size(0);\n    int P = particles.size(1);\n    int D = particles.size(2);\n    int obs_dim = observation.size(1);\n    \n    auto out_particles = torch::empty_like(particles);\n    auto out_log_weights = torch::empty_like(log_weights);\n    \n    // Shared memory size: P*D + P + P + P + 32\n    size_t smem_size = P * D * sizeof(float) + 3 * P * sizeof(float) + 32 * sizeof(float);\n    \n    // Generate random seed\n    unsigned long long seed = torch::randint(0, INT_MAX, {1}).item&lt;int&gt;();\n    \n    dim3 grid(B);\n    dim3 block(P);\n    \n    particle_filter_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(\n        particles.data_ptr&lt;float&gt;(),\n        log_weights.data_ptr&lt;float&gt;(),\n        observation.data_ptr&lt;float&gt;(),\n        A.data_ptr&lt;float&gt;(),\n        C.data_ptr&lt;float&gt;(),\n        out_particles.data_ptr&lt;float&gt;(),\n        out_log_weights.data_ptr&lt;float&gt;(),\n        B, P, D, obs_dim,\n        process_noise, obs_noise,\n        seed\n    );\n    \n    return {out_particles, out_log_weights};\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\nstd::vector&lt;torch::Tensor&gt; particle_filter_cuda(\n    torch::Tensor particles,\n    torch::Tensor log_weights,\n    torch::Tensor observation,\n    torch::Tensor A,\n    torch::Tensor C,\n    float process_noise,\n    float obs_noise\n);\n\&quot;\&quot;\&quot;\n\nparticle_filter_module = load_inline(\n    name=&#x27;particle_filter&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;particle_filter_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;-std=c++17&#x27;],\n    verbose=True\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self, state_dim, obs_dim, num_particles):\n        super().__init__()\n        self.state_dim = state_dim\n        self.obs_dim = obs_dim\n        self.num_particles = num_particles\n        self.register_buffer(\&quot;A\&quot;, 0.9 * torch.eye(state_dim))\n        self.register_buffer(\&quot;C\&quot;, torch.randn(obs_dim, state_dim) * 0.5)\n        self.process_noise = 0.1\n        self.obs_noise = 0.5\n\n    def forward(self, particles, log_weights, observation):\n        return particle_filter_module.particle_filter_cuda(\n            particles, log_weights, observation,\n            self.A, self.C, self.process_noise, self.obs_noise\n        )&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
