@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 15</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 23:50:22 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 15</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 23:52:26 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">15_GQAKVHeadExpansionAttention.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">2630</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">4</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">13410</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -153,5 +153,178 @@ Device: NVIDIA H100 80GB HBM3
 
 Ridge point (FP32): 20.12 FLOPs/byte
   Kernels with arithmetic intensity below the ridge point are
-  memory-bound; above it they are compute-bound.</div></details></div></div>
+  memory-bound; above it they are compute-bound.</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 102.7s turn · 29.7s LLM · tokens in=2,716 · out=2,839 · total=5,555 · 11,425 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>102.7s turn · 29.7s LLM · 73.0s tools · <span class="turn-tokens">tokens in=2,716 · out=2,839 · total=5,555</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me write my first kernel. The key insight is:
+- batch_size = 2
+- seq_len = 80
+- num_q_heads = 8
+- num_kv_heads = 2
+- head_dim = 32
+- group_size = 4
+
+So I have small dimensions. Each query head operates on only 32-dimensional vectors. The causal attention pattern means each position t can only attend to positions 0..t.
+
+For an efficient kernel:
+- One thread per output element (batch, seq, q_head, head_dim)
+- This gives 2 * 80 * 8 * 32 = 40,960 threads - enough to fill the GPU
+
+Actually, let me think more carefully. For each (b, t, h):
+- We compute attention scores for positions 0..t (t+1 values)
+- Then softmax
+- Then weighted sum of v values
+
+The memory access pattern:
+- q[b, t, h] is a head_dim vector
+- k[b, :t+1, h_group] are (t+1) * head_dim values
+- v[b, :t+1, h_group] are (t+1) * head_dim values
+
+For parallelism, I could:
+1. Each thread handles one (b, t, h) position - 2*80*8 = 1280 threads
+2. Each warp handles computing one attention output
+3. Use shared memory for the k and v history
+
+Let me try a different approach:
+- Each thread block handles one (batch, q_head) pair
+- Within the block, threads collaborate on the seq_len dimension
+- Block size = 128 threads (4 warps)
+
+With 2 batches and 8 q_heads, we&#x27;d have 16 blocks, which is low.
+
+Alternative:
+- Each thread handles one output position (b, t, h)
+- That&#x27;s 1280 threads - we could launch with 128 threads per block, 10 blocks
+
+Actually, let me think about using shared memory efficiently:
+- Block processes multiple (b, h) pairs
+- Each thread in block handles one or more (t) positions
+
+Given the dimensions:
+- 2 batches
+- 8 q_heads
+- 80 seq_len positions each
+
+Let me try: each block handles one (b, h) pair
+- 16 blocks total
+- Each block has 80 threads for the seq_len dimension, but we need to handle head_dim output elements
+
+Better: each block handles one (b, h)
+- Block has 256 threads (covering 32 head_dim * 8 seq positions, or we could have each thread handle one seq position and compute all head_dim outputs)
+
+Actually, simplest approach:
+- Grid: (batch_size * num_q_heads) blocks
+- Each block: seq_len threads
+- Each thread computes head_dim output elements
+
+With 2 * 8 = 16 blocks and 80 threads per block, this is still not enough to fully utilize the GPU. Let me increase parallelism.
+
+Alternative: have each block handle one (b, t, h) and compute all head_dim elements.
+- Grid: (batch_size * num_q_heads * seq_len) = 1280 blocks
+- Each block: 32 threads (one per head_dim element)
+- Total threads: 40,960 - good!
+
+Actually 1280 blocks is still low for an H100 with 132 SMs. Let me try:
+- Grid: (batch_size * num_q_heads) = 16 blocks
+- Block: 256 threads
+- Threads in block handle all (t, d) combinations
+
+This gives 4096 threads total across 16 blocks, which is still low.
+
+Let me just start with a simple kernel and optimize from there:
+
+```cpp
+// Each thread handles one output element (b, t, h, d)
+// Grid: (batch_size * num_q_heads) blocks in x, seq_len in y
+// Block: head_dim threads
+```
+
+Wait, that&#x27;s still not enough parallelism. Let me use:
+- blockDim.x = 128 threads
+- Each thread handles multiple output elements
+
+Or I could use a different decomposition:
+- Grid: (batch_size * num_q_heads * seq_len) blocks = 1280 blocks
+- Block: 32 threads (head_dim)
+- Total: 40,960 threads - enough!
+
+Let me write this kernel.
+
+Actually, for each (b, t, h) we need to:
+1. Load q[b, t, h, :] (32 elements)
+2. Compute attention scores with k[b, :t+1, h, :] ((t+1) * 32 multiply-adds)
+3. Compute softmax over (t+1) scores
+4. Compute weighted sum of v[b, :t+1, h, :] ((t+1) * 32 multiply-adds)
+5. Write output (32 elements)
+
+With 32 threads per block:
+- Each thread handles one head_dim element
+- Cooperative loading of q
+- Cooperative computing of attention scores (need reduction across head_dim)
+- Softmax (need reduction across positions)
+- Weighted sum
+
+This requires careful synchronization. Let me try a simpler approach first:
+
+Each thread handles one (b, h, t) and computes all head_dim elements:
+- Grid: (batch_size, num_q_heads) = (2, 8)
+- Block: seq_len threads = 80
+
+But 80 threads per block is low. We want 128-256 for good occupancy.
+
+Let me try:
+- Grid: batch_size = 2
+- Each block handles all q_heads and seq_len for one batch
+- Block: 256 threads
+- Each thread handles a subset of (h, t) pairs
+
+With 256 threads covering 8*80 = 640 positions, each thread handles ~2.5 positions. Not clean.
+
+Let me go with:
+- Grid: batch_size * num_q_heads = 16 blocks
+- Block: 128 threads covering seq_len dimension
+- Thread t handles position t % seq_len (need to handle multiple positions if t &gt;= seq_len)
+
+Actually seq_len = 80, so with 128 threads, 80 threads handle one position each, 48 threads are idle. Waste.
+
+Better:
+- Block: 80 threads (seq_len)
+- Each thread handles one seq position
+
+But 80 is not a multiple of 32, which could cause warp divergence issues. 
+
+Let me go with:
+- Grid: batch_size * num_q_heads * (seq_len / 4) = 16 * 20 = 320 blocks
+- Block: 128 threads
+- Each block handles 4 consecutive seq positions
+- Each thread handles one head_dim element for those 4 positions
+
+Hmm, this is getting complex. Let me just start with a simple implementation and optimize.
+
+Simple kernel:
+- Each thread handles one (b, t, h)
+- Computes all head_dim output elements
+- Grid: (batch_size * num_q_heads * seq_len) = 1280 blocks
+- Block: 32 threads (or just 1 thread)
+
+Let me start with single-thread blocks for simplicity, then expand.
+
+Actually, let me use a different strategy for more parallelism:
+- Each thread handles one output element (b, t, h, d)
+- Grid: (batch_size, num_q_heads, seq_len) with flattened indexing
+- Block: head_dim threads
+- Total: 40,960 threads across 1280 blocks
+
+Let me write this.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Now let me write the initial kernel. The problem is causal grouped-query attention where query heads outnumber KV heads (8 vs 2). I&#x27;ll write a kernel where each thread handles one output element.
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import math\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n\n// Each thread handles one output element (b, t, h, d)\n// Grid: (batch_size * num_q_heads * seq_len) blocks\n// Block: head_dim threads (32 for this problem)\n\n__global__ void causal_gqa_kernel(\n    const float* __restrict__ q,\n    const float* __restrict__ k,\n    const float* __restrict__ v,\n    float* __restrict__ out,\n    int batch_size, int seq_len, int num_q_heads, int num_kv_heads, int head_dim\n) {\n    int group_size = num_q_heads / num_kv_heads;\n    float scale = 1.0f / sqrtf((float)head_dim);\n    \n    // Block index determines (b, h, t)\n    int block_idx = blockIdx.x;\n    int b = block_idx / (num_q_heads * seq_len);\n    int remainder = block_idx % (num_q_heads * seq_len);\n    int h = remainder / seq_len;\n    int t = remainder % seq_len;\n    \n    // Thread index determines head dimension\n    int d = threadIdx.x;\n    if (d &gt;= head_dim) return;\n    \n    // Map query head to KV head\n    int kv_h = h / group_size;\n    \n    // Load query value for this position\n    int q_idx = ((b * seq_len + t) * num_q_heads + h) * head_dim + d;\n    float q_val = q[q_idx];\n    \n    // Compute attention scores for positions 0..t\n    // We need to compute this for all positions, then softmax, then weighted sum\n    \n    // Use registers for scores (max 80 positions)\n    extern __shared__ float shared_mem[];\n    float* scores = shared_mem;  // seq_len floats\n    float* local_out = &amp;shared_mem[seq_len];  // head_dim floats for cooperative output\n    \n    // Step 1: Compute attention scores\n    // Each thread computes its contribution to the dot product\n    for (int s = 0; s &lt;= t; s++) {\n        int k_idx = ((b * seq_len + s) * num_kv_heads + kv_h) * head_dim + d;\n        scores[s] = k[k_idx] * q_val;\n    }\n    \n    // Reduce across threads to get full dot product\n    for (int s = 0; s &lt;= t; s++) {\n        // Warp reduce\n        float val = scores[s];\n        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n            val += __shfl_down_sync(0xffffffff, val, offset);\n        }\n        if (d == 0) {\n            scores[s] = val * scale;\n        }\n    }\n    __syncthreads();\n    \n    // Step 2: Softmax (only need to compute once, have thread 0 do it)\n    if (d == 0) {\n        float max_score = scores[0];\n        for (int s = 1; s &lt;= t; s++) {\n            max_score = fmaxf(max_score, scores[s]);\n        }\n        float sum_exp = 0.0f;\n        for (int s = 0; s &lt;= t; s++) {\n            scores[s] = expf(scores[s] - max_score);\n            sum_exp += scores[s];\n        }\n        float inv_sum = 1.0f / sum_exp;\n        for (int s = 0; s &lt;= t; s++) {\n            scores[s] *= inv_sum;\n        }\n    }\n    __syncthreads();\n    \n    // Step 3: Weighted sum of values\n    float out_val = 0.0f;\n    for (int s = 0; s &lt;= t; s++) {\n        int v_idx = ((b * seq_len + s) * num_kv_heads + kv_h) * head_dim + d;\n        out_val += scores[s] * v[v_idx];\n    }\n    \n    // Write output\n    out[q_idx] = out_val;\n}\n\ntorch::Tensor forward_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v) {\n    int batch_size = q.size(0);\n    int seq_len = q.size(1);\n    int num_q_heads = q.size(2);\n    int head_dim = q.size(3);\n    int num_kv_heads = k.size(2);\n    \n    auto out = torch::zeros_like(q);\n    \n    int num_blocks = batch_size * num_q_heads * seq_len;\n    int block_size = head_dim;\n    int shared_mem_size = (seq_len + head_dim) * sizeof(float);\n    \n    causal_gqa_kernel&lt;&lt;&lt;num_blocks, block_size, shared_mem_size&gt;&gt;&gt;(\n        q.data_ptr&lt;float&gt;(),\n        k.data_ptr&lt;float&gt;(),\n        v.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        batch_size, seq_len, num_q_heads, num_kv_heads, head_dim\n    );\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor forward_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v);\n\&quot;\&quot;\&quot;\n\nmodule = load_inline(\n    name=\&quot;causal_gqa_ext\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[\&quot;forward_cuda\&quot;],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.module = module\n    \n    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -&gt; torch.Tensor:\n        return self.module.forward_cuda(q, k, v)&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>74.0s turn · 10.5s LLM · 63.4s tools · <span class="turn-tokens">tokens in=3,991 · out=1,234 · total=5,225</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Good, it compiled. Now let me check correctness.
+</div></details><details><summary>call → run_correctness</summary><div class="block tool-args"><span class="role-tag">call</span><b>run_correctness</b>
+{
+  &quot;kernel_code&quot;: &quot;import math\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n\n// Each thread handles one output element (b, t, h, d)\n// Grid: (batch_size * num_q_heads * seq_len) blocks\n// Block: head_dim threads (32 for this problem)\n\n__global__ void causal_gqa_kernel(\n    const float* __restrict__ q,\n    const float* __restrict__ k,\n    const float* __restrict__ v,\n    float* __restrict__ out,\n    int batch_size, int seq_len, int num_q_heads, int num_kv_heads, int head_dim\n) {\n    int group_size = num_q_heads / num_kv_heads;\n    float scale = 1.0f / sqrtf((float)head_dim);\n    \n    // Block index determines (b, h, t)\n    int block_idx = blockIdx.x;\n    int b = block_idx / (num_q_heads * seq_len);\n    int remainder = block_idx % (num_q_heads * seq_len);\n    int h = remainder / seq_len;\n    int t = remainder % seq_len;\n    \n    // Thread index determines head dimension\n    int d = threadIdx.x;\n    if (d &gt;= head_dim) return;\n    \n    // Map query head to KV head\n    int kv_h = h / group_size;\n    \n    // Load query value for this position\n    int q_idx = ((b * seq_len + t) * num_q_heads + h) * head_dim + d;\n    float q_val = q[q_idx];\n    \n    // Compute attention scores for positions 0..t\n    // We need to compute this for all positions, then softmax, then weighted sum\n    \n    // Use registers for scores (max 80 positions)\n    extern __shared__ float shared_mem[];\n    float* scores = shared_mem;  // seq_len floats\n    float* local_out = &amp;shared_mem[seq_len];  // head_dim floats for cooperative output\n    \n    // Step 1: Compute attention scores\n    // Each thread computes its contribution to the dot product\n    for (int s = 0; s &lt;= t; s++) {\n        int k_idx = ((b * seq_len + s) * num_kv_heads + kv_h) * head_dim + d;\n        scores[s] = k[k_idx] * q_val;\n    }\n    \n    // Reduce across threads to get full dot product\n    for (int s = 0; s &lt;= t; s++) {\n        // Warp reduce\n        float val = scores[s];\n        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n            val += __shfl_down_sync(0xffffffff, val, offset);\n        }\n        if (d == 0) {\n            scores[s] = val * scale;\n        }\n    }\n    __syncthreads();\n    \n    // Step 2: Softmax (only need to compute once, have thread 0 do it)\n    if (d == 0) {\n        float max_score = scores[0];\n        for (int s = 1; s &lt;= t; s++) {\n            max_score = fmaxf(max_score, scores[s]);\n        }\n        float sum_exp = 0.0f;\n        for (int s = 0; s &lt;= t; s++) {\n            scores[s] = expf(scores[s] - max_score);\n            sum_exp += scores[s];\n        }\n        float inv_sum = 1.0f / sum_exp;\n        for (int s = 0; s &lt;= t; s++) {\n            scores[s] *= inv_sum;\n        }\n    }\n    __syncthreads();\n    \n    // Step 3: Weighted sum of values\n    float out_val = 0.0f;\n    for (int s = 0; s &lt;= t; s++) {\n        int v_idx = ((b * seq_len + s) * num_kv_heads + kv_h) * head_dim + d;\n        out_val += scores[s] * v[v_idx];\n    }\n    \n    // Write output\n    out[q_idx] = out_val;\n}\n\ntorch::Tensor forward_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v) {\n    int batch_size = q.size(0);\n    int seq_len = q.size(1);\n    int num_q_heads = q.size(2);\n    int head_dim = q.size(3);\n    int num_kv_heads = k.size(2);\n    \n    auto out = torch::zeros_like(q);\n    \n    int num_blocks = batch_size * num_q_heads * seq_len;\n    int block_size = head_dim;\n    int shared_mem_size = (seq_len + head_dim) * sizeof(float);\n    \n    causal_gqa_kernel&lt;&lt;&lt;num_blocks, block_size, shared_mem_size&gt;&gt;&gt;(\n        q.data_ptr&lt;float&gt;(),\n        k.data_ptr&lt;float&gt;(),\n        v.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        batch_size, seq_len, num_q_heads, num_kv_heads, head_dim\n    );\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor forward_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v);\n\&quot;\&quot;\&quot;\n\nmodule = load_inline(\n    name=\&quot;causal_gqa_ext\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[\&quot;forward_cuda\&quot;],\n    verbose=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.module = module\n    \n    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -&gt; torch.Tensor:\n        return self.module.forward_cuda(q, k, v)&quot;
+}</div></details><details open><summary>result ← run_correctness (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>run_correctness</b>
+run_correctness FAILED: (0 / 3) trials did not all match.
+correctness_issue: Output mismatch
+max_difference: [&#x27;3.787323&#x27;, &#x27;4.355974&#x27;, &#x27;3.364215&#x27;]
+avg_difference: [&#x27;0.514774&#x27;, &#x27;0.472765&#x27;, &#x27;0.527090&#x27;]</div></details></div></div>
 </body></html>
