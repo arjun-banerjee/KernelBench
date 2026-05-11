@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L5 P3 · hardware_translation_stub</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 3</a></div><div class="site-subtitle">Llama-4-Maverick-17B-128E-Instruct-FP8 · hardware_translation_stub · l5_hw_translation_default_final_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/Llama-4-Maverick-17B-128E-Instruct-FP8.html">← Llama-4-Maverick-17B-128E-Instruct-FP8</a><span class="meta">generated 2026-05-11 00:40:51 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/hardware_translation_stub/models/Llama-4-Maverick-17B-128E-Instruct-FP8.html" class=current>Llama-4-Maverick-17B-128E-Instruct-FP8</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/hardware_translation_stub/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-error">error</span>
+  <span style="font-size:13px;">03_fused_rmsnorm.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">Llama-4-Maverick-17B-128E-Instruct-FP8</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">18198</div></div>
+  <div class="tldr-cell"><div class="l">wall clock</div><div class="v">70.7s</div></div>
+  <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp16</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">hardware_translation_stub</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-11T00:38:48Z</div></div>
+</div>
+
+
+
+</div><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>14.0s turn · 14.0s LLM · 0.0s tools · <span class="turn-tokens">tokens in=5,478 · out=1,439 · total=6,917</span></span></div><div class="block assistant"><span class="role-tag">assistant</span>```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_fp16.h&gt;
+
+__device__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+template &lt;typename scalar_t, int VEC_SIZE&gt;
+__global__ void rms_norm_kernel(scalar_t* __restrict__ out, 
+                                const scalar_t* __restrict__ input, 
+                                const scalar_t* __restrict__ weight, 
+                                float epsilon, int hidden_size) {
+    __shared__ float s_variance;
+    float variance = 0.0f;
+    const int idx = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    using vec_t = float2;
+
+    vec_t* input_vec = reinterpret_cast&lt;vec_t*&gt;(input + idx * hidden_size);
+    const vec_t* weight_vec = reinterpret_cast&lt;const vec_t*&gt;(weight);
+
+    for (int i = tid; i &lt; hidden_size / 2; i += blockDim.x) {
+        vec_t val = input_vec[i];
+        float2 x = make_float2(__half2float(val.x), __half2float(val.y));
+        variance += x.x * x.x + x.y * x.y;
+    }
+
+    variance = warp_reduce_sum(variance);
+    if (tid == 0) {
+        s_variance = rsqrtf(variance / hidden_size + epsilon);
+    }
+    __syncthreads();
+
+    for (int i = tid; i &lt; hidden_size / 2; i += blockDim.x) {
+        vec_t val = input_vec[i];
+        vec_t w = weight_vec[i];
+        float2 x = make_float2(__half2float(val.x), __half2float(val.y));
+        float2 wf = make_float2(__half2float(w.x), __half2float(w.y));
+        float2 out_val = make_float2(x.x * s_variance * wf.x, x.y * s_variance * wf.y);
+        val.x = __float2half(out_val.x);
+        val.y = __float2half(out_val.y);
+        input_vec[i] = val;
+    }
+}
+
+torch::Tensor rms_norm(torch::Tensor input, torch::Tensor weight, float epsilon) {
+    const int num_tokens = input.size(0);
+    const int hidden_size = input.size(1);
+    auto out = torch::empty_like(input);
+
+    const int block_size = 256;
+    const dim3 grid(num_tokens);
+    const dim3 block(block_size);
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), &quot;rms_norm_kernel&quot;, [&amp;] {
+        rms_norm_kernel&lt;scalar_t, 2&gt;&lt;&lt;&lt;grid, block&gt;&gt;&gt;(
+            out.data_ptr&lt;scalar_t&gt;(), 
+            input.data_ptr&lt;scalar_t&gt;(), 
+            weight.data_ptr&lt;scalar_t&gt;(), 
+            epsilon, hidden_size);
+    });
+
+    return out;
+}
+
+template &lt;typename scalar_t, int width&gt;
+__global__ void fused_add_rms_norm_kernel(scalar_t* __restrict__ input, 
+                                          scalar_t* __restrict__ residual, 
+                                          const scalar_t* __restrict__ weight, 
+                                          float epsilon, int hidden_size) {
+    __shared__ float s_variance;
+    float variance = 0.0f;
+    const int idx = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    using vec_t = float2;
+
+    vec_t* input_vec = reinterpret_cast&lt;vec_t*&gt;(input + idx * hidden_size);
+    vec_t* residual_vec = reinterpret_cast&lt;vec_t*&gt;(residual + idx * hidden_size);
+    const vec_t* weight_vec = reinterpret_cast&lt;const vec_t*&gt;(weight);
+
+    for (int i = tid; i &lt; hidden_size / 2; i += blockDim.x) {
+        vec_t inp = input_vec[i];
+        vec_t res = residual_vec[i];
+        float2 x_inp = make_float2(__half2float(inp.x), __half2float(inp.y));
+        float2 x_res = make_float2(__half2float(res.x), __half2float(res.y));
+        float2 x = make_float2(x_inp.x + x_res.x, x_inp.y + x_res.y);
+        variance += x.x * x.x + x.y * x.y;
+        inp.x = __float2half(x.x);
+        inp.y = __float2half(x.y);
+        residual_vec[i] = inp;
+    }
+
+    variance = warp_reduce_sum(variance);
+    if (tid == 0) {
+        s_variance = rsqrtf(variance / hidden_size + epsilon);
+    }
+    __syncthreads();
+
+    for (int i = tid; i &lt; hidden_size / 2; i += blockDim.x) {
+        vec_t res = residual_vec[i];
+        vec_t w = weight_vec[i];
+        float2 x_res = make_float2(__half2float(res.x), __half2float(res.y));
+        float2 wf = make_float2(__half2float(w.x), __half2float(w.y));
+        float2 out_val = make_float2(x_res.x * s_variance * wf.x, x_res.y * s_variance * wf.y);
+        input_vec[i] = make_float2(__float2half(out_val.x), __float2half(out_val.y));
+    }
+}
+
+torch::Tensor fused_add_rms_norm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, float epsilon) {
+    const int num_tokens = input.size(0);
+    const int hidden_size = input.size(1);
+
+    const int block_size = 256;
+    const dim3 grid(num_tokens);
+    const dim3 block(block_size);
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), &quot;fused_add_rms_norm_kernel&quot;, [&amp;] {
+        fused_add_rms_norm_kernel&lt;scalar_t, 8&gt;&lt;&lt;&lt;grid, block&gt;&gt;&gt;(
+            input.data_ptr&lt;scalar_t&gt;(), 
+            residual.data_ptr&lt;scalar_t&gt;(), 
+            weight.data_ptr&lt;scalar_t&gt;(), 
+            epsilon, hidden_size);
+    });
+
+    return input;
+}
+&quot;&quot;&quot;
+
+module = load_inline(
+    name=&#x27;custom_cuda&#x27;,
+    cuda_sources=[cuda_source],
+    functions=[&#x27;rms_norm&#x27;, &#x27;fused_add_rms_norm&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;-arch=sm_90&#x27;]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, hidden_size, eps):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x):
+        return module.fused_add_rms_norm(x, x.clone(), self.weight, self.eps)
+```
+</div></div><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>39.1s turn · 39.1s LLM · 0.0s tools · <span class="turn-tokens">tokens in=6,983 · out=4,298 · total=11,281</span></span></div><details><summary>call → static_check</summary><div class="block tool-args"><span class="role-tag">call</span><b>static_check</b>
+{
+  &quot;_raw&quot;: &quot;{\&quot;kernel_code\&quot;: \&quot;&quot;
+}</div></details><details open><summary>result ← static_check (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>static_check</b>
+Tool call arguments could not be parsed as JSON: Unterminated string starting at: line 1 column 17 (char 16). Please re-issue the call with valid JSON arguments.</div></details></div><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>17.5s turn · 0.2s LLM · 0.0s tools</span></div><div class="block assistant"><span class="role-tag">feedback</span>LLM call failed: BadRequestError: Error code: 400 - {&#x27;error&#x27;: {&#x27;code&#x27;: &#x27;Bad Request&#x27;, &#x27;message&#x27;: &#x27;{&quot;error&quot;:{&quot;message&quot;:&quot;Unterminated string starting at: line 1 column 17 (char 16) None&quot;,&quot;type&quot;:&quot;BadRequestError&quot;,&quot;param&quot;:null,&quot;code&quot;:400}}&#x27;, &#x27;status&#x27;: 400}}</div></div></div>
+</body></html>
