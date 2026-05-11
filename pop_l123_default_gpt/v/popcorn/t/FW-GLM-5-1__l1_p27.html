@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 27</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 14:04:23 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 27</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 14:06:29 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">27_permutation_all_to_all.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 12</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">1751</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 12</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">7714</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -109,5 +109,124 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 38.3s turn · 14.6s LLM · tokens in=1,681 · out=1,502 · total=3,183 · 7,045 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>38.3s turn · 14.6s LLM · 23.7s tools · <span class="turn-tokens">tokens in=1,681 · out=1,502 · total=3,183</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me understand the problem better:
+- Input: tensor of shape (B, N) where B=10, N=36
+- Output: y[b, j] = x[b, perm[j]] for all b in [0, B) and j in [0, N)
+- This is just permuting columns according to a fixed permutation
+
+The naive PyTorch implementation does `x[:, PERM.to(device=x.device)]` which involves:
+1. Moving PERM to the device
+2. Advanced indexing
+
+I can write a CUDA kernel that directly reads from permuted indices. Let me think about the optimal approach:
+
+For small tensors like (10, 36), we need to be careful about overhead. The total data is 360 floats = 1440 bytes, which is tiny.
+
+A simple approach: each thread handles one element. We need B*N = 360 threads, which is very small for GPU.
+
+Let me write the kernel:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+from kernelbench.distributed_collectives import default_device
+
+B = 10
+N = 36
+
+_g = torch.Generator()
+_g.manual_seed(10)
+PERM = torch.randperm(N, generator=_g)
+
+# Define CUDA kernel
+cuda_source = &quot;&quot;&quot;
+__global__ void permute_kernel(const float* __restrict__ input, float* __restrict__ output, 
+                                const int* __restrict__ perm, int B, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * N;
+    if (idx &lt; total) {
+        int b = idx / N;
+        int j = idx % N;
+        output[idx] = input[b * N + perm[j]];
+    }
+}
+
+void launch_permute(const float* input, float* output, const int* perm, int B, int N) {
+    int total = B * N;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    permute_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(input, output, perm, B, N);
+}
+&quot;&quot;&quot;
+
+cpp_source = &quot;&quot;&quot;
+void launch_permute(const float* input, float* output, const int* perm, int B, int N);
+&quot;&quot;&quot;
+
+permute_extension = load_inline(
+    name=&#x27;permute_extension&#x27;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&#x27;launch_permute&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Register permutation as a persistent buffer
+        self.register_buffer(&#x27;perm&#x27;, PERM.to(torch.int32))
+    
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        B, N = x.shape
+        output = torch.empty_like(x)
+        permute_extension.launch_permute(x.data_ptr(), output.data_ptr(), 
+                                          self.perm.data_ptr(), B, N)
+        return output
+```
+
+Wait, there&#x27;s an issue. The PERM is defined at module level with B and N being global constants. But the permutation should be the same as in the reference. Let me re-read the reference...
+
+Actually, the reference does `x[:, PERM.to(device=x.device)]` which moves PERM to the device each time. I should avoid this by caching PERM as a buffer.
+
+But I need to be careful - the permutation indices should be int32 or int64 for indexing. Let me use int64 to be safe.
+
+Actually wait, in CUDA using int64 might be slower. int32 should be fine since N=36.
+
+Let me also think about optimizations:
+1. Use __ldg for read-only cache on older GPUs (on H100 it might be automatic)
+2. Use vectorized loads if possible
+3. Use shared memory for the permutation array
+
+Actually, for such small data, the permutation array could fit in shared memory or even constant memory. Let me try using constant memory for the permutation.
+
+Actually, since PERM is defined at module level with a fixed seed, we can potentially use constant memory. But the size is N=36 which is small.
+
+Let me start with a simple kernel and optimize from there.
+
+Actually, I realize I should be more careful. The PERM is generated at module level, and my ModelNew needs to use the same PERM. Let me make sure I do that correctly.
+
+Let me write the first version:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Looking at this problem:
+- Input shape: (B=10, N=36) - quite small
+- Operation: Permute columns according to a fixed random permutation
+- Total elements: 360 floats = 1440 bytes
+
+For such small data, minimizing kernel launch overhead and using fast memory access is key. Let me write an optimized CUDA kernel.
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nfrom kernelbench.distributed_collectives import default_device\n\nB = 10\nN = 36\n\n_g = torch.Generator()\n_g.manual_seed(10)\nPERM = torch.randperm(N, generator=_g)\n\ncuda_source = \&quot;\&quot;\&quot;\n__global__ void permute_kernel(const float* __restrict__ input, float* __restrict__ output, \n                                const long* __restrict__ perm, int64_t B, int64_t N) {\n    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int64_t total = B * N;\n    if (idx &lt; total) {\n        int64_t b = idx / N;\n        int64_t j = idx % N;\n        output[idx] = input[b * N + perm[j]];\n    }\n}\n\nvoid launch_permute(const float* input, float* output, const long* perm, int64_t B, int64_t N) {\n    int64_t total = B * N;\n    int threads = 256;\n    int blocks = (total + threads - 1) / threads;\n    permute_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(input, output, perm, B, N);\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\nvoid launch_permute(const float* input, float* output, const long* perm, int64_t B, int64_t N);\n\&quot;\&quot;\&quot;\n\npermute_extension = load_inline(\n    name=&#x27;permute_extension&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;launch_permute&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.register_buffer(&#x27;perm&#x27;, PERM.to(torch.int64))\n    \n    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:\n        B, N = x.shape\n        output = torch.empty_like(x)\n        permute_extension.launch_permute(\n            x.data_ptr(), output.data_ptr(), \n            self.perm.data_ptr(), B, N\n        )\n        return output\n\n\ndef get_inputs():\n    dev = default_device()\n    g = torch.Generator(device=dev)\n    g.manual_seed(10)\n    return [torch.randn(B, N, device=dev, generator=g)]\n\ndef get_init_inputs():\n    return []&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>82.9s turn · 5.2s LLM · 77.6s tools · <span class="turn-tokens">tokens in=2,267 · out=513 · total=2,780</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Good, it compiles. Let me check correctness now.
+</div></details><details><summary>call → run_correctness</summary><div class="block tool-args"><span class="role-tag">call</span><b>run_correctness</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nfrom kernelbench.distributed_collectives import default_device\n\nB = 10\nN = 36\n\n_g = torch.Generator()\n_g.manual_seed(10)\nPERM = torch.randperm(N, generator=_g)\n\ncuda_source = \&quot;\&quot;\&quot;\n__global__ void permute_kernel(const float* __restrict__ input, float* __restrict__ output, \n                                const long* __restrict__ perm, int64_t B, int64_t N) {\n    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int64_t total = B * N;\n    if (idx &lt; total) {\n        int64_t b = idx / N;\n        int64_t j = idx % N;\n        output[idx] = input[b * N + perm[j]];\n    }\n}\n\nvoid launch_permute(const float* input, float* output, const long* perm, int64_t B, int64_t N) {\n    int64_t total = B * N;\n    int threads = 256;\n    int blocks = (total + threads - 1) / threads;\n    permute_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(input, output, perm, B, N);\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\nvoid launch_permute(const float* input, float* output, const long* perm, int64_t B, int64_t N);\n\&quot;\&quot;\&quot;\n\npermute_extension = load_inline(\n    name=&#x27;permute_extension&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;launch_permute&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.register_buffer(&#x27;perm&#x27;, PERM.to(torch.int64))\n    \n    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:\n        B, N = x.shape\n        output = torch.empty_like(x)\n        permute_extension.launch_permute(\n            x.data_ptr(), output.data_ptr(), \n            self.perm.data_ptr(), B, N\n        )\n        return output\n\n\ndef get_inputs():\n    dev = default_device()\n    g = torch.Generator(device=dev)\n    g.manual_seed(10)\n    return [torch.randn(B, N, device=dev, generator=g)]\n\ndef get_init_inputs():\n    return []&quot;
+}</div></details><details open><summary>result ← run_correctness (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>run_correctness</b>
+correctness_kernel FAILED: AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress&#x27; in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+</div></details></div></div>
 </body></html>
