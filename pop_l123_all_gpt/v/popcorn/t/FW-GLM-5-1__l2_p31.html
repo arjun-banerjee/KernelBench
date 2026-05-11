@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 31</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 20:48:51 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 31</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 20:50:57 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">31_FusedMLAAttention.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">10 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">11</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">118027</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">11 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">12</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">142442</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -674,5 +674,58 @@ profile_kernel PASSED: profiling complete.
   DRAM BW%: 0.08→0.17% (↑0.09) ok
   Occupancy: 8.98→17.69% (↑8.70) ok
   Ld sectors/req: 1.67→1.98 (↑0.31) REGRESSED
-  L2 hit%: 193.91→192.52% (↓1.39) REGRESSED</div></details></div></details></div>
+  L2 hit%: 193.91→192.52% (↓1.39) REGRESSED</div></details></div></details><details class="turn-collapse"><summary><b>turn 10</b> · 1 tool call(s) · 152.1s turn · 26.8s LLM · tokens in=21,428 · out=2,987 · total=24,415 · 12,172 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 10</span><span>152.1s turn · 26.8s LLM · 125.4s tools · <span class="turn-tokens">tokens in=21,428 · out=2,987 · total=24,415</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Good progress! The GPU time dropped from 46μs to 16μs, but occupancy is still low (17.7%). The main issues are:
+1. High memory latency stalls (long_scoreboard)
+2. Uncoalesced global loads (2.0x wasted bandwidth)
+3. Low occupancy due to register pressure
+
+The problem is that when computing keys and values, threads are accessing memory in a strided pattern across the weight matrices. Let me restructure to have better memory access patterns. I can:
+1. Prefetch latents into shared memory
+2. Reorganize the weight access pattern
+3. Use more cooperative loading
+
+Actually, looking at the algorithm more carefully:
+- For KV expansion: for each s in 0..t, we compute k[s] = latent[s] @ w_up_k[:, h, :] and v[s] = latent[s] @ w_up_v[:, h, :]
+- The latent is shape [rank], and w_up_k is shape [rank, num_heads, head_dim]
+- So k[s, d] = sum over r: latent[r] * w_up_k[r, h, d]
+
+The access pattern for w_up_k is: for fixed (h, d), we access w_up_k[0..rank-1, h, d], which is strided by num_heads * head_dim. This is not coalesced.
+
+If threads are organized so that each thread handles a different (h, d) pair, they&#x27;d all access consecutive r values with the same stride, which is still bad.
+
+Better approach: have threads cooperate to load latents into shared memory first, then compute the KV expansion.
+
+Actually, the key insight is that for each position s, we need to load the entire latent vector (rank elements) and the entire weight matrices for head h. Let me reorganize:
+1. Load all latents for positions 0..t into shared memory
+2. Then compute KV expansion using shared memory latents
+
+But that would require seq_len * rank floats of shared memory, which is 32 * 24 = 768 floats = 3KB. That&#x27;s manageable.
+
+Actually wait - the issue is that different thread blocks are working on different (b, h, t) tuples, and they all need to read the same latents (for s in 0..t). So latents are being read redundantly across different h and t values.
+
+For a given batch b and position s, the latent is shared across all heads and all query positions t &gt;= s. This suggests a different parallelization strategy might be better.
+
+But let&#x27;s first try to optimize within a single block. The main issue is the memory access pattern. Let me prefetch latents into shared memory:
+
+Actually, looking at the numbers again:
+- GPU time: 16.58 μs
+- The reference is a pure Python implementation with nested loops - it&#x27;s going to be extremely slow
+
+Let me just submit this and see the speedup. The kernel is already much faster than what the Python reference would be. But let me try one more optimization - prefetch latents and reorganize the weight matrix access.
+
+Actually, let me think about this differently. The weights w_up_k and w_up_v have shape [rank, num_heads, head_dim]. For a given head h, we need the slice [:, h, :], which has shape [rank, head_dim]. 
+
+If we reorganize to process multiple positions in parallel within a block, we can:
+1. Load latents for positions 0..t into shared memory (t+1 positions, each with rank floats)
+2. Load the weight matrices for head h into shared memory (2 * rank * head_dim floats)
+
+But that&#x27;s a lot of shared memory. Let me instead try a different approach - have threads load latents cooperatively and then each thread computes a different part of the key/value vectors.
+
+Actually, the simplest improvement might be to load latents into shared memory and then access them from there. Let me try that.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Good progress! GPU time dropped from 46μs to 16μs, but we&#x27;re still latency-bound with low occupancy. The main issue is uncoalesced memory access for weights. Let me restructure to prefetch latents into shared memory and improve the access pattern:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import math\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n\n// Optimized: prefetch latents into shared memory, better coalescing\n__global__ void __launch_bounds__(256) fused_mla_attention_kernel(\n    const float* __restrict__ q,\n    const float* __restrict__ kv_latent,\n    const float* __restrict__ w_up_k,\n    const float* __restrict__ w_up_v,\n    float* __restrict__ out,\n    int batch_size, int seq_len, int num_heads, int head_dim, int rank,\n    float scale\n) {\n    int idx = blockIdx.x;\n    int t = idx % seq_len;\n    idx /= seq_len;\n    int h = idx % num_heads;\n    idx /= num_heads;\n    int b = idx;\n    \n    int tid = threadIdx.x;\n    int nthreads = blockDim.x;\n    \n    // Shared memory layout:\n    // latents: [seq_len, rank]\n    // query: [head_dim]\n    // keys: [seq_len, head_dim]\n    // vals: [seq_len, head_dim]  \n    // scores: [seq_len]\n    extern __shared__ char smem[];\n    float* latents_smem = (float*)smem;\n    float* query_smem = latents_smem + seq_len * rank;\n    float* keys = query_smem + head_dim;\n    float* vals = keys + seq_len * head_dim;\n    float* scores = vals + seq_len * head_dim;\n    \n    // Cooperatively load latents for all positions into shared memory\n    // latents are shape [batch, seq_len, rank]\n    for (int i = tid; i &lt; seq_len * rank; i += nthreads) {\n        int s = i / rank;\n        int r = i % rank;\n        latents_smem[s * rank + r] = kv_latent[(b * seq_len + s) * rank + r];\n    }\n    \n    // Load query into shared memory\n    const float* q_ptr = q + ((b * seq_len + t) * num_heads + h) * head_dim;\n    for (int d = tid; d &lt; head_dim; d += nthreads) {\n        query_smem[d] = q_ptr[d];\n    }\n    \n    __syncthreads();\n    \n    // Compute keys and values for all positions s = 0..t\n    // Parallelize over output elements (s, d)\n    int total_elems = (t + 1) * head_dim;\n    for (int elem = tid; elem &lt; total_elems; elem += nthreads) {\n        int s = elem / head_dim;\n        int d = elem % head_dim;\n        \n        float k = 0.0f;\n        float v = 0.0f;\n        // Compute k[d] = latent[s] @ w_up_k[:, h, d]\n        for (int r = 0; r &lt; rank; r++) {\n            float lat = latents_smem[s * rank + r];\n            k += lat * w_up_k[r * num_heads * head_dim + h * head_dim + d];\n            v += lat * w_up_v[r * num_heads * head_dim + h * head_dim + d];\n        }\n        keys[s * head_dim + d] = k;\n        vals[s * head_dim + d] = v;\n    }\n    \n    __syncthreads();\n    \n    // Compute attention scores: score[s] = (q . k[s]) * scale\n    for (int s = tid; s &lt;= t; s += nthreads) {\n        float score = 0.0f;\n        for (int d = 0; d &lt; head_dim; d++) {\n            score += query_smem[d] * keys[s * head_dim + d];\n        }\n        scores[s] = score * scale;\n    }\n    \n    __syncthreads();\n    \n    // Find max score for numerical stability\n    __shared__ float max_score;\n    __shared__ float sum_exp;\n    \n    float local_max = -INFINITY;\n    for (int s = tid; s &lt;= t; s += nthreads) {\n        local_max = fmaxf(local_max, scores[s]);\n    }\n    \n    // Block-level max reduction using warp shuffles\n    __shared__ float shared_max[8];\n    int lane = tid % 32;\n    int warp_id = tid / 32;\n    int num_warps = nthreads / 32;\n    \n    for (int offset = 16; offset &gt; 0; offset /= 2) {\n        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));\n    }\n    if (lane == 0 &amp;&amp; warp_id &lt; 8) {\n        shared_max[warp_id] = local_max;\n    }\n    __syncthreads();\n    \n    if (warp_id == 0) {\n        float final_max = (lane &lt; num_warps &amp;&amp; lane &lt; 8) ? shared_max[lane] : -INFINITY;\n        for (int offset = 16; offset &gt; 0; offset /= 2) {\n            final_max = fmaxf(final_max, __shfl_down_sync(0xffffffff, final_max, offset));\n        }\n        if (lane == 0) {\n            max_score = final_max;\n        }\n    }\n    __syncthreads();\n    \n    // Compute exp(score - max) and sum\n    float local_sum = 0.0f;\n    for (int s = tid; s &lt;= t; s += nthreads) {\n        float e = expf(scores[s] - max_score);\n        scores[s] = e;\n        local_sum += e;\n    }\n    \n    // Block-level sum reduction\n    __shared__ float shared_sum[8];\n    for (int offset = 16; offset &gt; 0; offset /= 2) {\n        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);\n    }\n    if (lane == 0 &amp;&amp; warp_id &lt; 8) {\n        shared_sum[warp_id] = local_sum;\n    }\n    __syncthreads();\n    \n    if (warp_id == 0) {\n        float final_sum = (lane &lt; num_warps &amp;&amp; lane &lt; 8) ? shared_sum[lane] : 0.0f;\n        for (int offset = 16; offset &gt; 0; offset /= 2) {\n            final_sum += __shfl_down_sync(0xffffffff, final_sum, offset);\n        }\n        if (lane == 0) {\n            sum_exp = final_sum;\n        }\n    }\n    __syncthreads();\n    \n    // Compute weighted sum of values\n    float inv_sum = 1.0f / sum_exp;\n    for (int d = tid; d &lt; head_dim; d += nthreads) {\n        float out_val = 0.0f;\n        for (int s = 0; s &lt;= t; s++) {\n            out_val += scores[s] * inv_sum * vals[s * head_dim + d];\n        }\n        out[((b * seq_len + t) * num_heads + h) * head_dim + d] = out_val;\n    }\n}\n\ntorch::Tensor fused_mla_attention_cuda(\n    torch::Tensor q,\n    torch::Tensor kv_latent,\n    torch::Tensor w_up_k,\n    torch::Tensor w_up_v\n) {\n    TORCH_CHECK(q.is_cuda(), \&quot;q must be a CUDA tensor\&quot;);\n    TORCH_CHECK(kv_latent.is_cuda(), \&quot;kv_latent must be a CUDA tensor\&quot;);\n    TORCH_CHECK(w_up_k.is_cuda(), \&quot;w_up_k must be a CUDA tensor\&quot;);\n    TORCH_CHECK(w_up_v.is_cuda(), \&quot;w_up_v must be a CUDA tensor\&quot;);\n    \n    int batch_size = q.size(0);\n    int seq_len = q.size(1);\n    int num_heads = q.size(2);\n    int head_dim = q.size(3);\n    int rank = kv_latent.size(2);\n    \n    float scale = 1.0f / sqrtf((float)head_dim);\n    \n    auto out = torch::zeros_like(q);\n    \n    int num_blocks = batch_size * num_heads * seq_len;\n    int threads_per_block = 256;\n    \n    // Shared memory: latents + query + keys + vals + scores\n    size_t smem_size = (seq_len * rank + head_dim + 2 * seq_len * head_dim + seq_len) * sizeof(float);\n    \n    fused_mla_attention_kernel&lt;&lt;&lt;num_blocks, threads_per_block, smem_size&gt;&gt;&gt;(\n        q.data_ptr&lt;float&gt;(),\n        kv_latent.data_ptr&lt;float&gt;(),\n        w_up_k.data_ptr&lt;float&gt;(),\n        w_up_v.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        batch_size, seq_len, num_heads, head_dim, rank,\n        scale\n    );\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor fused_mla_attention_cuda(\n    torch::Tensor q,\n    torch::Tensor kv_latent,\n    torch::Tensor w_up_k,\n    torch::Tensor w_up_v\n);\n\&quot;\&quot;\&quot;\n\nmodule = load_inline(\n    name=\&quot;fused_mla_attention\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[\&quot;fused_mla_attention_cuda\&quot;],\n    verbose=True,\n    extra_cuda_cflags=[\&quot;-O3\&quot;],\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fused_mla_attention = module.fused_mla_attention_cuda\n    \n    def forward(self, q, kv_latent, w_up_k, w_up_v):\n        return self.fused_mla_attention(q, kv_latent, w_up_k, w_up_v)&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
