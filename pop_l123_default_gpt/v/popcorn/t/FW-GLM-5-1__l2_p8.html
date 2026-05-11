@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 8</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 13:35:57 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 8</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 13:36:14 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">8_DeepSeekMoEGroundedTop2Routing.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 12</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">21408</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">4 / 12</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">4</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">36173</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -133,5 +133,205 @@ Search for `cudaErrorIllegalAddress&#x27; in https://docs.nvidia.com/cuda/cuda-r
 CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
 For debugging consider passing CUDA_LAUNCH_BLOCKING=1
 Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
-</div></details></div></details></div>
+</div></details></div></details><details class="turn-collapse"><summary><b>turn 3</b> · 1 tool call(s) · 1002.1s turn · 40.0s LLM · tokens in=10,468 · out=4,297 · total=14,765 · 17,394 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 3</span><span>1002.1s turn · 40.0s LLM · 962.1s tools · <span class="turn-tokens">tokens in=10,468 · out=4,297 · total=14,765</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">There&#x27;s an illegal memory access. The issue is likely with how I&#x27;m accessing the similarity matrix. Let me think about the memory layout more carefully.
+
+The issue is that after cublasSgemm writes to similarity, the resulting matrix is in column-major with leading dimension num_experts. But in my fused kernel, I&#x27;m accessing it as if it were row-major:
+```cpp
+const float* sim_row = similarity + token_idx * num_experts;
+```
+
+This assumes row-major layout where each row has num_experts elements. But since cublas wrote it as column-major (num_experts x num_tokens), the memory layout is different.
+
+Let me think about this again:
+- After cublasSgemm with m=num_experts, n=num_tokens, ldc=num_experts, the result is stored as column-major (num_experts x num_tokens)
+- In column-major, element at row i, col j is at position j * ldc + i = j * num_experts + i
+- But in my kernel, I&#x27;m accessing similarity + token_idx * num_experts, which would be at offset token_idx * num_experts
+  - This corresponds to column-major column = token_idx / ldc = token_idx / num_experts? No, that doesn&#x27;t make sense either.
+
+Let me think differently. I want the result in row-major format:
+- similarity[token, expert] = sum_k token_hidden[token, k] * expert_ground[expert, k]
+
+In memory, similarity[token][expert] should be at offset token * num_experts + expert.
+
+But cublasSgemm writes:
+- C_col[row, col] at offset col * ldc + row
+
+So if C is stored with ldc = num_experts and shape (num_experts, num_tokens):
+- C_col[expert, token] = memory[token * num_experts + expert]
+
+But I want:
+- similarity[token, expert] = memory[token * num_experts + expert]
+
+These are different! C_col[expert, token] ≠ similarity[token, expert] in general.
+
+Wait, let me check if they&#x27;re related:
+- similarity[token, expert] = token_hidden @ expert_ground.T
+- C_col = expert_ground.T @ token_hidden (column-major)
+
+Actually, let&#x27;s be more precise about what we want:
+- similarity[num_tokens][num_experts] = token_hidden[num_tokens][hidden_dim] @ expert_ground.T[num_experts][hidden_dim]
+
+The formula is: similarity[t, e] = sum_k token_hidden[t, k] * expert_ground[e, k]
+
+Now, cublasSgemm with transa=T, transb=N:
+- A = expert_ground (pointer to row-major data), A_col has shape (hidden_dim, num_experts)
+- transa=T: op(A) = A_col.T has shape (num_experts, hidden_dim)
+- B = token_hidden (pointer to row-major data), B_col has shape (hidden_dim, num_tokens)
+- transb=N: op(B) = B_col has shape (hidden_dim, num_tokens)
+- C = op(A) @ op(B) has shape (num_experts, num_tokens)
+
+In terms of actual values:
+- C_col[expert, token] = sum_k op(A)[expert, k] * op(B)[k, token]
+- op(A)[expert, k] = A_col.T[expert, k] = A_col[k, expert] = expert_ground.T_col[k, expert]
+  - expert_ground.T_col[k, expert] = expert_ground[expert, k] (since transposing twice)
+- op(B)[k, token] = B_col[k, token] = token_hidden.T_col[k, token]
+  - token_hidden.T_col[k, token] = token_hidden[token, k]
+  
+So C_col[expert, token] = sum_k expert_ground[expert, k] * token_hidden[token, k]
+
+This is exactly similarity[token, expert]!
+
+So C_col[expert, token] = similarity[token, expert]
+And C is stored in column-major with ldc = num_experts:
+- C_col[expert, token] = memory[token * num_experts + expert]
+
+So similarity[token, expert] = memory[token * num_experts + expert]
+
+This matches row-major layout for similarity[num_tokens][num_experts]! Great, so the memory layout is correct.
+
+But wait, if C_col has shape (num_experts, num_tokens), then:
+- rows = num_experts
+- cols = num_tokens
+
+So the matrix has num_experts rows and num_tokens columns.
+Element at row i (expert), col j (token) is at memory[j * ldc + i] = memory[j * num_experts + i].
+
+And I want similarity[token][expert] = memory[token * num_experts + expert].
+
+Setting i = expert, j = token:
+memory[j * num_experts + i] = memory[token * num_experts + expert]
+
+This matches! So the layout is correct.
+
+But wait, in my fused kernel, I access:
+```cpp
+const float* sim_row = similarity + token_idx * num_experts;
+```
+
+This gives a pointer to memory starting at offset token_idx * num_experts.
+Then I access sim_row[e] which is at memory[token_idx * num_experts + e].
+
+And from above, similarity[token_idx, e] = memory[token_idx * num_experts + e].
+
+So this should be correct!
+
+Hmm, let me check the router_logits access:
+```cpp
+const float* logit_row = router_logits + token_idx * num_experts;
+```
+
+router_logits is [num_tokens, num_experts] row-major.
+logit_row points to memory[token_idx * num_experts].
+logit_row[e] is at memory[token_idx * num_experts + e].
+This is router_logits[token_idx, e] ✓
+
+So both accesses look correct. Where&#x27;s the issue?
+
+Oh wait, the problem might be in how I&#x27;m passing the pointers from Python. Let me check.
+
+Actually, looking at the error, it might be an issue with the cublasSgemm call itself. Let me check the arguments again.
+
+cublasSgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
+
+I&#x27;m calling:
+```cpp
+cublasSgemm(handle, 
+    CUBLAS_OP_T, CUBLAS_OP_N,
+    num_experts, num_tokens, hidden_dim,
+    &amp;gemm_alpha,
+    expert_ground, hidden_dim,
+    token_hidden, hidden_dim,
+    &amp;gemm_beta,
+    similarity, num_experts);
+```
+
+Wait, I think the issue is with the leading dimensions. Let me trace through this more carefully.
+
+In cublasSgemm, the matrices A, B, C are in column-major format:
+- A has lda as leading dimension (number of rows in column-major storage)
+- B has ldb as leading dimension
+- C has ldc as leading dimension
+
+Our matrices are:
+- expert_ground: row-major (num_experts, hidden_dim)
+  - In column-major: (hidden_dim, num_experts) with lda = hidden_dim
+- token_hidden: row-major (num_tokens, hidden_dim)
+  - In column-major: (hidden_dim, num_tokens) with ldb = hidden_dim
+- similarity: will be (num_experts, num_tokens) in column-major with ldc = num_experts
+
+With transa=T (transpose A), op(A) has shape (num_experts, hidden_dim)
+With transb=N (no transpose), op(B) has shape (hidden_dim, num_tokens)
+
+So op(A) @ op(B) = (num_experts, hidden_dim) @ (hidden_dim, num_tokens) = (num_experts, num_tokens)
+
+But in my call, I have m=num_experts, n=num_tokens, k=hidden_dim.
+According to cublas documentation:
+- m = number of rows of op(A)
+- n = number of cols of op(B)
+- k = number of cols of op(A) = number of rows of op(B)
+
+So m should be num_experts (rows of op(A) = num_experts), which I have.
+n should be num_tokens (cols of op(B) = num_tokens), which I have.
+k should be hidden_dim (cols of op(A) = hidden_dim, rows of op(B) = hidden_dim), which I have.
+
+The leading dimensions:
+- lda should be &gt;= num_rows of A (before transpose) = hidden_dim
+- ldb should be &gt;= num_rows of B (before transpose) = hidden_dim
+- ldc should be &gt;= num_rows of C = num_experts
+
+I have lda = hidden_dim, ldb = hidden_dim, ldc = num_experts. These all look correct.
+
+Hmm, let me check if the issue is with how PyTorch tensors are laid out. PyTorch uses row-major by default. But contiguous tensors should have the expected layout.
+
+Actually, wait. I just realized the issue might be simpler. Let me check the dimensions:
+- num_tokens = 4096
+- hidden_dim = 128
+- num_experts = 16
+
+These all fit fine. Let me check if there&#x27;s an issue with the kernel bounds.
+
+In the fused kernel:
+```cpp
+int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+if (token_idx &gt;= num_tokens) return;
+```
+
+This looks fine too.
+
+Let me also check if there&#x27;s an issue with accessing the similarity array. After cublasSgemm:
+- similarity has num_experts * num_tokens = 16 * 4096 = 65536 elements
+
+In the fused kernel, I access:
+- similarity + token_idx * num_experts, where token_idx can be 0 to num_tokens-1
+- This gives offsets 0, 16, 32, ..., (4095 * 16) = 0 to 65520
+- I then access indices 0 to num_experts-1 = 0 to 15
+- So total accessed offsets are within 0 to 65535, which is within bounds
+
+This all looks fine.
+
+Let me reconsider the cublas call. Maybe there&#x27;s an issue with the matrix multiplication layout.
+
+Actually, I wonder if the issue is that I&#x27;m not synchronizing after cublas before launching the kernel. cublas calls are asynchronous, so the kernel might start before cublas finishes writing to similarity.
+
+Let me add a cudaStreamSynchronize or use cudaDeviceSynchronize.
+
+Actually, since both are on the default stream (stream 0), they should be automatically serialized. But let me try adding synchronization.
+
+Hmm, let me try a different approach. Instead of using cublas, I&#x27;ll write a custom kernel for the matmul that&#x27;s simpler and easier to debug.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>There&#x27;s a memory access issue. Let me trace through the layout more carefully and fix it:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cublas_v2.h&gt;\n#include &lt;cstdio&gt;\n\n// Fused kernel: compute grounded scores (similarity + logits), find top-2, softmax, output\n// similarity is stored as column-major (num_experts x num_tokens) from cuBLAS\n// layout: memory[expert + token * num_experts] = similarity[token, expert]\n__global__ void fused_grounded_top2_kernel(\n    const float* __restrict__ similarity,\n    const float* __restrict__ router_logits,\n    float* __restrict__ output,\n    int num_tokens,\n    int num_experts) {\n    \n    int token_idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (token_idx &gt;= num_tokens) return;\n    \n    // similarity is column-major: similarity_col[expert, token] = memory[token * num_experts + expert]\n    // We want similarity_row[token, expert] = similarity_col[expert, token]\n    // So similarity_row[token, expert] = memory[token * num_experts + expert]\n    \n    const float* sim_col = similarity + token_idx * num_experts;  // Points to column `token_idx`\n    const float* logit_row = router_logits + token_idx * num_experts;\n    \n    // Find top-2 among grounded scores\n    float max1 = -INFINITY, max2 = -INFINITY;\n    int idx1 = 0, idx2 = 0;\n    \n    for (int e = 0; e &lt; num_experts; e++) {\n        // sim_col[e] = memory[token_idx * num_experts + e] = similarity[token_idx, e]\n        float val = sim_col[e] + logit_row[e];\n        if (val &gt; max1) {\n            max2 = max1;\n            idx2 = idx1;\n            max1 = val;\n            idx1 = e;\n        } else if (val &gt; max2) {\n            max2 = val;\n            idx2 = e;\n        }\n    }\n    \n    // Softmax\n    float max_val = fmaxf(max1, max2);\n    float exp0 = expf(max1 - max_val);\n    float exp1 = expf(max2 - max_val);\n    float sum = exp0 + exp1;\n    \n    float w0 = exp0 / sum;\n    float w1 = exp1 / sum;\n    \n    // Output layout: [num_tokens, 2, 2]\n    // output[token, 0, 0] = idx1 (as float)\n    // output[token, 0, 1] = idx2 (as float)\n    // output[token, 1, 0] = w0\n    // output[token, 1, 1] = w1\n    output[token_idx * 4 + 0] = (float)idx1;\n    output[token_idx * 4 + 1] = (float)idx2;\n    output[token_idx * 4 + 2] = w0;\n    output[token_idx * 4 + 3] = w1;\n}\n\n// Global cuBLAS handle\nstatic cublasHandle_t get_cublas_handle() {\n    static cublasHandle_t handle = nullptr;\n    if (handle == nullptr) {\n        cublasCreate(&amp;handle);\n    }\n    return handle;\n}\n\n// Main entry point\nvoid grounded_top2_moe_router_entry(\n    const float* token_hidden,\n    const float* router_logits,\n    const float* expert_ground,\n    float* output,\n    float alpha,\n    int num_tokens,\n    int hidden_dim,\n    int num_experts) {\n    \n    cublasHandle_t handle = get_cublas_handle();\n    \n    // Allocate workspace for similarity scores\n    float* similarity;\n    cudaMalloc(&amp;similarity, (size_t)num_tokens * num_experts * sizeof(float));\n    \n    // Compute similarity = alpha * token_hidden @ expert_ground.T\n    // token_hidden: [num_tokens, hidden_dim] row-major\n    // expert_ground: [num_experts, hidden_dim] row-major\n    // similarity: [num_tokens, num_experts] - will be stored as column-major from cuBLAS\n    \n    // Using cuBLAS: C = alpha * op(A) * op(B) + beta * C\n    // We want: similarity = token_hidden @ expert_ground.T * alpha\n    // \n    // For row-major A[m,k] and B[n,k], compute C[m,n] = A @ B.T\n    // Interpretation in column-major:\n    // A_col = A.T (k x m), B_col = B.T (k x n)\n    // C_col.T = B_col.T @ A_col = B @ A.T ? No...\n    //\n    // Actually: similarity[t,e] = sum_k token_hidden[t,k] * expert_ground[e,k]\n    // \n    // For cuBLAS, we compute: C_col = expert_ground_col.T @ token_hidden_col\n    // where expert_ground_col (hidden_dim x num_experts) = expert_ground.T\n    //       token_hidden_col (hidden_dim x num_tokens) = token_hidden.T\n    // C_col = (num_experts x hidden_dim) @ (hidden_dim x num_tokens) = (num_experts x num_tokens)\n    // \n    // C_col[expert, token] = sum_k expert_ground[expert,k] * token_hidden[token,k]\n    //                       = similarity[token, expert] \u2713\n    // \n    // Memory layout of C_col (column-major, ldc = num_experts):\n    // C_col[expert, token] = memory[token * num_experts + expert]\n    // So similarity[token, expert] = memory[token * num_experts + expert]\n    \n    const float gemm_alpha = alpha;\n    const float gemm_beta = 0.0f;\n    \n    // cublasSgemm: C = alpha * op(A) * op(B) + beta * C\n    // C(m,n) = op(A)(m,k) * op(B)(k,n)\n    // We want op(A) to have num_experts rows -&gt; A should be expert_ground with transa=T\n    // We want op(B) to have num_tokens cols -&gt; B should be token_hidden with transb=N\n    // \n    // expert_ground as column-major: (hidden_dim x num_experts) with lda=hidden_dim\n    // token_hidden as column-major: (hidden_dim x num_tokens) with ldb=hidden_dim\n    // \n    // op(A) with transa=T: (num_experts x hidden_dim), m=num_experts\n    // op(B) with transb=N: (hidden_dim x num_tokens), n=num_tokens, k=hidden_dim\n    \n    cublasStatus_t status = cublasSgemm(handle, \n        CUBLAS_OP_T, CUBLAS_OP_N,\n        num_experts, num_tokens, hidden_dim,\n        &amp;gemm_alpha,\n        expert_ground, hidden_dim,\n        token_hidden, hidden_dim,\n        &amp;gemm_beta,\n        similarity, num_experts);\n    \n    if (status != CUBLAS_STATUS_SUCCESS) {\n        printf(\&quot;cuBLAS sgemm failed: %d\\\\n\&quot;, status);\n    }\n    \n    // Synchronize to ensure cuBLAS is done before kernel launches\n    cudaDeviceSynchronize();\n    \n    // Launch fused kernel\n    int threads_per_block = 256;\n    int blocks = (num_tokens + threads_per_block - 1) / threads_per_block;\n    \n    fused_grounded_top2_kernel&lt;&lt;&lt;blocks, threads_per_block&gt;&gt;&gt;(\n        similarity, router_logits, output, num_tokens, num_experts);\n    \n    // Free workspace\n    cudaFree(similarity);\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\nvoid grounded_top2_moe_router_entry(\n    const float* token_hidden,\n    const float* router_logits,\n    const float* expert_ground,\n    float* output,\n    float alpha,\n    int num_tokens,\n    int hidden_dim,\n    int num_experts);\n\&quot;\&quot;\&quot;\n\nmodule = load_inline(\n    name=\&quot;grounded_top2_moe_cuda\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[\&quot;grounded_top2_moe_router_entry\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;-arch=sm_90\&quot;],\n    extra_ldflags=[\&quot;-lcublas\&quot;],\n    verbose=True\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.cuda_module = module\n\n    def forward(\n        self,\n        token_hidden: torch.Tensor,\n        router_logits: torch.Tensor,\n        expert_ground: torch.Tensor,\n        alpha: float,\n    ) -&gt; torch.Tensor:\n        num_tokens, hidden_dim = token_hidden.shape\n        num_experts = router_logits.shape[1]\n        \n        # Ensure contiguous tensors\n        token_hidden = token_hidden.contiguous()\n        router_logits = router_logits.contiguous()\n        expert_ground = expert_ground.contiguous()\n        \n        # Output tensor: [num_tokens, 2, 2]\n        output = torch.empty(num_tokens, 2, 2, dtype=torch.float32, device=token_hidden.device)\n        \n        self.cuda_module.grounded_top2_moe_router_entry(\n            token_hidden.data_ptr(),\n            router_logits.data_ptr(),\n            expert_ground.data_ptr(),\n            output.data_ptr(),\n            alpha,\n            num_tokens,\n            hidden_dim,\n            num_experts\n        )\n        \n        return output&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
