@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 18</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 13:11:33 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 18</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn · pop_l123_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-11 13:12:26 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">18_CSRMultiHeadSpMM.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 12</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 12</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">10695</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -88,5 +88,1078 @@ def get_inputs():
 
 def get_init_inputs():
     return []
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 451.1s turn · 84.5s LLM · tokens in=1,713 · out=8,982 · total=10,695 · 37,252 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>451.1s turn · 84.5s LLM · 366.6s tools · <span class="turn-tokens">tokens in=1,713 · out=8,982 · total=10,695</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the problem:
+
+1. This is a multi-head sparse aggregation operation
+2. Input tensors:
+   - `row_ptr`: CSR format row pointers, shape (num_nodes + 1,)
+   - `col_idx`: column indices for edges, shape (num_edges,)
+   - `edge_weight`: per-edge per-head weights, shape (num_edges, num_heads)
+   - `node_feat`: node features, shape (num_nodes, num_heads, head_dim)
+
+3. Output: aggregated features, shape (num_nodes, num_heads, head_dim)
+
+4. The operation: For each destination node, sum over its incoming edges:
+   - Get source node indices from col_idx
+   - Get edge weights for this edge
+   - Multiply node_feat[src] * edge_weight[edge] and sum
+
+Let me think about the CUDA kernel design:
+
+Given:
+- num_nodes = 320
+- avg_degree = 14
+- num_heads = 8
+- head_dim = 32
+
+Total edges = 320 * 14 = ~4480
+
+This is a relatively small problem size. The naive approach in PyTorch has a Python loop over nodes, which is inefficient.
+
+For CUDA, I can:
+1. Assign one thread block per destination node
+2. Within each block, threads cooperate to load and aggregate features
+
+Or:
+1. Assign one thread per edge and use atomic adds (less efficient for this)
+
+Given the small size and the structure, I think block-per-node with shared memory would be good.
+
+Let me think about the thread organization:
+- Each destination node processes its neighbors
+- For each neighbor, we need to multiply weight[num_heads] by feature[num_heads, head_dim] and add to output
+
+One approach:
+- Each block handles one destination node
+- Threads within block handle different (head, dim) combinations
+- Use shared memory for intermediate aggregation
+
+Let me design:
+
+```cuda
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,  // [num_edges, num_heads]
+    const float* __restrict__ node_feat,     // [num_nodes, num_heads, head_dim]
+    float* __restrict__ output,               // [num_nodes, num_heads, head_dim]
+    int num_nodes, int num_heads, int head_dim
+) {
+    int dst = blockIdx.x;
+    if (dst &gt;= num_nodes) return;
+    
+    int start = row_ptr[dst];
+    int end = row_ptr[dst + 1];
+    
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+    
+    // Each thread handles a subset of (head, dim) combinations
+    int total_outputs = num_heads * head_dim;
+    
+    for (int idx = tid; idx &lt; total_outputs; idx += total_threads) {
+        int h = idx / head_dim;
+        int d = idx % head_dim;
+        
+        float sum = 0.0f;
+        for (int edge = start; edge &lt; end; edge++) {
+            int src = col_idx[edge];
+            sum += node_feat[src * num_heads * head_dim + h * head_dim + d] 
+                 * edge_weight[edge * num_heads + h];
+        }
+        output[dst * num_heads * head_dim + h * head_dim + d] = sum;
+    }
+}
+```
+
+This is a simple approach. Let me think about optimizations:
+
+1. Coalesced memory access: The current approach reads node_feat and edge_weight in a strided manner. Could be improved.
+
+2. Shared memory: We could load edge weights and source features into shared memory.
+
+3. For the problem size (320 nodes, 8 heads, 32 dims), we have 320 blocks and each block has 8*32=256 outputs to compute.
+
+Let me think about a better approach:
+- Use blockDim = 256 (or 128) threads
+- Each thread handles one (head, dim) pair
+- Loop over edges for each thread
+
+Actually, let me reconsider. The problem is:
+- 320 nodes
+- ~14 neighbors per node
+- 8 heads
+- 32 dims per head
+
+One thread per (node, head, dim) = 320 * 8 * 32 = 81920 threads
+This is reasonable for a GPU.
+
+Let me try a different approach:
+- Grid dimension: (num_nodes, num_heads)
+- Block dimension: head_dim threads
+
+Each thread block handles one (node, head) pair, and each thread handles one dimension.
+
+```cuda
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,
+    const float* __restrict__ node_feat,
+    float* __restrict__ output,
+    int num_nodes, int num_heads, int head_dim
+) {
+    int dst = blockIdx.x;
+    int h = blockIdx.y;
+    int d = threadIdx.x;
+    
+    if (dst &gt;= num_nodes || h &gt;= num_heads || d &gt;= head_dim) return;
+    
+    int start = row_ptr[dst];
+    int end = row_ptr[dst + 1];
+    
+    float sum = 0.0f;
+    for (int edge = start; edge &lt; end; edge++) {
+        int src = col_idx[edge];
+        sum += node_feat[src * num_heads * head_dim + h * head_dim + d]
+             * edge_weight[edge * num_heads + h];
+    }
+    output[dst * num_heads * head_dim + h * head_dim + d] = sum;
+}
+```
+
+This might not be efficient because:
+1. Small blocks (32 threads) - low occupancy
+2. Each thread does independent work - no cooperation
+
+Let me think about a better memory access pattern...
+
+Actually, let me check the memory layout:
+- node_feat: [num_nodes, num_heads, head_dim]
+- edge_weight: [num_edges, num_heads]
+
+In the kernel above:
+- edge_weight[edge * num_heads + h] - strided access across heads
+- node_feat[src * num_heads * head_dim + h * head_dim + d] - contiguous within head
+
+Let me try another approach with shared memory for edge weights:
+
+```cuda
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,
+    const float* __restrict__ node_feat,
+    float* __restrict__ output,
+    int num_nodes, int num_heads, int head_dim
+) {
+    int dst = blockIdx.x;
+    if (dst &gt;= num_nodes) return;
+    
+    int start = row_ptr[dst];
+    int end = row_ptr[dst + 1];
+    int num_edges = end - start;
+    
+    extern __shared__ float shared_mem[];
+    float* shared_weights = shared_mem;  // [max_edges, num_heads]
+    int* shared_src = (int*)&amp;shared_weights[num_edges * num_heads];
+    
+    // Cooperatively load edge data into shared memory
+    for (int i = threadIdx.x; i &lt; num_edges; i += blockDim.x) {
+        int edge = start + i;
+        int src = col_idx[edge];
+        shared_src[i] = src;
+        for (int h = 0; h &lt; num_heads; h++) {
+            shared_weights[i * num_heads + h] = edge_weight[edge * num_heads + h];
+        }
+    }
+    __syncthreads();
+    
+    // Each thread handles one output element
+    int total_outputs = num_heads * head_dim;
+    for (int idx = threadIdx.x; idx &lt; total_outputs; idx += blockDim.x) {
+        int h = idx / head_dim;
+        int d = idx % head_dim;
+        
+        float sum = 0.0f;
+        for (int i = 0; i &lt; num_edges; i++) {
+            int src = shared_src[i];
+            float w = shared_weights[i * num_heads + h];
+            sum += node_feat[src * num_heads * head_dim + h * head_dim + d] * w;
+        }
+        output[dst * num_heads * head_dim + h * head_dim + d] = sum;
+    }
+}
+```
+
+Hmm, the shared memory approach might not help much because the main memory access is still to node_feat.
+
+Let me think about a different optimization: vectorized loads.
+
+For head_dim = 32, we could use float4 loads to load 4 floats at a time.
+
+Actually, let me step back and think about the data access pattern:
+
+For each destination node, we access:
+- edge_weight[edge, :] for each edge (num_heads floats per edge)
+- node_feat[src, :, :] for each source node (num_heads * head_dim floats per node)
+
+The node_feat access is the dominant one. For each edge, we access node_feat[src, h, :] for each head h.
+
+If we organize threads to handle different heads, we could have:
+- Threads 0-31 handle head 0, dims 0-31
+- Threads 32-63 handle head 1, dims 0-31
+- etc.
+
+With 8 heads * 32 dims = 256 threads, we could have one thread per (head, dim).
+
+Let me think about memory coalescing:
+- If consecutive threads handle consecutive dims, then for a given src and head, threads access consecutive memory locations (good)
+- If consecutive threads handle different heads, then access is strided (bad)
+
+So organizing as (head, dim) where tid = head * head_dim + dim means:
+- Thread 0 accesses head 0, dim 0
+- Thread 1 accesses head 0, dim 1
+- ...
+- Thread 31 accesses head 0, dim 31
+- Thread 32 accesses head 1, dim 0
+- etc.
+
+This means within a warp (32 threads), we access the same head but different dims. This is contiguous in memory for node_feat - good!
+
+But for edge_weight, we access edge_weight[edge, h] where h varies across warps. So threads in different warps access different elements of edge_weight.
+
+Let me write a kernel with this organization:
+
+```cuda
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,
+    const float* __restrict__ node_feat,
+    float* __restrict__ output,
+    int num_nodes, int num_heads, int head_dim
+) {
+    // One block per destination node
+    // Threads handle different (head, dim) combinations
+    
+    int dst = blockIdx.x;
+    if (dst &gt;= num_nodes) return;
+    
+    int start = row_ptr[dst];
+    int end = row_ptr[dst + 1];
+    
+    int tid = threadIdx.x;
+    int h = tid / head_dim;
+    int d = tid % head_dim;
+    
+    if (h &gt;= num_heads) return;
+    
+    float sum = 0.0f;
+    
+    for (int edge = start; edge &lt; end; edge++) {
+        int src = col_idx[edge];
+        float w = edge_weight[edge * num_heads + h];
+        float f = node_feat[src * num_heads * head_dim + h * head_dim + d];
+        sum += w * f;
+    }
+    
+    output[dst * num_heads * head_dim + h * head_dim + d] = sum;
+}
+```
+
+This should work with blockDim = 256 threads (8 heads * 32 dims).
+
+Wait, there&#x27;s an issue. The inner loop iterates over edges, and for each edge, we load:
+- col_idx[edge] - one int
+- edge_weight[edge * num_heads + h] - one float per thread
+- node_feat[src * num_heads * head_dim + h * head_dim + d] - one float per thread
+
+The col_idx access is shared across all threads in the block - could use shared memory.
+
+For edge_weight, each thread in a warp (same head) accesses the same edge_weight[edge * num_heads + h]. This is a broadcast - could use __ldg or shared memory.
+
+For node_feat, consecutive threads access consecutive dims for the same src and head - this is coalesced!
+
+Let me optimize:
+1. Load col_idx[src] into shared memory
+2. Load edge_weight for all heads into shared memory
+3. Then iterate
+
+```cuda
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,
+    const float* __restrict__ node_feat,
+    float* __restrict__ output,
+    int num_nodes, int num_heads_param, int head_dim
+) {
+    int dst = blockIdx.x;
+    if (dst &gt;= num_nodes) return;
+    
+    int start = row_ptr[dst];
+    int end = row_ptr[dst + 1];
+    int num_edges_node = end - start;
+    
+    extern __shared__ char shared_mem[];
+    int* shared_src = (int*)shared_mem;
+    float* shared_weights = (float*)(shared_src + num_edges_node);
+    
+    // Load source indices and weights into shared memory
+    // Using cooperative loading
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    for (int i = tid; i &lt; num_edges_node; i += block_size) {
+        int edge = start + i;
+        shared_src[i] = col_idx[edge];
+        for (int h = 0; h &lt; num_heads_param; h++) {
+            shared_weights[i * num_heads_param + h] = edge_weight[edge * num_heads_param + h];
+        }
+    }
+    __syncthreads();
+    
+    // Each thread handles one (head, dim)
+    int h = tid / head_dim;
+    int d = tid % head_dim;
+    
+    if (h &gt;= num_heads_param) return;
+    
+    float sum = 0.0f;
+    for (int i = 0; i &lt; num_edges_node; i++) {
+        int src = shared_src[i];
+        float w = shared_weights[i * num_heads_param + h];
+        sum += node_feat[src * num_heads_param * head_dim + h * head_dim + d] * w;
+    }
+    
+    output[dst * num_heads_param * head_dim + h * head_dim + d] = sum;
+}
+```
+
+Actually, the parameter naming is confusing. Let me rename num_heads_param to n_heads to avoid confusion with the variable.
+
+Actually, let me reconsider the shared memory approach. The problem is:
+- We need to load edge_weight for all heads for each edge
+- This is num_edges_node * num_heads floats
+- With avg_degree=14 and num_heads=8, that&#x27;s 112 floats per node
+- That&#x27;s 448 bytes per node, which fits in shared memory
+
+But loading the weights cooperatively might not be efficient because each thread has to loop over heads.
+
+Let me try a simpler approach first without shared memory for weights, and see if it&#x27;s fast enough.
+
+Actually, let me think about the problem differently. The reference implementation does:
+```python
+for dst in range(num_nodes):
+    start = int(row_ptr[dst].item())
+    end = int(row_ptr[dst + 1].item())
+    if end &gt; start:
+        src = col_idx[start:end].long()
+        weights = edge_weight[start:end].unsqueeze(-1)  # [num_edges_node, num_heads, 1]
+        out[dst] = (node_feat[src] * weights).sum(dim=0)  # [num_heads, head_dim]
+```
+
+So for each destination node:
+1. Get source indices for all incoming edges
+2. Get edge weights for those edges
+3. Broadcast weights to [num_edges_node, num_heads, 1]
+4. Multiply node_feat[src] (shape [num_edges_node, num_heads, head_dim]) by weights
+5. Sum over edges dimension
+
+The CUDA kernel should do the same but in parallel.
+
+Let me write a simple kernel first:
+
+```cuda
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,
+    const float* __restrict__ node_feat,
+    float* __restrict__ output,
+    int num_nodes, int n_heads, int head_dim
+) {
+    int dst = blockIdx.x;
+    if (dst &gt;= num_nodes) return;
+    
+    int start = row_ptr[dst];
+    int end = row_ptr[dst + 1];
+    
+    int tid = threadIdx.x;
+    int h = tid / head_dim;
+    int d = tid % head_dim;
+    
+    if (h &gt;= n_heads) return;
+    
+    float sum = 0.0f;
+    
+    for (int edge = start; edge &lt; end; edge++) {
+        int src = col_idx[edge];
+        float w = edge_weight[edge * n_heads + h];
+        float f = node_feat[src * n_heads * head_dim + h * head_dim + d];
+        sum += w * f;
+    }
+    
+    output[dst * n_heads * head_dim + h * head_dim + d] = sum;
+}
+```
+
+Launch configuration:
+- Grid: num_nodes blocks
+- Block: max(256, n_heads * head_dim) threads = 256 threads
+
+Let me write the full Python code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,
+    const float* __restrict__ node_feat,
+    float* __restrict__ output,
+    int num_nodes, int n_heads, int head_dim
+) {
+    int dst = blockIdx.x;
+    if (dst &gt;= num_nodes) return;
+    
+    int start = row_ptr[dst];
+    int end = row_ptr[dst + 1];
+    
+    int tid = threadIdx.x;
+    int h = tid / head_dim;
+    int d = tid % head_dim;
+    
+    if (h &gt;= n_heads) return;
+    
+    float sum = 0.0f;
+    
+    for (int edge = start; edge &lt; end; edge++) {
+        int src = col_idx[edge];
+        float w = edge_weight[edge * n_heads + h];
+        float f = node_feat[src * n_heads * head_dim + h * head_dim + d];
+        sum += w * f;
+    }
+    
+    output[dst * n_heads * head_dim + h * head_dim + d] = sum;
+}
+
+void sparse_aggregate_cuda(
+    const torch::Tensor&amp; row_ptr,
+    const torch::Tensor&amp; col_idx,
+    const torch::Tensor&amp; edge_weight,
+    const torch::Tensor&amp; node_feat,
+    torch::Tensor&amp; output
+) {
+    int num_nodes = row_ptr.numel() - 1;
+    int n_heads = node_feat.size(1);
+    int head_dim = node_feat.size(2);
+    
+    int threads = n_heads * head_dim;
+    int blocks = num_nodes;
+    
+    sparse_aggregate_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        row_ptr.data_ptr&lt;int&gt;(),
+        col_idx.data_ptr&lt;int&gt;(),
+        edge_weight.data_ptr&lt;float&gt;(),
+        node_feat.data_ptr&lt;float&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        num_nodes, n_heads, head_dim
+    );
+}
+&quot;&quot;&quot;
+
+cpp_source = &quot;&quot;&quot;
+void sparse_aggregate_cuda(
+    const torch::Tensor&amp; row_ptr,
+    const torch::Tensor&amp; col_idx,
+    const torch::Tensor&amp; edge_weight,
+    const torch::Tensor&amp; node_feat,
+    torch::Tensor&amp; output);
+&quot;&quot;&quot;
+
+sparse_agg_module = load_inline(
+    name=&#x27;sparse_agg&#x27;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&#x27;sparse_aggregate_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        row_ptr: torch.Tensor,
+        col_idx: torch.Tensor,
+        edge_weight: torch.Tensor,
+        node_feat: torch.Tensor,
+    ) -&gt; torch.Tensor:
+        num_nodes = row_ptr.numel() - 1
+        num_heads = node_feat.shape[1]
+        head_dim = node_feat.shape[2]
+        out = torch.zeros(num_nodes, num_heads, head_dim, dtype=node_feat.dtype, device=node_feat.device)
+        
+        sparse_agg_module.sparse_aggregate_cuda(row_ptr, col_idx, edge_weight, node_feat, out)
+        
+        return out
+```
+
+Wait, I think I should check the function signature more carefully. The load_inline expects `functions=[&#x27;sparse_aggregate_cuda&#x27;]` which should be a function that can be called from Python.
+
+Let me look at the cpp_sources again. The function signature should be:
+```cpp
+void sparse_aggregate_cuda(
+    const torch::Tensor&amp; row_ptr,
+    const torch::Tensor&amp; col_idx,
+    const torch::Tensor&amp; edge_weight,
+    const torch::Tensor&amp; node_feat,
+    torch::Tensor&amp; output);
+```
+
+But I defined it in cuda_sources. Let me move the implementation to cpp_sources with the CUDA code:
+
+Actually, the correct way is:
+1. cpp_sources declares the function
+2. cuda_sources defines the function
+3. functions lists the function name
+
+Let me check the torch documentation...
+
+From what I understand, `load_inline` expects:
+- `cpp_sources`: C++ code that can call CUDA functions
+- `cuda_sources`: CUDA kernel definitions
+- `functions`: list of function names to bind to Python
+
+The way it works is:
+1. The cuda_sources are compiled with nvcc
+2. The cpp_sources provide a C++ wrapper
+3. pybind11 bindings are auto-generated for functions listed in `functions`
+
+So I should have:
+- A CUDA kernel in cuda_sources
+- A host function in cuda_sources (or cpp_sources) that calls the kernel
+- The host function name in `functions`
+
+Let me rewrite:
+
+```python
+cuda_source = &quot;&quot;&quot;
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,
+    const float* __restrict__ node_feat,
+    float* __restrict__ output,
+    int num_nodes, int n_heads, int head_dim
+) {
+    int dst = blockIdx.x;
+    if (dst &gt;= num_nodes) return;
+    
+    int start = row_ptr[dst];
+    int end = row_ptr[dst + 1];
+    
+    int tid = threadIdx.x;
+    int h = tid / head_dim;
+    int d = tid % head_dim;
+    
+    if (h &gt;= n_heads) return;
+    
+    float sum = 0.0f;
+    
+    for (int edge = start; edge &lt; end; edge++) {
+        int src = col_idx[edge];
+        float w = edge_weight[edge * n_heads + h];
+        float f = node_feat[src * n_heads * head_dim + h * head_dim + d];
+        sum += w * f;
+    }
+    
+    output[dst * n_heads * head_dim + h * head_dim + d] = sum;
+}
+
+void sparse_aggregate_cuda(
+    torch::Tensor row_ptr,
+    torch::Tensor col_idx,
+    torch::Tensor edge_weight,
+    torch::Tensor node_feat,
+    torch::Tensor output
+) {
+    int num_nodes = row_ptr.numel() - 1;
+    int n_heads = node_feat.size(1);
+    int head_dim = node_feat.size(2);
+    
+    int threads = n_heads * head_dim;
+    int blocks = num_nodes;
+    
+    sparse_aggregate_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        row_ptr.data_ptr&lt;int&gt;(),
+        col_idx.data_ptr&lt;int&gt;(),
+        edge_weight.data_ptr&lt;float&gt;(),
+        node_feat.data_ptr&lt;float&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        num_nodes, n_heads, head_dim
+    );
+}
+&quot;&quot;&quot;
+
+sparse_agg_module = load_inline(
+    name=&#x27;sparse_agg&#x27;,
+    cpp_sources=&quot;&quot;,
+    cuda_sources=cuda_source,
+    functions=[&#x27;sparse_aggregate_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+)
+```
+
+Actually, I realize that the CUDA source can contain both kernel and host function. Let me simplify.
+
+But wait, I also need to be careful about the integer division in CUDA. `tid / head_dim` is integer division which is fine. But `tid % head_dim` should also work.
+
+Let me also think about edge cases:
+- What if num_heads * head_dim is not a power of 2?
+- What if num_nodes is 0?
+
+For the given parameters (num_heads=8, head_dim=32), we have 256 threads per block, which is fine.
+
+Let me also check if I need to handle the case where threadIdx.x &gt;= n_heads * head_dim. Since we launch with threads = n_heads * head_dim, all threads should be valid.
+
+But wait, what if n_heads or head_dim changes? The kernel should still work as long as threads = n_heads * head_dim &lt;= 1024 (max threads per block).
+
+For n_heads=8, head_dim=32, threads=256 which is fine.
+
+Let me compile and test:
+
+Actually, let me also think about optimization. The current kernel has:
+1. Each thread loops over all edges for its destination node
+2. Each thread makes independent memory accesses
+
+The memory access pattern:
+- col_idx[edge]: shared across threads in a block, could use shared memory
+- edge_weight[edge * n_heads + h]: each warp accesses the same h, so threads in a warp access the same address (broadcast)
+- node_feat[src * n_heads * head_dim + h * head_dim + d]: coalesced within a warp
+
+The broadcast for edge_weight is actually efficient on modern GPUs. But we could potentially use __ldg to cache it.
+
+Let me try adding __ldg:
+
+```cuda
+float w = __ldg(&amp;edge_weight[edge * n_heads + h]);
+```
+
+But actually, since we&#x27;re iterating over edges in a loop, the data should already be in cache.
+
+Let me first try the basic kernel and see if it&#x27;s correct and fast enough.
+
+One more thing: I should make sure to handle the case where end &lt;= start (no edges for this node). In that case, the loop doesn&#x27;t execute and sum stays 0, which is correct.
+
+Let me also make sure the kernel uses restrict pointers for better optimization:
+
+```cuda
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,
+    const float* __restrict__ node_feat,
+    float* __restrict__ output,
+    int num_nodes, int n_heads, int head_dim)
+```
+
+This is already done.
+
+Let me write the complete code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,
+    const float* __restrict__ node_feat,
+    float* __restrict__ output,
+    int num_nodes, int n_heads, int head_dim) {
+    
+    int dst = blockIdx.x;
+    if (dst &gt;= num_nodes) return;
+    
+    int start = row_ptr[dst];
+    int end = row_ptr[dst + 1];
+    
+    int tid = threadIdx.x;
+    int h = tid / head_dim;
+    int d = tid % head_dim;
+    
+    if (h &gt;= n_heads) return;
+    
+    float sum = 0.0f;
+    
+    for (int edge = start; edge &lt; end; edge++) {
+        int src = col_idx[edge];
+        float w = edge_weight[edge * n_heads + h];
+        float f = node_feat[src * n_heads * head_dim + h * head_dim + d];
+        sum += w * f;
+    }
+    
+    output[dst * n_heads * head_dim + h * head_dim + d] = sum;
+}
+
+void sparse_aggregate_cuda(
+    torch::Tensor row_ptr,
+    torch::Tensor col_idx,
+    torch::Tensor edge_weight,
+    torch::Tensor node_feat,
+    torch::Tensor output) {
+    
+    int num_nodes = row_ptr.numel() - 1;
+    int n_heads = node_feat.size(1);
+    int head_dim = node_feat.size(2);
+    
+    int threads = n_heads * head_dim;
+    int blocks = num_nodes;
+    
+    sparse_aggregate_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        row_ptr.data_ptr&lt;int&gt;(),
+        col_idx.data_ptr&lt;int&gt;(),
+        edge_weight.data_ptr&lt;float&gt;(),
+        node_feat.data_ptr&lt;float&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        num_nodes, n_heads, head_dim);
+}
+&quot;&quot;&quot;
+
+sparse_agg_module = load_inline(
+    name=&#x27;sparse_agg&#x27;,
+    cuda_sources=cuda_source,
+    functions=[&#x27;sparse_aggregate_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        row_ptr: torch.Tensor,
+        col_idx: torch.Tensor,
+        edge_weight: torch.Tensor,
+        node_feat: torch.Tensor,
+    ) -&gt; torch.Tensor:
+        num_nodes = row_ptr.numel() - 1
+        num_heads = node_feat.shape[1]
+        head_dim = node_feat.shape[2]
+        out = torch.zeros(num_nodes, num_heads, head_dim, dtype=node_feat.dtype, device=node_feat.device)
+        
+        sparse_agg_module.sparse_aggregate_cuda(row_ptr, col_idx, edge_weight, node_feat, out)
+        
+        return out
+```
+
+Wait, I need to also handle the case where cpp_sources is needed. Looking at torch.utils.cpp_extension.load_inline documentation:
+
+- cpp_sources: C++ source code (optional)
+- cuda_sources: CUDA source code (optional)
+- functions: list of function names to bind
+
+If I only provide cuda_sources, the functions should still be bound correctly. Let me verify this.
+
+Actually, I think I should include both cpp_sources (empty) and cuda_sources. Let me check if that&#x27;s needed.
+
+Looking at examples, it seems like cuda_sources can contain both the kernel and host function, and load_inline will handle the binding.
+
+But I also need to check if I&#x27;m using the correct function signature. In PyTorch C++ extension, the typical signature uses torch::Tensor, not const torch::Tensor&amp;.
+
+Let me adjust:
+
+```cpp
+void sparse_aggregate_cuda(
+    torch::Tensor row_ptr,
+    torch::Tensor col_idx,
+    torch::Tensor edge_weight,
+    torch::Tensor node_feat,
+    torch::Tensor output)
+```
+
+This should work with load_inline.
+
+Let me also think about whether I need to call cudaDeviceSynchronize() or if that&#x27;s handled automatically by PyTorch. PyTorch should handle synchronization automatically when returning tensors.
+
+One more consideration: should I check for empty tensors? For num_nodes=0, the kernel won&#x27;t launch any blocks, so it should be fine.
+
+Let me compile and test this kernel.
+
+Actually, I realize I need to be more careful. Let me check the integer type for row_ptr and col_idx. The problem says they are int32 (dtype=torch.int32), so I should use `int*` in CUDA which is 32-bit on most systems.
+
+Wait, on some systems, `int` might be 64-bit. Let me use `int32_t` to be safe:
+
+```cuda
+#include &lt;cstdint&gt;
+
+__global__ void sparse_aggregate_kernel(
+    const int32_t* __restrict__ row_ptr,
+    const int32_t* __restrict__ col_idx,
+    ...
+```
+
+Actually, on most systems (including NVIDIA GPUs), `int` is 32-bit. But to be safe and portable, I could use `int32_t`. Let me check if this requires an include.
+
+In CUDA, `int` is guaranteed to be 32-bit. So I&#x27;ll stick with `int`.
+
+Let me also think about potential issues:
+1. The output tensor is zero-initialized in Python before calling the kernel. This is fine.
+2. The kernel writes to output[dst * n_heads * head_dim + h * head_dim + d] which is unique for each thread in a block.
+
+I think the kernel should be correct. Let me compile it.
+
+Wait, I just realized that in the CUDA kernel, I&#x27;m using `row_ptr[dst]` and `row_ptr[dst + 1]`. These are loaded from global memory. Since consecutive blocks access consecutive elements of row_ptr, this should be coalesced within a warp.
+
+Actually, no - blocks are independent. Each block loads two values from row_ptr: row_ptr[dst] and row_ptr[dst + 1]. Since blocks are launched in order (block 0, 1, 2, ...), consecutive blocks access consecutive memory locations, which should be cached well.
+
+OK let me write the complete code and compile it.
+
+Actually, one more thing. I should check the data types. The problem states:
+- row_ptr: int32
+- col_idx: int32
+- edge_weight: float32 (shape: [num_edges, num_heads])
+- node_feat: float32 (shape: [num_nodes, num_heads, head_dim])
+
+So I need to use:
+- int* for row_ptr and col_idx
+- float* for edge_weight, node_feat, and output
+
+This is what I have. Good.
+
+Let me write the final code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+__global__ void sparse_aggregate_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ edge_weight,
+    const float* __restrict__ node_feat,
+    float* __restrict__ output,
+    int num_nodes, int n_heads, int head_dim) {
+    
+    int dst = blockIdx.x;
+    if (dst &gt;= num_nodes) return;
+    
+    int start = row_ptr[dst];
+    int end = row_ptr[dst + 1];
+    
+    int tid = threadIdx.x;
+    int h = tid / head_dim;
+    int d = tid % head_dim;
+    
+    if (h &gt;= n_heads) return;
+    
+    float sum = 0.0f;
+    
+    for (int edge = start; edge &lt; end; edge++) {
+        int src = col_idx[edge];
+        float w = edge_weight[edge * n_heads + h];
+        float f = node_feat[src * n_heads * head_dim + h * head_dim + d];
+        sum += w * f;
+    }
+    
+    output[dst * n_heads * head_dim + h * head_dim + d] = sum;
+}
+
+void sparse_aggregate_cuda(
+    torch::Tensor row_ptr,
+    torch::Tensor col_idx,
+    torch::Tensor edge_weight,
+    torch::Tensor node_feat,
+    torch::Tensor output) {
+    
+    int num_nodes = row_ptr.numel() - 1;
+    int n_heads = node_feat.size(1);
+    int head_dim = node_feat.size(2);
+    
+    int threads = n_heads * head_dim;
+    int blocks = num_nodes;
+    
+    sparse_aggregate_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        row_ptr.data_ptr&lt;int&gt;(),
+        col_idx.data_ptr&lt;int&gt;(),
+        edge_weight.data_ptr&lt;float&gt;(),
+        node_feat.data_ptr&lt;float&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        num_nodes, n_heads, head_dim);
+}
+&quot;&quot;&quot;
+
+sparse_agg_module = load_inline(
+    name=&#x27;sparse_agg&#x27;,
+    cuda_sources=cuda_source,
+    functions=[&#x27;sparse_aggregate_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        row_ptr: torch.Tensor,
+        col_idx: torch.Tensor,
+        edge_weight: torch.Tensor,
+        node_feat: torch.Tensor,
+    ) -&gt; torch.Tensor:
+        num_nodes = row_ptr.numel() - 1
+        num_heads = node_feat.shape[1]
+        head_dim = node_feat.shape[2]
+        out = torch.zeros(num_nodes, num_heads, head_dim, dtype=node_feat.dtype, device=node_feat.device)
+        
+        sparse_agg_module.sparse_aggregate_cuda(row_ptr, col_idx, edge_weight, node_feat, out)
+        
+        return out
+```
+
+Let me compile this.
+
+Actually, I realize there might be an issue with how I&#x27;m calling the CUDA module. Let me check if the function is called as a method on the module object.
+
+From the PyTorch documentation, after load_inline, you can call the functions directly on the returned module object:
+```python
+sparse_agg_module.sparse_aggregate_cuda(...)
+```
+
+This should work.
+
+Let me also make sure the output tensor is contiguous. torch.zeros creates a contiguous tensor by default, so that should be fine.
+
+Actually, wait. Let me reconsider the memory access pattern for edge_weight.
+
+edge_weight has shape [num_edges, num_heads]. In the kernel, I access:
+```cuda
+float w = edge_weight[edge * n_heads + h];
+```
+
+For threads in the same warp (same h), they all access the same location: edge_weight[edge * n_heads + h].
+This is a broadcast pattern, which is efficient - all threads in the warp read the same memory location, and the hardware handles this efficiently.
+
+For node_feat:
+```cuda
+float f = node_feat[src * n_heads * head_dim + h * head_dim + d];
+```
+
+For threads in the same warp:
+- They have the same h (since warp size = 32 = head_dim, and h = tid / 32)
+- They have different d (d = tid % 32)
+- So they access node_feat[src * n_heads * head_dim + h * head_dim + 0], node_feat[src * n_heads * head_dim + h * head_dim + 1], etc.
+
+This is a contiguous access pattern within a warp! Perfect for coalesced memory access.
+
+Wait, let me double-check. If blockDim = 256 and head_dim = 32:
+- Threads 0-31 have h=0, d=0-31
+- Threads 32-63 have h=1, d=0-31
+- ...
+
+Within a warp (consecutive 32 threads), they have the same h and different d. So they access consecutive memory locations for node_feat. 
+
+Actually, I need to be more careful. The warp size is 32. If blockDim = 256, the warps are:
+- Warp 0: threads 0-31 (h=0, d=0-31)
+- Warp 1: threads 32-63 (h=1, d=0-31)
+- ...
+
+So within each warp, threads have the same h and different d. They access:
+node_feat[... + h * head_dim + 0], node_feat[... + h * head_dim + 1], ..., node_feat[... + h * head_dim + 31]
+
+These are consecutive addresses! Coalesced access. 
+
+For edge_weight, within a warp, all threads access edge_weight[edge * n_heads + h], which is the same address. This is a broadcast.
+
+OK, the memory access pattern looks good. Let me compile and test.
+
+Actually, I want to optimize a bit more. Since edge_weight is accessed by broadcast within a warp, I could consider using __ldg to explicitly load through the read-only cache. But modern GPUs usually detect this pattern automatically, so it might not be necessary.
+
+Let me also consider using shared memory for col_idx and edge_weight. But given the small problem size (avg_degree=14), the overhead of loading to shared memory might not be worth it.
+
+Let me first try the simple kernel and see the performance.
+
+Actually, I realize I should double check the indexing. Let me trace through an example:
+
+Suppose:
+- num_nodes = 320
+- num_edges = 320 * 14 = 4480
+- n_heads = 8
+- head_dim = 32
+
+For dst = 0:
+- start = row_ptr[0] = 0
+- end = row_ptr[1] = 14 (assuming avg_degree)
+- src[0:14] = col_idx[0:14] (some random source nodes)
+- edge_weight[0:14, :] = weights for the first 14 edges
+
+The kernel computes:
+- For thread (h=0, d=0):
+  - sum = sum over edges: node_feat[col_idx[edge], 0, 0] * edge_weight[edge, 0]
+- For thread (h=0, d=1):
+  - sum = sum over edges: node_feat[col_idx[edge], 0, 1] * edge_weight[edge, 0]
+- ...
+
+This matches the reference implementation. 
+
+Let me compile and test.
+
+One more thing: I should check if there are any integer overflow issues. The maximum value of src is num_nodes - 1 = 319. The index src * n_heads * head_dim + h * head_dim + d is at most 319 * 8 * 32 + 7 * 32 + 31 = 81920 + 224 + 31 = 82175, which fits comfortably in a 32-bit integer.
+
+Similarly, edge * n_heads + h is at most 4479 * 8 + 7 = 35839, which also fits.
+
+OK, let me compile and test the kernel.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Looking at this multi-head sparse aggregation operation, I need to implement a CUDA kernel that efficiently aggregates weighted source node features for each destination node.
+
+The key observations:
+1. CSR format with row_ptr/col_idx for sparse adjacency
+2. Per-edge, per-head weights
+3. For each destination node, sum weighted features from all neighbors
+4. Output shape: (num_nodes, num_heads, head_dim)
+
+My approach:
+- One thread block per destination node
+- Each thread handles one (head, dim) output element
+- Threads within a warp access contiguous memory for node features (coalesced)
+- Edge weights are broadcast within a warp (efficient)
+
+Let me first check GPU specs and then implement the kernel:
+</div><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
 </body></html>
