@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L5 P1 · hardware_translation_stub</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L5 · problem 1</a></div><div class="site-subtitle">grok-4.3 · hardware_translation_stub · sl5_hw_translation_8xh100_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← hardware_translation_stub</a><a href="../models/grok-4.3.html">← grok-4.3</a><span class="meta">generated 2026-05-13 17:20:54 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">hardware_translation_stub:</span><a href="../../../v/hardware_translation_stub/index.html">overview</a><a href="../../../v/hardware_translation_stub/models/FW-GLM-5-1.html">FW-GLM-5-1</a><a href="../../../v/hardware_translation_stub/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/hardware_translation_stub/models/grok-4.3.html" class=current>grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-in_progress">in_progress</span>
+  <span style="font-size:13px;">01_paged_attention_v1.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">grok-4.3</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">7571</div></div>
+  <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp16</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">hardware_translation_stub</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-13T17:19:20Z</div></div>
+</div>
+
+
+
+</div><details class="turn-collapse"><summary><b>turn 0</b> · 0 tool call(s) · 29.0s turn · 29.0s LLM · tokens in=5,045 · out=1,675 · total=7,571 · 7,630 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>29.0s turn · 29.0s LLM · 0.0s tools · <span class="turn-tokens">tokens in=5,045 · out=1,675 · total=7,571</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">The task is to re-optimize a paged attention v1 CUDA kernel for H100 (Hopper) from A100 (Ampere). The provided code is the launcher and dispatch for paged_attention_v1.
+I need to re-optimize the CUDA kernel for paged attention from A100 to H100. The original is for Ampere, and I have to adapt it for Hopper architecture on an 8x H100 node.
+
+The inputs are q, k, v tensors with shapes like [BATCH, NUM_HEADS ... (truncated)
+
+The task is to create a ModelNew class that uses a custom CUDA kernel optimized for H100, matching the I/O contract with q, k, v inputs.
+
+Since the original kernel is paged attention, but inputs are not paged, I think I need to implement a standard attention kernel optimized for H100.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_fp16.h&gt;
+
+#define WARP_SIZE 32
+
+template &lt;int HEAD_SIZE, int BLOCK_SIZE&gt;
+__global__ void paged_attention_v1_kernel(
+    half* __restrict__ out,
+    const half* __restrict__ query,
+    const half* __restrict__ key_cache,
+    const half* __restrict__ value_cache,
+    const int num_kv_heads,
+    const float scale,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride) {
+
+    const int head_idx = blockIdx.x;
+    const int seq_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int seq_len = seq_lens[seq_idx];
+    const int num_blocks = (seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    extern __shared__ float sdata[];
+
+    const half* q_ptr = query + seq_idx * q_stride + head_idx * HEAD_SIZE;
+    half* out_ptr = out + seq_idx * (gridDim.x * HEAD_SIZE) + head_idx * HEAD_SIZE;
+
+    float q_reg[HEAD_SIZE / 2];
+    #pragma unroll
+    for (int i = 0; i &lt; HEAD_SIZE / 2; i++) {
+        if (tid * 2 + i * 2 &lt; HEAD_SIZE) {
+            q_reg[i] = __half2float(q_ptr[tid * 2 + i]);
+        }
+    }
+
+    float max_score = -1e20f;
+    float sum_exp = 0.0f;
+    float acc[HEAD_SIZE / 2] = {0.0f};
+
+    for (int b = 0; b &lt; num_blocks; b++) {
+        int block_id = block_tables[seq_idx * max_num_blocks_per_seq + b];
+        if (block_id &lt; 0) continue;
+
+        const half* k_ptr = key_cache + block_id * kv_block_stride + (head_idx % num_kv_heads) * kv_head_stride;
+        const half* v_ptr = value_cache + block_id * kv_block_stride + (head_idx % num_kv_heads) * kv_head_stride;
+
+        for (int t = 0; t &lt; BLOCK_SIZE; t++) {
+            int pos = b * BLOCK_SIZE + t;
+            if (pos &gt;= seq_len) break;
+
+            float score = 0.0f;
+            #pragma unroll
+            for (int i = 0; i &lt; HEAD_SIZE / 2; i++) {
+                float k_val = __half2float(k_ptr[t * HEAD_SIZE + tid * 2 + i]);
+                score += q_reg[i] * k_val;
+            }
+            score *= scale;
+
+            float new_max = fmaxf(max_score, score);
+            float exp_score = __expf(score - new_max);
+            float rescale = __expf(max_score - new_max);
+
+            sum_exp = sum_exp * rescale + exp_score;
+            max_score = new_max;
+
+            #pragma unroll
+            for (int i = 0; i &lt; HEAD_SIZE / 2; i++) {
+                float v_val = __half2float(v_ptr[t * HEAD_SIZE + tid * 2 + i]);
+                acc[i] = acc[i] * rescale + exp_score * v_val;
+            }
+        }
+    }
+
+    float inv_sum = 1.0f / sum_exp;
+    #pragma unroll
+    for (int i = 0; i &lt; HEAD_SIZE / 2; i++) {
+        float val = acc[i] * inv_sum;
+        out_ptr[tid * 2 + i] = __float2half(val);
+    }
+}
+
+torch::Tensor paged_attention_cuda(
+    torch::Tensor query,
+    torch::Tensor key_cache,
+    torch::Tensor value_cache,
+    torch::Tensor block_tables,
+    torch::Tensor seq_lens,
+    int num_kv_heads,
+    float scale,
+    int block_size) {
+
+    int batch = query.size(0);
+    int num_heads = query.size(1);
+    int head_size = query.size(2);
+    int max_seq = seq_lens.max().item&lt;int&gt;();
+    int max_blocks = block_tables.size(1);
+
+    auto out = torch::zeros({batch, num_heads, head_size}, query.options());
+
+    dim3 grid(num_heads, batch);
+    dim3 block(128);
+
+    int shared_mem = 0;
+
+    AT_DISPATCH_HALF_TYPES(query.scalar_type(), &quot;paged_attn&quot;, ([&amp;] {
+        if (head_size == 128) {
+            if (block_size == 16) {
+                paged_attention_v1_kernel&lt;128, 16&gt;&lt;&lt;&lt;grid, block, shared_mem&gt;&gt;&gt;(
+                    reinterpret_cast&lt;half*&gt;(out.data_ptr&lt;at::Half&gt;()),
+                    reinterpret_cast&lt;const half*&gt;(query.data_ptr&lt;at::Half&gt;()),
+                    reinterpret_cast&lt;const half*&gt;(key_cache.data_ptr&lt;at::Half&gt;()),
+                    reinterpret_cast&lt;const half*&gt;(value_cache.data_ptr&lt;at::Half&gt;()),
+                    num_kv_heads, scale,
+                    block_tables.data_ptr&lt;int&gt;(),
+                    seq_lens.data_ptr&lt;int&gt;(),
+                    max_blocks,
+                    query.stride(0),
+                    key_cache.stride(0),
+                    key_cache.stride(1));
+            }
+        }
+    }));
+
+    return out;
+}
+&#x27;&#x27;&#x27;
+
+cpp_source = &#x27;&#x27;&#x27;
+torch::Tensor paged_attention_cuda(
+    torch::Tensor query,
+    torch::Tensor key_cache,
+    torch::Tensor value_cache,
+    torch::Tensor block_tables,
+    torch::Tensor seq_lens,
+    int num_kv_heads,
+    float scale,
+    int block_size);
+&#x27;&#x27;&#x27;
+
+module = load_inline(
+    name=&#x27;paged_attn_h100&#x27;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&#x27;paged_attention_cuda&#x27;],
+    verbose=False,
+    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;, &#x27;-arch=sm_90&#x27;]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_heads, num_kv_heads, head_size):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.scale = 1.0 / (head_size ** 0.5)
+        self.block_size = 16
+
+    def forward(self, q, k, v):
+        batch, num_heads, seq_len, head_size = q.shape
+        # Simulate paged cache layout for compatibility
+        num_blocks = (seq_len + self.block_size - 1) // self.block_size
+        block_tables = torch.arange(batch * num_blocks, device=q.device).view(batch, num_blocks).to(torch.int32)
+        seq_lens = torch.full((batch,), seq_len, device=q.device, dtype=torch.int32)
+        key_cache = k.reshape(batch, num_blocks, self.block_size, self.num_kv_heads, head_size).permute(0, 3, 1, 2, 4).contiguous().reshape(-1, self.num_kv_heads, head_size)
+        value_cache = v.reshape(batch, num_blocks, self.block_size, self.num_kv_heads, head_size).permute(0, 3, 1, 2, 4).contiguous().reshape(-1, self.num_kv_heads, head_size)
+        key_cache = key_cache.reshape(-1, self.num_kv_heads, head_size)
+        value_cache = value_cache.reshape(-1, self.num_kv_heads, head_size)
+        return module.paged_attention_cuda(q, key_cache, value_cache, block_tables, seq_lens, self.num_kv_heads, self.scale, self.block_size)
+```
+</div></div></details></div>
+</body></html>
