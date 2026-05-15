@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 12</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-15 17:16:59 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 12</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_default_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-15 17:19:03 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">12_DeepSeekMoEDispatchPermute.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">1679</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">5099</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -97,5 +97,122 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 639.5s turn · 14.6s LLM · tokens in=1,792 · out=1,628 · total=3,420 · 7,970 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>639.5s turn · 14.6s LLM · 625.0s tools · <span class="turn-tokens">tokens in=1,792 · out=1,628 · total=3,420</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me write the kernel. This is essentially a scatter/gather operation where tokens are scattered into output rows based on expert assignments.
+
+Key observations:
+- Each token reads a hidden_dim sized vector and writes it to a specific output row
+- The mapping is: token -&gt; (expert_idx, slot_idx) -&gt; row = expert_offsets[expert] + slot_idx
+- This is independent per token, so we can parallelize across tokens
+
+I&#x27;ll use a 1D grid where each thread handles one token. Each thread:
+1. Reads its expert_idx[token] and slot_idx[token]
+2. Computes the output row: expert_offsets[expert] + slot_idx
+3. Copies the hidden_dim values from token_hidden[token] to out[row]
+
+For hidden_dim=160, each thread copies 160 floats = 640 bytes. This is reasonable for a single thread.
+
+Let me write the kernel:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# CUDA kernel for MoE dispatch permute
+cuda_source = &quot;&quot;&quot;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void moe_dispatch_permute_kernel(
+    const float* __restrict__ token_hidden,
+    const int64_t* __restrict__ expert_idx,
+    const int64_t* __restrict__ slot_idx,
+    const int64_t* __restrict__ expert_offsets,
+    float* __restrict__ out,
+    int num_tokens,
+    int hidden_dim) {
+    
+    int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token &gt;= num_tokens) return;
+    
+    // Get expert and compute output row
+    int64_t expert = expert_idx[token];
+    int64_t row = expert_offsets[expert] + slot_idx[token];
+    
+    // Copy the hidden vector
+    const float* src = token_hidden + token * hidden_dim;
+    float* dst = out + row * hidden_dim;
+    
+    for (int i = 0; i &lt; hidden_dim; i++) {
+        dst[i] = src[i];
+    }
+}
+
+void moe_dispatch_permute_cuda(
+    const torch::Tensor&amp; token_hidden,
+    const torch::Tensor&amp; expert_idx,
+    const torch::Tensor&amp; slot_idx,
+    const torch::Tensor&amp; expert_offsets,
+    torch::Tensor&amp; out) {
+    
+    int num_tokens = token_hidden.size(0);
+    int hidden_dim = token_hidden.size(1);
+    
+    int threads = 256;
+    int blocks = (num_tokens + threads - 1) / threads;
+    
+    moe_dispatch_permute_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        token_hidden.data_ptr&lt;float&gt;(),
+        expert_idx.data_ptr&lt;int64_t&gt;(),
+        slot_idx.data_ptr&lt;int64_t&gt;(),
+        expert_offsets.data_ptr&lt;int64_t&gt;(),
+        out.data_ptr&lt;float&gt;(),
+        num_tokens,
+        hidden_dim);
+}
+&quot;&quot;&quot;
+
+cpp_source = &quot;&quot;&quot;
+void moe_dispatch_permute_cuda(
+    const torch::Tensor&amp; token_hidden,
+    const torch::Tensor&amp; expert_idx,
+    const torch::Tensor&amp; slot_idx,
+    const torch::Tensor&amp; expert_offsets,
+    torch::Tensor&amp; out);
+&quot;&quot;&quot;
+
+module = load_inline(
+    name=&#x27;moe_dispatch_permute&#x27;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&#x27;moe_dispatch_permute_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, token_hidden: torch.Tensor, expert_idx: torch.Tensor, 
+                slot_idx: torch.Tensor, expert_offsets: torch.Tensor) -&gt; torch.Tensor:
+        num_rows = int(expert_offsets[-1].item())
+        out = torch.zeros(num_rows, token_hidden.shape[1], dtype=token_hidden.dtype, device=token_hidden.device)
+        module.moe_dispatch_permute_cuda(token_hidden, expert_idx, slot_idx, expert_offsets, out)
+        return out
+```
+
+Actually, let me think about optimization. For hidden_dim=160 floats, that&#x27;s 640 bytes per token. With 4096 tokens, that&#x27;s 2.5 MB of data movement.
+
+A simple optimization would be to use coalesced memory access patterns, but since each token reads from its own row and writes to a scattered row, coalescing is naturally limited.
+
+Let me try vectorized loads/stores. With 160 floats, we could load/store in chunks of 4 (using float4) - that&#x27;s 40 float4 operations per token.
+
+Let me write an optimized version:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me write the CUDA kernel. This is a scatter operation where each token&#x27;s hidden vector is written to a specific row based on expert assignment.
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# CUDA kernel for MoE dispatch permute\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\n__global__ void moe_dispatch_permute_kernel(\n    const float* __restrict__ token_hidden,\n    const int64_t* __restrict__ expert_idx,\n    const int64_t* __restrict__ slot_idx,\n    const int64_t* __restrict__ expert_offsets,\n    float* __restrict__ out,\n    int num_tokens,\n    int hidden_dim) {\n    \n    int token = blockIdx.x * blockDim.x + threadIdx.x;\n    if (token &gt;= num_tokens) return;\n    \n    // Get expert and compute output row\n    int64_t expert = expert_idx[token];\n    int64_t row = expert_offsets[expert] + slot_idx[token];\n    \n    // Copy the hidden vector\n    const float* src = token_hidden + (int64_t)token * hidden_dim;\n    float* dst = out + row * hidden_dim;\n    \n    for (int i = 0; i &lt; hidden_dim; i++) {\n        dst[i] = src[i];\n    }\n}\n\nvoid moe_dispatch_permute_cuda(\n    const torch::Tensor&amp; token_hidden,\n    const torch::Tensor&amp; expert_idx,\n    const torch::Tensor&amp; slot_idx,\n    const torch::Tensor&amp; expert_offsets,\n    torch::Tensor&amp; out) {\n    \n    int num_tokens = token_hidden.size(0);\n    int hidden_dim = token_hidden.size(1);\n    \n    int threads = 256;\n    int blocks = (num_tokens + threads - 1) / threads;\n    \n    moe_dispatch_permute_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(\n        token_hidden.data_ptr&lt;float&gt;(),\n        expert_idx.data_ptr&lt;int64_t&gt;(),\n        slot_idx.data_ptr&lt;int64_t&gt;(),\n        expert_offsets.data_ptr&lt;int64_t&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        num_tokens,\n        hidden_dim);\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\nvoid moe_dispatch_permute_cuda(\n    const torch::Tensor&amp; token_hidden,\n    const torch::Tensor&amp; expert_idx,\n    const torch::Tensor&amp; slot_idx,\n    const torch::Tensor&amp; expert_offsets,\n    torch::Tensor&amp; out);\n\&quot;\&quot;\&quot;\n\nmodule = load_inline(\n    name=&#x27;moe_dispatch_permute_v1&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;moe_dispatch_permute_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=False\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, token_hidden: torch.Tensor, expert_idx: torch.Tensor, \n                slot_idx: torch.Tensor, expert_offsets: torch.Tensor) -&gt; torch.Tensor:\n        num_rows = int(expert_offsets[-1].item())\n        out = torch.zeros(num_rows, token_hidden.shape[1], dtype=token_hidden.dtype, device=token_hidden.device)\n        module.moe_dispatch_permute_cuda(token_hidden, expert_idx, slot_idx, expert_offsets, out)\n        return out&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
