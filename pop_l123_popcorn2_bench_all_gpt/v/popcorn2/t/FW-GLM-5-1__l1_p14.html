@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 14</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-15 23:22:14 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 14</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-15 23:23:15 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">14_GaussianProcessRBFKernel.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">2683</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">13947</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -125,5 +125,846 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 148.3s turn · 74.2s LLM · tokens in=2,686 · out=8,578 · total=11,264 · 29,738 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>148.3s turn · 74.2s LLM · 74.1s tools · <span class="turn-tokens">tokens in=2,686 · out=8,578 · total=11,264</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">This is an H100 with great specs. Let me understand the kernel:
+
+1. Input: X1 (B, N, D), X2 (B, M, D)
+2. Output: K (B, N, M) where K[b,i,j] = var * exp(-0.5 * ||X1[b,i] - X2[b,j]||^2 / l2)
+
+The algorithm:
+- X1_sq = (X1**2).sum(-1, keepdim=True) -&gt; (B, N, 1)
+- X2_sq = (X2**2).sum(-1, keepdim=True) -&gt; (B, M, 1)
+- dist_sq = X1_sq - 2 * X1 @ X2.T + X2_sq.T -&gt; (B, N, M)
+- K = var * exp(-0.5 * dist_sq / l2)
+
+The dominant operation is the matrix multiplication X1 @ X2.T, which is O(B * N * M * D). For the given sizes:
+- B = 32, N = 512, M = 128, D = 8
+
+The matmul is about 32 * 512 * 128 * 8 = ~134M multiply-adds. This isn&#x27;t huge.
+
+The output size is 32 * 512 * 128 = ~2M elements.
+
+Let me write a kernel that:
+1. Computes X1_sq and X2_sq (simple reductions)
+2. Uses cuBLAS for the matrix multiplication (X1 @ X2.T)
+3. Fuses the final computation
+
+Actually, for optimal performance, I should consider fusing as much as possible. The key insight is that:
+- The matmul X1 @ X2.T is the expensive part
+- The rest can be fused
+
+Let me write a custom kernel that does everything in one pass, using shared memory tiling.
+
+For a fused kernel, I&#x27;ll compute:
+- Each thread computes one element of K[b,i,j]
+- Thread needs X1[b,i,:] and X2[b,j,:]
+- Use shared memory to load tiles of X1 and X2
+
+With the problem sizes:
+- N = 512, M = 128, D = 8
+- We can have each thread block handle one batch element
+- Or we can have thread blocks handle tiles of the output matrix
+
+Given D=8 is small, we can have each thread compute multiple output elements and keep X1 and X2 rows in registers.
+
+Let me design a kernel:
+1. Each thread computes K[b,i,j] for multiple (i,j) pairs
+2. Shared memory holds a tile of X1 rows and X2 rows
+3. Each thread loads X1[i] and X2[j] into registers, computes dot products, etc.
+
+Actually, since D=8 is very small, a better approach might be:
+- Have each warp compute a row of the output (M=128 elements)
+- Each thread in the warp handles M/32 = 4 elements
+- Load X1[i,:] into registers once, then iterate over X2 rows
+
+Let me try a different approach:
+- Use cuBLAS for X1 @ X2.T (highly optimized)
+- Custom kernel for the final exponent computation
+
+Or even better:
+- Use cublasGemmStridedBatchedEx for batched matmul
+- Then a simple elementwise kernel for exp computation
+
+Let me start with this approach since it&#x27;s reliable and leverages optimized libraries.
+
+Actually, let me think more carefully. The computation is:
+1. X1_sq = sum of squares of X1
+2. X2_sq = sum of squares of X2  
+3. dist_sq = X1_sq - 2*matmul + X2_sq.T
+
+We can fuse steps 1 and 2 with the matmul into one kernel, or we can do:
+1. Compute X1_sq and X2_sq in one kernel
+2. Use cuBLAS for matmul
+3. Fuse dist_sq computation with exp in another kernel
+
+Or we can do everything in one custom kernel.
+
+Given the sizes (B=32, N=512, M=128, D=8), let me try a fully fused approach:
+
+Kernel design:
+- Grid: (B * N, 1, 1) blocks
+- Each block handles one row of the output (one X1 vector)
+- Block size: 128 or 256 threads
+- Each thread computes one or more output elements
+
+Actually, let me try:
+- Grid: (B, N, 1) in 2D blocks
+- Each block computes all M outputs for one X1 vector
+- Threads in block cooperatively compute
+
+Since M=128, we can have:
+- 128 threads per block, each computing one output element
+- Or 64 threads, each computing 2 output elements
+- Or 32 threads (warp), each computing 4 output elements
+
+Let me go with 128 threads per block:
+- blockDim.x = 128 (one thread per output column)
+- Each thread loads X1[row] into registers (8 floats)
+- Each thread loads one X2[j] into registers
+- Computes dot product and squared norm
+- Computes final K value
+
+The memory access pattern:
+- X1[row] is loaded once per thread block (broadcast)
+- X2[j] is loaded by thread j (coalesced if we&#x27;re careful)
+
+Wait, the block index would be (batch, row). So blockIdx.x = batch, blockIdx.y = row.
+
+Let me redesign:
+- Grid: (B, N) blocks
+- Block size: M threads
+- Each thread computes K[batch, row, thread_id]
+
+This gives us 32 * 512 = 16384 blocks, each with 128 threads.
+
+For each block:
+- Load X1[batch, row, :] into registers (shared across threads? No, each thread loads it)
+- Thread j loads X2[batch, j, :] 
+- Compute dot product
+
+Wait, if each thread loads the same X1[row], that&#x27;s wasteful. Better to use shared memory.
+
+Actually, since D=8, we can have each thread just load X1[row] independently. The compiler will likely optimize this to use shared memory or broadcast.
+
+Let me write the kernel:
+
+```cuda
+__global__ void rbf_kernel_forward(
+    const float* __restrict__ X1,
+    const float* __restrict__ X2,
+    float* __restrict__ K,
+    int B, int N, int M, int D,
+    float l2, float var) {
+    
+    int batch = blockIdx.x;
+    int row = blockIdx.y;
+    int col = threadIdx.x;
+    
+    if (batch &gt;= B || row &gt;= N || col &gt;= M) return;
+    
+    // Load X1[batch, row, :]
+    float x1[8];  // D=8
+    const float* x1_ptr = X1 + (batch * N + row) * D;
+    for (int d = 0; d &lt; D; d++) {
+        x1[d] = x1_ptr[d];
+    }
+    
+    // Load X2[batch, col, :]
+    float x2[8];
+    const float* x2_ptr = X2 + (batch * M + col) * D;
+    for (int d = 0; d &lt; D; d++) {
+        x2[d] = x2_ptr[d];
+    }
+    
+    // Compute squared distance
+    float dot = 0.0f;
+    float x1_sq = 0.0f;
+    float x2_sq = 0.0f;
+    for (int d = 0; d &lt; D; d++) {
+        dot += x1[d] * x2[d];
+        x1_sq += x1[d] * x1[d];
+        x2_sq += x2[d] * x2[d];
+    }
+    
+    float dist_sq = x1_sq - 2.0f * dot + x2_sq;
+    if (dist_sq &lt; 0.0f) dist_sq = 0.0f;
+    
+    // Compute kernel value
+    float k = var * expf(-0.5f * dist_sq / l2);
+    
+    // Store result
+    K[batch * N * M + row * M + col] = k;
+}
+```
+
+Actually, wait. If M &gt; 1024 (max threads per block), this won&#x27;t work. But M=128, so we&#x27;re fine.
+
+Let me also check: if blockDim.x = 128, and M = 128, then each thread handles exactly one output.
+
+But what if M != 128? We need a more general kernel. Let me use a loop:
+
+```cuda
+__global__ void rbf_kernel_forward(
+    const float* __restrict__ X1,
+    const float* __restrict__ X2,
+    float* __restrict__ K,
+    int B, int N, int M, int D,
+    float l2, float var) {
+    
+    int batch = blockIdx.z;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (batch &gt;= B || row &gt;= N || col &gt;= M) return;
+    
+    // ... rest of kernel
+}
+```
+
+Actually, let me think about the launch configuration more carefully.
+
+We want to output K[B, N, M] = K[32, 512, 128].
+
+Total elements: 32 * 512 * 128 = 2,097,152 = ~2M elements.
+
+If we use 1D grid of thread blocks:
+- Each block has 256 threads (for example)
+- Each thread computes one element
+- Need ~8192 blocks
+
+Or we can use 2D blocks:
+- Each block is (16, 16) = 256 threads
+- Grid is (M/16, N/16, B) = (8, 32, 32) = 8192 blocks
+
+Let me try the simpler approach first: each thread computes one element.
+
+```cuda
+__global__ void rbf_kernel_forward(
+    const float* __restrict__ X1,
+    const float* __restrict__ X2,
+    float* __restrict__ K,
+    int B, int N, int M, int D,
+    float l2, float var) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * N * M;
+    
+    if (idx &gt;= total) return;
+    
+    int batch = idx / (N * M);
+    int row = (idx % (N * M)) / M;
+    int col = idx % M;
+    
+    // Load X1[batch, row, :]
+    const float* x1_ptr = X1 + (batch * N + row) * D;
+    
+    // Load X2[batch, col, :]
+    const float* x2_ptr = X2 + (batch * M + col) * D;
+    
+    // Compute squared distance
+    float dot = 0.0f;
+    float x1_sq = 0.0f;
+    float x2_sq = 0.0f;
+    for (int d = 0; d &lt; D; d++) {
+        float x1_d = x1_ptr[d];
+        float x2_d = x2_ptr[d];
+        dot += x1_d * x2_d;
+        x1_sq += x1_d * x1_d;
+        x2_sq += x2_d * x2_d;
+    }
+    
+    float dist_sq = x1_sq - 2.0f * dot + x2_sq;
+    dist_sq = max(dist_sq, 0.0f);
+    
+    // Compute kernel value
+    float k = var * expf(-0.5f * dist_sq / l2);
+    
+    // Store result
+    K[idx] = k;
+}
+```
+
+This is simple but might have poor memory access patterns since we&#x27;re accessing X1 and X2 strided.
+
+Let me think about a better approach. The key is to maximize memory coalescing.
+
+For output K, linear index gives us K[batch, row, col] where col varies fastest. This means threads in a warp access consecutive K elements, which is good.
+
+For X2, X2[batch, col, :] where col varies with thread index. So threads access X2[batch, 0, :], X2[batch, 1, :], etc. Each thread accesses D consecutive floats. This is also coalesced.
+
+For X1, X1[batch, row, :] where row is determined by (idx % (N*M)) / M. For threads in a warp (32 consecutive threads), they all have the same row (assuming M &gt;= 32). So all threads in a warp access the same X1[batch, row, :]. This could cause a broadcast which is efficient on modern GPUs.
+
+Actually wait, let me recalculate. idx goes from 0 to total-1. For the first 32 threads:
+- idx = 0..31
+- batch = 0 (all)
+- row = 0 (all, since idx &lt; M = 128)
+- col = 0..31
+
+So all 32 threads access X1[0, 0, :] and X2[0, col, :] for col = 0..31. X1 is broadcast (efficient) and X2 is coalesced (efficient).
+
+For threads 128..159:
+- idx = 128..159
+- batch = 0 (all)
+- row = 1 (all, since idx/M = 128/128 = 1)
+- col = 0..31
+
+Same pattern: X1 broadcast, X2 coalesced.
+
+This seems fine. Let me try this approach.
+
+But wait, I should also think about using shared memory to load X1 row once per block. Currently each thread loads X1 independently. If we use shared memory:
+
+```cuda
+__global__ void rbf_kernel_forward(...) {
+    __shared__ float x1_shared[8]; // D = 8
+    
+    // First thread loads X1
+    if (threadIdx.x == 0) {
+        for (int d = 0; d &lt; D; d++) {
+            x1_shared[d] = x1_ptr[d];
+        }
+    }
+    __syncthreads();
+    
+    // All threads use x1_shared
+    ...
+}
+```
+
+But this requires a block where all threads work on the same X1 row. My current design doesn&#x27;t guarantee that.
+
+Let me redesign:
+- Grid: (B * N, 1, 1) blocks, each block handles one X1 row
+- Block size: M threads, each handles one X2 column
+- Use shared memory for X1 row
+
+Actually, let&#x27;s do:
+- Grid: (B, N) blocks in 2D (z dimension not needed if we use x and y)
+- Block size: 128 threads in x dimension (assuming M &lt;= 128)
+
+Wait, CUDA has 3D grid and blocks. Let me use:
+- blockIdx.x for batch
+- blockIdx.y for row
+- threadIdx.x for col
+
+Actually, CUDA limits: blockIdx.x and blockIdx.y can be up to 2^31 - 1, but blockDim.x &lt;= 1024.
+
+For our case:
+- B = 32
+- N = 512  
+- M = 128
+
+We can use:
+- blockIdx.x = batch (0 to 31)
+- blockIdx.y = row (0 to 511)
+- threadIdx.x = col (0 to 127)
+
+This gives gridDim = (32, 512) and blockDim = (128, 1, 1).
+
+Each block handles one (batch, row) pair. All threads in the block compute K[batch, row, col] for col = 0..M-1.
+
+This is perfect for shared memory: all threads need X1[batch, row, :], so load it once into shared memory.
+
+```cuda
+__global__ void rbf_kernel_forward(
+    const float* __restrict__ X1,
+    const float* __restrict__ X2,
+    float* __restrict__ K,
+    int B, int N, int M, int D,
+    float l2, float var) {
+    
+    int batch = blockIdx.x;
+    int row = blockIdx.y;
+    int col = threadIdx.x;
+    
+    if (batch &gt;= B || row &gt;= N || col &gt;= M) return;
+    
+    // Shared memory for X1 row
+    __shared__ float x1_shared[8]; // D is usually small
+    
+    // Cooperative load of X1 row
+    for (int d = threadIdx.x; d &lt; D; d += blockDim.x) {
+        x1_shared[d] = X1[(batch * N + row) * D + d];
+    }
+    __syncthreads();
+    
+    // Load X2[batch, col, :]
+    const float* x2_ptr = X2 + (batch * M + col) * D;
+    
+    // Compute squared distance
+    float dot = 0.0f;
+    float x2_sq = 0.0f;
+    for (int d = 0; d &lt; D; d++) {
+        float x1_d = x1_shared[d];
+        float x2_d = x2_ptr[d];
+        dot += x1_d * x2_d;
+        x2_sq += x2_d * x2_d;
+    }
+    
+    float x1_sq = 0.0f;
+    for (int d = 0; d &lt; D; d++) {
+        x1_sq += x1_shared[d] * x1_shared[d];
+    }
+    
+    float dist_sq = x1_sq - 2.0f * dot + x2_sq;
+    dist_sq = max(dist_sq, 0.0f);
+    
+    // Compute kernel value
+    float k = var * expf(-0.5f * dist_sq / l2);
+    
+    // Store result
+    K[batch * N * M + row * M + col] = k;
+}
+```
+
+But wait, D might not be 8 in all cases. Let me handle general D.
+
+Also, I need to handle the case where M &gt; blockDim.x. Let me use a stride loop:
+
+```cuda
+__global__ void rbf_kernel_forward(
+    const float* __restrict__ X1,
+    const float* __restrict__ X2,
+    float* __restrict__ K,
+    int B, int N, int M, int D,
+    float l2, float var) {
+    
+    int batch = blockIdx.x;
+    int row = blockIdx.y;
+    
+    if (batch &gt;= B || row &gt;= N) return;
+    
+    // Shared memory for X1 row (dynamic size)
+    extern __shared__ float x1_shared[];
+    
+    // Cooperative load of X1 row
+    for (int d = threadIdx.x; d &lt; D; d += blockDim.x) {
+        x1_shared[d] = X1[(batch * N + row) * D + d];
+    }
+    __syncthreads();
+    
+    // Compute x1_sq once
+    float x1_sq = 0.0f;
+    for (int d = 0; d &lt; D; d++) {
+        x1_sq += x1_shared[d] * x1_shared[d];
+    }
+    
+    // Loop over columns
+    for (int col = threadIdx.x; col &lt; M; col += blockDim.x) {
+        // Load X2[batch, col, :]
+        const float* x2_ptr = X2 + (batch * M + col) * D;
+        
+        // Compute dot product and x2_sq
+        float dot = 0.0f;
+        float x2_sq = 0.0f;
+        for (int d = 0; d &lt; D; d++) {
+            float x1_d = x1_shared[d];
+            float x2_d = x2_ptr[d];
+            dot += x1_d * x2_d;
+            x2_sq += x2_d * x2_d;
+        }
+        
+        float dist_sq = x1_sq - 2.0f * dot + x2_sq;
+        dist_sq = max(dist_sq, 0.0f);
+        
+        // Compute kernel value
+        float k = var * expf(-0.5f * dist_sq / l2);
+        
+        // Store result
+        K[batch * N * M + row * M + col] = k;
+    }
+}
+```
+
+This is better. Now let me write the complete Python code.
+
+But I realize there&#x27;s an issue: for large D, we need to precompute x1_sq. Let me also think about optimization.
+
+Actually, a key optimization is to compute x1_sq for each X1 row in a separate kernel or in the same kernel more efficiently. Since we have 32*512 = 16384 X1 rows, precomputing all x1_sq values would save time.
+
+Similarly, we could precompute x2_sq for all X2 rows.
+
+Then the main kernel would just do:
+- Matmul X1 @ X2.T (or use custom kernel for this)
+- Combine with precomputed x1_sq and x2_sq
+
+But let&#x27;s first try the fully fused approach and see if it&#x27;s fast enough.
+
+Let me also consider vectorized loads for D=8 (or when D is a multiple of 4).
+
+For D=8, we can load as two float4s.
+
+Let me write a kernel that handles D=8 specifically with vectorized loads:
+
+```cuda
+__global__ void rbf_kernel_forward_d8(
+    const float* __restrict__ X1,
+    const float* __restrict__ X2,
+    float* __restrict__ K,
+    int B, int N, int M,
+    float l2, float var) {
+    
+    int batch = blockIdx.x;
+    int row = blockIdx.y;
+    
+    if (batch &gt;= B || row &gt;= N) return;
+    
+    // Load X1 row using float4
+    const float4* x1_ptr = reinterpret_cast&lt;const float4*&gt;(X1 + (batch * N + row) * 8);
+    float4 x1_0 = x1_ptr[0];
+    float4 x1_1 = x1_ptr[1];
+    
+    // Compute x1_sq
+    float x1_sq = 0.0f;
+    // ... compute from x1_0 and x1_1
+    
+    // Loop over columns
+    for (int col = threadIdx.x; col &lt; M; col += blockDim.x) {
+        const float4* x2_ptr = reinterpret_cast&lt;const float4*&gt;(X2 + (batch * M + col) * 8);
+        float4 x2_0 = x2_ptr[0];
+        float4 x2_1 = x2_ptr[1];
+        
+        // Compute dot product and x2_sq
+        // ...
+        
+        K[batch * N * M + row * M + col] = k;
+    }
+}
+```
+
+This is getting complex. Let me just write a general kernel first and optimize later if needed.
+
+Actually, let me think about whether the approach I&#x27;m using is optimal. The key observation is:
+
+1. The computation is K = var * exp(-0.5 * dist_sq / l2)
+2. dist_sq = x1_sq - 2*X1@X2.T + x2_sq.T
+3. The expensive part is X1 @ X2.T
+
+For the matmul, using cuBLAS might be faster than a custom kernel, especially for larger dimensions. But for D=8, the custom kernel might be faster due to lower overhead.
+
+Let me try both approaches:
+1. Fully fused custom kernel
+2. Hybrid: cuBLAS matmul + custom elementwise kernel
+
+For approach 2:
+```python
+# 1. Compute x1_sq and x2_sq
+x1_sq = (X1 ** 2).sum(dim=-1)  # (B, N)
+x2_sq = (X2 ** 2).sum(dim=-1)  # (B, M)
+
+# 2. Compute matmul using cuBLAS
+# X1: (B, N, D), X2: (B, M, D)
+# We want X1 @ X2.transpose(-1, -2) = (B, N, M)
+# In cuBLAS terms, we want C = A @ B^T where A = X1, B = X2
+
+# 3. Compute dist_sq and exp
+```
+
+Actually, PyTorch&#x27;s matmul already uses cuBLAS internally, so there might not be a benefit to calling cuBLAS directly.
+
+Let me focus on the fully fused custom kernel approach.
+
+Here&#x27;s my plan:
+1. Write a CUDA kernel that computes the RBF kernel
+2. Launch with appropriate grid and block dimensions
+3. Handle the general case (any B, N, M, D)
+
+Let me write the kernel:
+
+```cuda
+__global__ void rbf_kernel_forward(
+    const float* __restrict__ X1,  // (B, N, D)
+    const float* __restrict__ X2,  // (B, M, D)
+    float* __restrict__ K,         // (B, N, M)
+    int B, int N, int M, int D,
+    float l2, float var) {
+    
+    int batch = blockIdx.x;
+    int row = blockIdx.y;
+    int tid = threadIdx.x;
+    
+    if (batch &gt;= B || row &gt;= N) return;
+    
+    // Shared memory for X1 row
+    extern __shared__ float smem[];
+    float* x1_shared = smem;  // D elements
+    
+    // Cooperative load of X1 row
+    for (int d = tid; d &lt; D; d += blockDim.x) {
+        x1_shared[d] = X1[(batch * N + row) * D + d];
+    }
+    __syncthreads();
+    
+    // Compute x1_sq (single thread or reduction)
+    float x1_sq = 0.0f;
+    if (tid == 0) {
+        for (int d = 0; d &lt; D; d++) {
+            x1_sq += x1_shared[d] * x1_shared[d];
+        }
+        smem[D] = x1_sq;  // Store in shared memory
+    }
+    __syncthreads();
+    x1_sq = smem[D];
+    
+    // Precompute -0.5 / l2
+    float neg_half_over_l2 = -0.5f / l2;
+    
+    // Loop over columns
+    for (int col = tid; col &lt; M; col += blockDim.x) {
+        const float* x2_ptr = X2 + (batch * M + col) * D;
+        
+        // Compute dot product and x2_sq
+        float dot = 0.0f;
+        float x2_sq = 0.0f;
+        for (int d = 0; d &lt; D; d++) {
+            float x1_d = x1_shared[d];
+            float x2_d = x2_ptr[d];
+            dot += x1_d * x2_d;
+            x2_sq += x2_d * x2_d;
+        }
+        
+        float dist_sq = x1_sq - 2.0f * dot + x2_sq;
+        dist_sq = fmaxf(dist_sq, 0.0f);
+        
+        // Compute kernel value
+        float k = var * expf(neg_half_over_l2 * dist_sq);
+        
+        // Store result
+        K[batch * N * M + row * M + col] = k;
+    }
+}
+```
+
+Now let me write the Python wrapper:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cmath&gt;
+
+__global__ void rbf_kernel_forward(
+    const float* __restrict__ X1,
+    const float* __restrict__ X2,
+    float* __restrict__ K,
+    int B, int N, int M, int D,
+    float l2, float var) {
+    // ... kernel code
+}
+
+void rbf_kernel_forward_cuda(
+    at::Tensor X1, at::Tensor X2, at::Tensor K,
+    int B, int N, int M, int D, float l2, float var) {
+    
+    int threads_per_block = 256;
+    int shared_mem_size = (D + 1) * sizeof(float);
+    
+    dim3 grid(B, N);
+    dim3 block(threads_per_block);
+    
+    rbf_kernel_forward&lt;&lt;&lt;grid, block, shared_mem_size&gt;&gt;&gt;(
+        X1.data_ptr&lt;float&gt;(),
+        X2.data_ptr&lt;float&gt;(),
+        K.data_ptr&lt;float&gt;(),
+        B, N, M, D, l2, var);
+}
+&quot;&quot;&quot;
+
+# Load the extension
+rbf_ext = load_inline(
+    name=&#x27;rbf_extension&#x27;,
+    cpp_sources=&#x27;&#x27;,
+    cuda_sources=cuda_source,
+    functions=[&#x27;rbf_kernel_forward_cuda&#x27;],
+    verbose=True)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_dim, lengthscale=1.0, variance=1.0):
+        super().__init__()
+        self.log_lengthscale = nn.Parameter(torch.tensor(lengthscale).log())
+        self.log_variance = nn.Parameter(torch.tensor(variance).log())
+    
+    def forward(self, X1: torch.Tensor, X2: torch.Tensor) -&gt; torch.Tensor:
+        B, N, D = X1.shape
+        _, M, _ = X2.shape
+        
+        l2 = self.log_lengthscale.exp() ** 2
+        var = self.log_variance.exp()
+        
+        K = torch.empty(B, N, M, device=X1.device, dtype=X1.dtype)
+        
+        rbf_ext.rbf_kernel_forward_cuda(
+            X1.contiguous(), X2.contiguous(), K,
+            B, N, M, D, l2.item(), var.item())
+        
+        return K
+```
+
+Wait, I need to be careful about the cpp_sources. I need to provide the C++ wrapper function in cpp_sources, not in cuda_sources.
+
+Let me check the signature again. `load_inline` takes:
+- `cpp_sources`: C++ code (host functions)
+- `cuda_sources`: CUDA code (kernels)
+- `functions`: list of function names to bind
+
+The host wrapper should be in cpp_sources. Let me reorganize:
+
+```python
+cpp_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+
+void rbf_kernel_forward_cuda(
+    at::Tensor X1, at::Tensor X2, at::Tensor K,
+    int B, int N, int M, int D, float l2, float var);
+&quot;&quot;&quot;
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cmath&gt;
+
+__global__ void rbf_kernel_forward(...) {
+    // kernel code
+}
+
+void rbf_kernel_forward_cuda(
+    at::Tensor X1, at::Tensor X2, at::Tensor K,
+    int B, int N, int M, int D, float l2, float var) {
+    
+    // launch code
+}
+&quot;&quot;&quot;
+```
+
+Actually, I think the CUDA wrapper can be in cuda_sources. Let me check the PyTorch documentation...
+
+From the PyTorch docs, `load_inline` generates the pybind11 bindings automatically based on the `functions` list. The functions can be defined in either cpp_sources or cuda_sources.
+
+Let me write a cleaner version:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cmath&gt;
+
+__global__ void rbf_kernel_forward_kernel(
+    const float* __restrict__ X1,
+    const float* __restrict__ X2,
+    float* __restrict__ K,
+    int B, int N, int M, int D,
+    float l2, float var) {
+    
+    int batch = blockIdx.x;
+    int row = blockIdx.y;
+    int tid = threadIdx.x;
+    
+    if (batch &gt;= B || row &gt;= N) return;
+    
+    extern __shared__ float smem[];
+    float* x1_shared = smem;
+    
+    for (int d = tid; d &lt; D; d += blockDim.x) {
+        x1_shared[d] = X1[(batch * N + row) * D + d];
+    }
+    __syncthreads();
+    
+    float x1_sq = 0.0f;
+    if (tid == 0) {
+        for (int d = 0; d &lt; D; d++) {
+            x1_sq += x1_shared[d] * x1_shared[d];
+        }
+        smem[D] = x1_sq;
+    }
+    __syncthreads();
+    x1_sq = smem[D];
+    
+    float neg_half_over_l2 = -0.5f / l2;
+    
+    for (int col = tid; col &lt; M; col += blockDim.x) {
+        const float* x2_ptr = X2 + (batch * M + col) * D;
+        
+        float dot = 0.0f;
+        float x2_sq = 0.0f;
+        for (int d = 0; d &lt; D; d++) {
+            float x1_d = x1_shared[d];
+            float x2_d = x2_ptr[d];
+            dot += x1_d * x2_d;
+            x2_sq += x2_d * x2_d;
+        }
+        
+        float dist_sq = x1_sq - 2.0f * dot + x2_sq;
+        dist_sq = fmaxf(dist_sq, 0.0f);
+        
+        float k = var * expf(neg_half_over_l2 * dist_sq);
+        
+        K[batch * N * M + row * M + col] = k;
+    }
+}
+
+void rbf_kernel_forward_cuda(
+    torch::Tensor X1, torch::Tensor X2, torch::Tensor K,
+    int64_t B, int64_t N, int64_t M, int64_t D,
+    double l2, double var) {
+    
+    int threads_per_block = 256;
+    int shared_mem_size = (D + 1) * sizeof(float);
+    
+    dim3 grid(B, N);
+    dim3 block(threads_per_block);
+    
+    rbf_kernel_forward_kernel&lt;&lt;&lt;grid, block, shared_mem_size&gt;&gt;&gt;(
+        X1.data_ptr&lt;float&gt;(),
+        X2.data_ptr&lt;float&gt;(),
+        K.data_ptr&lt;float&gt;(),
+        B, N, M, D, static_cast&lt;float&gt;(l2), static_cast&lt;float&gt;(var));
+}
+&quot;&quot;&quot;
+
+rbf_ext = load_inline(
+    name=&#x27;rbf_extension&#x27;,
+    cpp_sources=&#x27;&#x27;,
+    cuda_sources=cuda_source,
+    functions=[&#x27;rbf_kernel_forward_cuda&#x27;],
+    verbose=True,
+    extra_cuda_cflags=[&#x27;-O3&#x27;])
+
+class ModelNew(nn.Module):
+    def __init__(self, input_dim, lengthscale=1.0, variance=1.0):
+        super().__init__()
+        self.log_lengthscale = nn.Parameter(torch.tensor(lengthscale).log())
+        self.log_variance = nn.Parameter(torch.tensor(variance).log())
+    
+    def forward(self, X1: torch.Tensor, X2: torch.Tensor) -&gt; torch.Tensor:
+        B, N, D = X1.shape
+        _, M, _ = X2.shape
+        
+        l2 = self.log_lengthscale.exp() ** 2
+        var = self.log_variance.exp()
+        
+        K = torch.empty(B, N, M, device=X1.device, dtype=X1.dtype)
+        
+        rbf_ext.rbf_kernel_forward_cuda(
+            X1.contiguous(), X2.contiguous(), K,
+            B, N, M, D, l2.item(), var.item())
+        
+        return K
+```
+
+Let me compile this first to check for errors.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me start by understanding the problem and then write a custom CUDA kernel for the RBF (Gaussian Process) kernel computation.
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n\n__global__ void rbf_kernel_forward_kernel(\n    const float* __restrict__ X1,\n    const float* __restrict__ X2,\n    float* __restrict__ K,\n    int B, int N, int M, int D,\n    float l2, float var) {\n    \n    int batch = blockIdx.x;\n    int row = blockIdx.y;\n    int tid = threadIdx.x;\n    \n    if (batch &gt;= B || row &gt;= N) return;\n    \n    extern __shared__ float smem[];\n    float* x1_shared = smem;\n    \n    for (int d = tid; d &lt; D; d += blockDim.x) {\n        x1_shared[d] = X1[(batch * N + row) * D + d];\n    }\n    __syncthreads();\n    \n    float x1_sq = 0.0f;\n    if (tid == 0) {\n        for (int d = 0; d &lt; D; d++) {\n            x1_sq += x1_shared[d] * x1_shared[d];\n        }\n        smem[D] = x1_sq;\n    }\n    __syncthreads();\n    x1_sq = smem[D];\n    \n    float neg_half_over_l2 = -0.5f / l2;\n    \n    for (int col = tid; col &lt; M; col += blockDim.x) {\n        const float* x2_ptr = X2 + (batch * M + col) * D;\n        \n        float dot = 0.0f;\n        float x2_sq = 0.0f;\n        for (int d = 0; d &lt; D; d++) {\n            float x1_d = x1_shared[d];\n            float x2_d = x2_ptr[d];\n            dot += x1_d * x2_d;\n            x2_sq += x2_d * x2_d;\n        }\n        \n        float dist_sq = x1_sq - 2.0f * dot + x2_sq;\n        dist_sq = fmaxf(dist_sq, 0.0f);\n        \n        float k = var * expf(neg_half_over_l2 * dist_sq);\n        \n        K[batch * N * M + row * M + col] = k;\n    }\n}\n\nvoid rbf_kernel_forward_cuda(\n    torch::Tensor X1, torch::Tensor X2, torch::Tensor K,\n    int64_t B, int64_t N, int64_t M, int64_t D,\n    double l2, double var) {\n    \n    int threads_per_block = 256;\n    int shared_mem_size = (D + 1) * sizeof(float);\n    \n    dim3 grid(B, N);\n    dim3 block(threads_per_block);\n    \n    rbf_kernel_forward_kernel&lt;&lt;&lt;grid, block, shared_mem_size&gt;&gt;&gt;(\n        X1.data_ptr&lt;float&gt;(),\n        X2.data_ptr&lt;float&gt;(),\n        K.data_ptr&lt;float&gt;(),\n        B, N, M, D, static_cast&lt;float&gt;(l2), static_cast&lt;float&gt;(var));\n}\n\&quot;\&quot;\&quot;\n\nrbf_ext = load_inline(\n    name=&#x27;rbf_extension&#x27;,\n    cpp_sources=&#x27;&#x27;,\n    cuda_sources=cuda_source,\n    functions=[&#x27;rbf_kernel_forward_cuda&#x27;],\n    verbose=True,\n    extra_cuda_cflags=[&#x27;-O3&#x27;])\n\nclass ModelNew(nn.Module):\n    def __init__(self, input_dim, lengthscale=1.0, variance=1.0):\n        super().__init__()\n        self.log_lengthscale = nn.Parameter(torch.tensor(lengthscale).log())\n        self.log_variance = nn.Parameter(torch.tensor(variance).log())\n    \n    def forward(self, X1: torch.Tensor, X2: torch.Tensor) -&gt; torch.Tensor:\n        B, N, D = X1.shape\n        _, M, _ = X2.shape\n        \n        l2 = self.log_lengthscale.exp() ** 2\n        var = self.log_variance.exp()\n        \n        K = torch.empty(B, N, M, device=X1.device, dtype=X1.dtype)\n        \n        rbf_ext.rbf_kernel_forward_cuda(\n            X1.contiguous(), X2.contiguous(), K,\n            B, N, M, D, l2.item(), var.item())\n        \n        return K&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;rbf_extension&#x27;</div></details></div></details></div>
 </body></html>
