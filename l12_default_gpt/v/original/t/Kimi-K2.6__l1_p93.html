@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L1 P93 · original</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 93</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_default</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 06:37:12 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/original/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab current">default</span><span class="tier-tab disabled">all</span></div><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-error">error</span>
+  <span style="font-size:13px;">93_masked_cumsum.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">original</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-02T20:35:32Z</div></div>
+</div>
+
+
+
+</div><details class="ref-source"><summary>reference PyTorch source (the prompt the agent sees)</summary><pre class="block">import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    &quot;&quot;&quot;
+    A model that performs a masked cumulative sum, only summing elements that satisfy a condition.
+
+    Parameters:
+        dim (int): The dimension along which to perform the masked cumulative sum.
+    &quot;&quot;&quot;
+
+    def __init__(self, dim):
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x, mask):
+        &quot;&quot;&quot;
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+            mask (torch.Tensor): Boolean mask of the same shape as x.
+
+        Returns:
+            torch.Tensor: Cumulative sum of elements where mask is True.
+        &quot;&quot;&quot;
+        return torch.cumsum(x * mask, dim=self.dim)
+
+batch_size = 32768
+input_shape = (32768,)
+dim = 1
+
+def get_inputs():
+    x = torch.rand(batch_size, *input_shape)
+    mask = torch.randint(0, 2, x.shape).bool()  # Random boolean mask
+    return [x, mask]
+
+def get_init_inputs():
+    return [dim]
+</pre></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 6.0s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to replace the PyTorch reference `Model` with a custom CUDA kernel `ModelNew`. The reference computation: `torch.cumsum(x * mask, dim=self.dim)`, where `x` is fp32 (I think by default `torch.rand` gives fp32), mask is bool. Input shape: `[batch_size, input_shape] = [32768, 32768]`, so a 2D tensor of shape [32768, 32768]. `dim=1`. So we need to compute, for each row independently, the cumulative sum along dimension 1, but only including elements where mask is True (i.e., multiply x by mask, then cumsum). The reference does `x * mask`, where mask is bool, so mask gets promoted to same dtype as x, i.e., fp32, values 0.0 or 1.0, then cumsum along dim=1.
+
+So the core computation: for each i in [0, batch_size), for each j in [0, N), compute sum_{k=0..j} x[i,k] * mask[i,k].
+
+We need a custom CUDA kernel that is faster than PyTorch&#x27;s cumsum. Since the shape is huge: 32768x32768 = about 1.07 billion elements, ~4 GB of fp32 data. Cumsum along rows of a large 2D matrix. PyTorch&#x27;s cumsum likely uses some parallel scan algorithm, but for such a large tensor it may be memory bandwidth bound. However, we also need to incorporate the mask multiplication. Doing that as a separate kernel (or fused) can save bandwidth.
+
+We need to write a CUDA kernel using torch.utils.cpp_extension.load_inline. Also need to consider if we can use cub::DeviceScan (CUB) for scan per row. Since we have many rows (32768), we can process each row with CUB block scan. The number of elements per row is also 32768. A 2D grid where each block handles a row (or multiple rows) using CUB&#x27;s BlockScan.
+
+We need to get high memory bandwidth and occupancy.
+
+We can load elements from x and mask. Since mask is bool (1 byte each), we should load it as a vector or at least contiguous.
+
+Given row-major layout (dim=1 is contiguous? Actually a [32768, 32768] tensor in PyTorch default memory layout is row-major? PyTorch uses strided layout, but for a 2D tensor created by `torch.rand(batch_size, *input_shape)`, the strides are [32768, 1] (row-major). So dim=1 is the contiguous dimension. That means each row is contiguous in memory. This is good.
+
+So for each row i, elements x[i, j] are contiguous. We can assign one thread block per row, or multiple blocks per row.
+
+32768 rows; 32768 elements per row. This is huge. Let&#x27;s consider hardware. Let&#x27;s get GPU specs first.
+
+We need to call get_gpu_specs.
+
+Then design kernel.
+
+We must write a complete Python module that defines ModelNew. At module load time, compile inline CUDA. Then instantiate ModelNew with same args as Model.
+
+We need to be careful: The evaluation may run on a specific GPU; we need to use `get_gpu_specs` to know its capabilities.
+
+Let&#x27;s get GPU specs.
+</div></details><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details open><summary>result ← get_gpu_specs (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>get_gpu_specs</b>
+get_gpu_specs FAILED: unexpected error during tool execution.
+_WorkItemTimeout: work item exceeded soft timeout budget
+Traceback (most recent call last):
+  File &quot;/scratch/tejas/PopcornBench/src/kernelbench/agent/agent.py&quot;, line 627, in _execute_tool
+    return tool.execute(self.ctx, **args)
+  File &quot;/scratch/tejas/PopcornBench/src/kernelbench/agent/tools.py&quot;, line 656, in execute
+    return ctx.eval_client.get_gpu_specs(ctx)
+  File &quot;/scratch/tejas/PopcornBench/src/kernelbench/agent/eval_client.py&quot;, line 62, in get_gpu_specs
+    return self._call(&quot;specs&quot;, args)
+  File &quot;/scratch/tejas/PopcornBench/src/kernelbench/agent/eval_client.py&quot;, line 117, in _call
+    payload = self._response_q.get(timeout=remaining)
+  File &quot;&lt;string&gt;&quot;, line 2, in get
+  File &quot;/home/prabhune/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/multiprocessing/managers.py&quot;, line 818, in _callmethod
+    kind, result = conn.recv()
+  File &quot;/home/prabhune/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/multiprocessing/connection.py&quot;, line 250, in recv
+    buf = self._recv_bytes()
+  File &quot;/home/prabhune/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/multiprocessing/connection.py&quot;, line 414, in _recv_bytes
+    buf = self._recv(4)
+  File &quot;/home/prabhune/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/multiprocessing/connection.py&quot;, line 379, in _recv
+    chunk = read(handle, remaining)
+  File &quot;/scratch/tejas/PopcornBench/scripts/run_sweep.py&quot;, line 161, in _alarm_handler
+    raise _WorkItemTimeout(&quot;work item exceeded soft timeout budget&quot;)
+__mp_main__._WorkItemTimeout: work item exceeded soft timeout budget
+</div></details></div><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 6.0s</span></div><div class="block assistant"><span class="role-tag">feedback</span>LLM call failed: Empty: </div></div></div>
+</body></html>
