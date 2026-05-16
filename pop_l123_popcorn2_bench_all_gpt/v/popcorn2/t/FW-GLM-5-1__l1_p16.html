@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 16</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-16 00:04:10 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 16</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-16 00:05:33 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">16_DeepSeekMoECombineScatter.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">6 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">6</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">23862</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">7 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">7</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">31290</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -180,5 +180,57 @@ profile_kernel PASSED: profiling complete.
 --- Optimization Hints ---
   -&gt; 7857% stalls: global memory latency (waiting for DRAM/L2). + sectors/req=35.5 -&gt; uncoalesced global loads, restructure access pattern or use __ldg Try shared-memory tiling, prefetching, or reducing working set.
   -&gt; Global load coalescing=35.5x (ideal=1.0) -&gt; 36x wasted DRAM BW. Make per-warp accesses contiguous.
-  -&gt; Low eligible warps + low BW% + low compute% = LATENCY-BOUND. Need more parallelism (larger grid, more ILP, prefetching).</div></details></div></div>
+  -&gt; Low eligible warps + low BW% + low compute% = LATENCY-BOUND. Need more parallelism (larger grid, more ILP, prefetching).</div></details></div><details class="turn-collapse"><summary><b>turn 6</b> · 1 tool call(s) · 202.8s turn · 12.8s LLM · tokens in=6,110 · out=1,318 · total=7,428 · 6,374 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 6</span><span>202.8s turn · 12.8s LLM · 190.1s tools · <span class="turn-tokens">tokens in=6,110 · out=1,318 · total=7,428</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">The profiling shows some issues:
+1. Global load coalescing is poor (35.5x wasted bandwidth) - the row-wise access pattern isn&#x27;t coalesced
+2. 78.5% of stalls are from global memory latency
+3. The kernel itself shows 38.8% occupancy which is decent
+
+The main issue is that when threads in a warp access different token positions, they may access very different memory locations in the output tensor, leading to uncoalesced atomic adds.
+
+Let me think about a better approach:
+1. One approach is to have threads in a warp cooperate on a single row - each thread handles a subset of the hidden_dim
+2. This would improve coalescing for both input reads and output writes
+
+Let me redesign the kernel:
+- Each block handles one or more rows
+- Threads within a block/warp collaborate on hidden_dim elements
+- This gives better coalescing on both input and output
+
+Actually, let me think more carefully about the data layout:
+- expert_hidden: [num_rows, hidden_dim] - row-major, so elements are contiguous along hidden_dim
+- out: [num_tokens, hidden_dim] - row-major
+- token_idx: [num_rows] - maps each row to a token
+
+Current approach: each thread handles all hidden_dim elements for one row
+- Input read: expert_hidden[row * hidden_dim + h] - sequential but within a single thread
+- Output write: out[token * hidden_dim + h] - atomicAdd to potentially scattered positions
+
+Better approach: have threads within a warp each handle different h elements of the same row
+- This means multiple rows are processed by different warps
+- For each row, threads 0-31 handle h=0-31 (if hidden_dim &gt;= 32)
+- But this only works if hidden_dim is a multiple of 32 or we handle edge cases
+
+Actually, given hidden_dim=160 and num_rows=6144:
+- 160/32 = 5 warps worth of work per row
+- But threads per warp = 32, so we could have each warp handle 32 elements
+
+Better approach: 2D grid
+- blockIdx.y = row
+- blockIdx.x or threadIdx.x = hidden_dim element
+
+Or even simpler: 
+- Each thread handles a specific (row, h) pair
+- blockIdx.y * blockDim.y + threadIdx.y = row
+- blockIdx.x * blockDim.x + threadIdx.x = h
+- Total threads = num_rows * hidden_dim = 6144 * 160 = 983,040
+
+This gives perfect coalescing on both input and output when threads in a warp access consecutive h values.
+
+Let me implement this 2D approach:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>The profiling shows the kernel has poor global load coalescing (35.5x wasted bandwidth) due to the row-wise access pattern. Let me redesign with a 2D grid where threads handle (row, h) pairs for better memory access patterns:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\ntemplate &lt;typename scalar_t&gt;\n__global__ void moe_combine_kernel_2d(\n    const scalar_t* __restrict__ expert_hidden,\n    const int64_t* __restrict__ token_idx,\n    const scalar_t* __restrict__ gates,\n    scalar_t* __restrict__ out,\n    int num_rows,\n    int hidden_dim) {\n    \n    int row = blockIdx.y * blockDim.y + threadIdx.y;\n    int h = blockIdx.x * blockDim.x + threadIdx.x;\n    \n    if (row &gt;= num_rows || h &gt;= hidden_dim) return;\n    \n    int64_t token = token_idx[row];\n    scalar_t gate = gates[row];\n    \n    // Coalesced memory access: threads in a warp access consecutive h values\n    atomicAdd(&amp;out[token * hidden_dim + h], gate * expert_hidden[row * hidden_dim + h]);\n}\n\ntorch::Tensor moe_combine_cuda(torch::Tensor expert_hidden, torch::Tensor token_idx, torch::Tensor gates, int num_tokens) {\n    int num_rows = expert_hidden.size(0);\n    int hidden_dim = expert_hidden.size(1);\n    \n    auto out = torch::zeros({num_tokens, hidden_dim}, expert_hidden.options());\n    \n    // Ensure contiguous and correct types\n    auto expert_hidden_contiguous = expert_hidden.contiguous();\n    auto token_idx_contiguous = token_idx.contiguous().to(torch::kLong);\n    auto gates_contiguous = gates.contiguous().to(expert_hidden.scalar_type());\n    \n    // 2D grid: x dimension covers hidden_dim, y dimension covers rows\n    const int block_x = 32;  // warp width for coalescing\n    const int block_y = 8;\n    \n    dim3 blockDim(block_x, block_y);\n    dim3 gridDim((hidden_dim + block_x - 1) / block_x, (num_rows + block_y - 1) / block_y);\n    \n    AT_DISPATCH_FLOATING_TYPES(expert_hidden.scalar_type(), \&quot;moe_combine_kernel_2d\&quot;, ([&amp;] {\n        moe_combine_kernel_2d&lt;scalar_t&gt;&lt;&lt;&lt;gridDim, blockDim&gt;&gt;&gt;(\n            expert_hidden_contiguous.data_ptr&lt;scalar_t&gt;(),\n            token_idx_contiguous.data_ptr&lt;int64_t&gt;(),\n            gates_contiguous.data_ptr&lt;scalar_t&gt;(),\n            out.data_ptr&lt;scalar_t&gt;(),\n            num_rows,\n            hidden_dim);\n    }));\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;torch::Tensor moe_combine_cuda(torch::Tensor expert_hidden, torch::Tensor token_idx, torch::Tensor gates, int num_tokens);\&quot;\n\nmoe_combine_module = load_inline(\n    name=&#x27;moe_combine_2d&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;moe_combine_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, expert_hidden: torch.Tensor, token_idx: torch.Tensor, gates: torch.Tensor, num_tokens: int) -&gt; torch.Tensor:\n        return moe_combine_module.moe_combine_cuda(expert_hidden, token_idx, gates, num_tokens)&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
