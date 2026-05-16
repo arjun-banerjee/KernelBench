@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-16 23:22:48 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-16 23:25:11 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_EdgeSoftmaxMultiHeadCSR.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">2328</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">6492</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -99,5 +99,133 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 252.6s turn · 16.6s LLM · tokens in=2,431 · out=1,733 · total=4,164 · 8,113 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>252.6s turn · 16.6s LLM · 236.0s tools · <span class="turn-tokens">tokens in=2,431 · out=1,733 · total=4,164</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me write the kernel. The key aspects:
+1. CSR sparse matrix with row pointers
+2. Multi-head edge scores (each edge has 8 scores, one per head)
+3. Row-wise softmax - each row (node) is normalized independently per head
+
+The data layout: edge_scores is likely [num_edges * num_heads], stored edge-major (all heads for edge 0, then all heads for edge 1, etc.)
+
+Let me write the kernel:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cfloat&gt;
+
+template &lt;typename scalar_t, int BLOCK_SIZE&gt;
+__global__ void edge_softmax_csr_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const scalar_t* __restrict__ edge_scores,
+    scalar_t* __restrict__ out,
+    const int num_nodes,
+    const int num_heads) {
+    
+    // Each block handles one node (row)
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    // Each thread handles one head
+    for (int h = threadIdx.x; h &lt; num_heads; h += blockDim.x) {
+        // Find max for numerical stability
+        scalar_t max_val = -FLT_MAX;
+        for (int e = 0; e &lt; num_edges; e++) {
+            int idx = (start + e) * num_heads + h;
+            if (edge_scores[idx] &gt; max_val) {
+                max_val = edge_scores[idx];
+            }
+        }
+        
+        // Compute sum of exp
+        scalar_t sum_exp = 0;
+        for (int e = 0; e &lt; num_edges; e++) {
+            int idx = (start + e) * num_heads + h;
+            scalar_t exp_val = exp(edge_scores[idx] - max_val);
+            sum_exp += exp_val;
+            // Store exp temporarily in output
+            out[idx] = exp_val;
+        }
+        
+        // Normalize
+        scalar_t inv_sum = 1.0 / sum_exp;
+        for (int e = 0; e &lt; num_edges; e++) {
+            int idx = (start + e) * num_heads + h;
+            out[idx] = out[idx] * inv_sum;
+        }
+    }
+}
+
+torch::Tensor edge_softmax_csr_cuda(
+    torch::Tensor row_ptr,
+    torch::Tensor edge_scores) {
+    
+    int num_nodes = row_ptr.numel() - 1;
+    int num_edges = edge_scores.size(0);
+    int num_heads = edge_scores.size(1);
+    
+    auto out = torch::empty_like(edge_scores);
+    
+    const int block_size = 256;
+    const int num_blocks = num_nodes;
+    
+    AT_DISPATCH_FLOATING_TYPES(edge_scores.scalar_type(), &quot;edge_softmax_csr&quot;, ([&amp;] {
+        edge_softmax_csr_kernel&lt;scalar_t, block_size&gt;&lt;&lt;&lt;num_blocks, block_size&gt;&gt;&gt;(
+            row_ptr.data_ptr&lt;int64_t&gt;(),
+            edge_scores.data_ptr&lt;scalar_t&gt;(),
+            out.data_ptr&lt;scalar_t&gt;(),
+            num_nodes,
+            num_heads
+        );
+    }));
+    
+    return out;
+}
+&quot;&quot;&quot;
+
+cpp_source = &quot;torch::Tensor edge_softmax_csr_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores);&quot;
+
+# Load the extension
+edge_softmax_ext = load_inline(
+    name=&#x27;edge_softmax_csr&#x27;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&#x27;edge_softmax_csr_cuda&#x27;],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:
+        return edge_softmax_ext.edge_softmax_csr_cuda(row_ptr, edge_scores)
+```
+
+Wait, I need to check if the edge_scores has shape [num_edges, num_heads] or is it flat [num_edges * num_heads]. Let me look at the reference code again:
+
+```python
+out[start:end] = torch.softmax(edge_scores[start:end], dim=0)
+```
+
+This suggests edge_scores is being indexed linearly (1D), so it might be flat. Let me check the input generation function.
+
+Actually, let me first write a basic version and compile it to see if it works. I&#x27;ll adjust based on what I learn.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me write and compile the initial kernel:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n\ntemplate &lt;typename scalar_t&gt;\n__global__ void edge_softmax_csr_kernel(\n    const int64_t* __restrict__ row_ptr,\n    const scalar_t* __restrict__ edge_scores,\n    scalar_t* __restrict__ out,\n    const int num_nodes,\n    const int num_heads) {\n    \n    // Each block handles one node (row)\n    int node = blockIdx.x;\n    if (node &gt;= num_nodes) return;\n    \n    int start = row_ptr[node];\n    int end = row_ptr[node + 1];\n    int num_edges = end - start;\n    \n    if (num_edges == 0) return;\n    \n    // Each thread handles one head\n    for (int h = threadIdx.x; h &lt; num_heads; h += blockDim.x) {\n        // Find max for numerical stability\n        scalar_t max_val = -INFINITY;\n        for (int e = 0; e &lt; num_edges; e++) {\n            int idx = (start + e) * num_heads + h;\n            scalar_t val = edge_scores[idx];\n            if (val &gt; max_val) {\n                max_val = val;\n            }\n        }\n        \n        // Compute sum of exp\n        scalar_t sum_exp = scalar_t(0);\n        for (int e = 0; e &lt; num_edges; e++) {\n            int idx = (start + e) * num_heads + h;\n            scalar_t exp_val = exp(edge_scores[idx] - max_val);\n            sum_exp += exp_val;\n            // Store exp temporarily in output\n            out[idx] = exp_val;\n        }\n        \n        // Normalize\n        scalar_t inv_sum = scalar_t(1) / sum_exp;\n        for (int e = 0; e &lt; num_edges; e++) {\n            int idx = (start + e) * num_heads + h;\n            out[idx] = out[idx] * inv_sum;\n        }\n    }\n}\n\ntorch::Tensor edge_softmax_csr_cuda(\n    torch::Tensor row_ptr,\n    torch::Tensor edge_scores) {\n    \n    int num_nodes = row_ptr.numel() - 1;\n    int num_edges = edge_scores.size(0);\n    int num_heads = edge_scores.size(1);\n    \n    auto out = torch::empty_like(edge_scores);\n    \n    const int block_size = 256;\n    const int num_blocks = num_nodes;\n    \n    AT_DISPATCH_FLOATING_TYPES(edge_scores.scalar_type(), \&quot;edge_softmax_csr\&quot;, ([&amp;] {\n        edge_softmax_csr_kernel&lt;scalar_t&gt;&lt;&lt;&lt;num_blocks, block_size&gt;&gt;&gt;(\n            row_ptr.data_ptr&lt;int64_t&gt;(),\n            edge_scores.data_ptr&lt;scalar_t&gt;(),\n            out.data_ptr&lt;scalar_t&gt;(),\n            num_nodes,\n            num_heads\n        );\n    }));\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;torch::Tensor edge_softmax_csr_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores);\&quot;\n\n# Load the extension\nedge_softmax_ext = load_inline(\n    name=&#x27;edge_softmax_csr_ext&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;edge_softmax_csr_cuda&#x27;],\n    verbose=False\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:\n        return edge_softmax_ext.edge_softmax_csr_cuda(row_ptr, edge_scores)&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
