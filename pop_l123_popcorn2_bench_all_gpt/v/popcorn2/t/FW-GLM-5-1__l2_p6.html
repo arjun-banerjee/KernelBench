@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-16 15:13:13 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-16 15:15:36 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_TriangularAttention.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">6 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">6</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">63542</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">7 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">7</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">94202</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -264,5 +264,638 @@ compile_kernel PASSED: kernel compiled without errors.</div></details></div></de
   &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport math\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the CUDA source for triangular attention\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n\nconstexpr int BLOCK_SIZE = 256;\n\n__device__ __forceinline__ float warp_reduce_sum(float val) {\n    #pragma unroll\n    for (int mask = 16; mask &gt; 0; mask &gt;&gt;= 1) {\n        val += __shfl_xor_sync(0xffffffff, val, mask, 32);\n    }\n    return val;\n}\n\n__device__ __forceinline__ float block_reduce_sum(float val) {\n    __shared__ float shared[32];\n    int lane = threadIdx.x % 32;\n    int wid = threadIdx.x / 32;\n    val = warp_reduce_sum(val);\n    if (lane == 0) shared[wid] = val;\n    __syncthreads();\n    val = (threadIdx.x &lt; blockDim.x / 32) ? shared[lane] : 0.0f;\n    if (wid == 0) val = warp_reduce_sum(val);\n    return val;\n}\n\n// LayerNorm + projection kernel\n// Input: pair_repr (B, N, N, D)\n// Output: query, key, value (B*N, h, N, d), gate (B, N, N, D), bias (B, h, N, N)\n__global__ void layernorm_proj_kernel(\n    const float* __restrict__ input,      // (B, N, N, D)\n    const float* __restrict__ weight_ln,  // (D,)\n    const float* __restrict__ bias_ln,    // (D,)\n    const float* __restrict__ weight_q,   // (D, D) - output dim, input dim\n    const float* __restrict__ weight_k,   // (D, D)\n    const float* __restrict__ weight_v,   // (D, D)\n    const float* __restrict__ weight_gate, // (D, D)\n    const float* __restrict__ bias_gate,   // (D,)\n    const float* __restrict__ weight_bias, // (h, D)\n    float* __restrict__ query,            // (B*N, h, N, d)\n    float* __restrict__ key,              // (B*N, h, N, d)\n    float* __restrict__ value,            // (B*N, h, N, d)\n    float* __restrict__ gate,             // (B, N, N, D)\n    float* __restrict__ bias,             // (B, h, N, N)\n    int B, int N, int D, int h, int d\n) {\n    // blockIdx.x: position in (B, N, N) -&gt; for each row\n    // blockIdx.y: for j dimension (column within row i)\n    int row_idx = blockIdx.x;  // 0 to B*N-1\n    int j = blockIdx.y;        // 0 to N-1\n    \n    int b = row_idx / N;\n    int i = row_idx % N;\n    \n    int idx = b * N * N * D + i * N * D + j * D;\n    const float* x_ptr = input + idx;\n    \n    // Compute mean and variance for LayerNorm\n    float mean = 0.0f, var = 0.0f;\n    for (int k = threadIdx.x; k &lt; D; k += blockDim.x) {\n        mean += x_ptr[k];\n    }\n    mean = block_reduce_sum(mean) / D;\n    \n    __shared__ float mean_shared;\n    if (threadIdx.x == 0) mean_shared = mean;\n    __syncthreads();\n    mean = mean_shared;\n    \n    for (int k = threadIdx.x; k &lt; D; k += blockDim.x) {\n        float diff = x_ptr[k] - mean;\n        var += diff * diff;\n    }\n    var = block_reduce_sum(var) / D;\n    \n    __shared__ float inv_std_shared;\n    if (threadIdx.x == 0) inv_std_shared = rsqrtf(var + 1e-5f);\n    __syncthreads();\n    float inv_std = inv_std_shared;\n    \n    // Apply LayerNorm and store in shared memory\n    extern __shared__ float smem[];\n    float* x_norm = smem;  // Size D\n    \n    for (int k = threadIdx.x; k &lt; D; k += blockDim.x) {\n        x_norm[k] = (x_ptr[k] - mean) * inv_std * weight_ln[k] + bias_ln[k];\n    }\n    __syncthreads();\n    \n    // Compute Q, K, V projections\n    // weight shape: (out_dim, in_dim) = (D, D)\n    // output = x_norm @ weight.T (since PyTorch Linear is output = input @ weight.T)\n    // For each output element q[out_idx], compute sum over k of x_norm[k] * weight[out_idx, k]\n    \n    for (int out_idx = threadIdx.x; out_idx &lt; D; out_idx += blockDim.x) {\n        float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;\n        for (int in_idx = 0; in_idx &lt; D; in_idx++) {\n            float xn = x_norm[in_idx];\n            q_val += xn * weight_q[out_idx * D + in_idx];\n            k_val += xn * weight_k[out_idx * D + in_idx];\n            v_val += xn * weight_v[out_idx * D + in_idx];\n        }\n        \n        // Reshape to (B*N, h, N, d)\n        // For row_idx (which is b*N + i), position j:\n        // Output position j in the attention: query[row_idx, head, j, dim]\n        // The output index out_idx maps to (head, dim) as out_idx = head * d + dim\n        int head = out_idx / d;\n        int dim = out_idx % d;\n        \n        // query[key] shape is (B*N, h, N, d)\n        // Index: row_idx * h * N * d + head * N * d + j * d + dim\n        int qkv_idx = row_idx * h * N * d + head * N * d + j * d + dim;\n        query[qkv_idx] = q_val;\n        key[qkv_idx] = k_val;\n        value[qkv_idx] = v_val;\n    }\n    \n    // Compute gate projection\n    // gate weight shape: (D, D), bias: (D,)\n    // gate_out = sigmoid(x_norm @ weight_gate.T + bias_gate)\n    for (int out_idx = threadIdx.x; out_idx &lt; D; out_idx += blockDim.x) {\n        float g_val = 0.0f;\n        for (int in_idx = 0; in_idx &lt; D; in_idx++) {\n            g_val += x_norm[in_idx] * weight_gate[out_idx * D + in_idx];\n        }\n        g_val += bias_gate[out_idx];\n        // Apply sigmoid\n        g_val = 1.0f / (1.0f + expf(-g_val));\n        \n        // gate shape: (B, N, N, D)\n        int gate_idx = b * N * N * D + i * N * D + j * D + out_idx;\n        gate[gate_idx] = g_val;\n    }\n    \n    // Compute bias projection\n    // bias weight shape: (h, D)\n    // bias_out = x_norm @ weight_bias.T -&gt; (h,)\n    for (int head = threadIdx.x; head &lt; h; head += blockDim.x) {\n        float b_val = 0.0f;\n        for (int in_idx = 0; in_idx &lt; D; in_idx++) {\n            b_val += x_norm[in_idx] * weight_bias[head * D + in_idx];\n        }\n        // bias shape: (B, h, N, N)\n        // For position (b, i, j), all heads have bias values\n        int bias_idx = b * h * N * N + head * N * N + i * N + j;\n        bias[bias_idx] = b_val;\n    }\n}\n\ntorch::Tensor triangular_attention_forward(\n    torch::Tensor pair_repr,\n    torch::Tensor pair_mask,\n    torch::Tensor weight_ln,\n    torch::Tensor bias_ln,\n    torch::Tensor weight_q,\n    torch::Tensor weight_k,\n    torch::Tensor weight_v,\n    torch::Tensor weight_gate,\n    torch::Tensor bias_gate,\n    torch::Tensor weight_bias,\n    torch::Tensor out_weight,\n    torch::Tensor out_bias,\n    int num_heads\n) {\n    int B = pair_repr.size(0);\n    int N = pair_repr.size(1);\n    int D = pair_repr.size(3);\n    int h = num_heads;\n    int d = D / h;\n    \n    auto options = pair_repr.options();\n    auto query = torch::empty({B * N, h, N, d}, options);\n    auto key = torch::empty({B * N, h, N, d}, options);\n    auto value = torch::empty({B * N, h, N, d}, options);\n    auto gate = torch::empty({B, N, N, D}, options);\n    auto bias = torch::empty({B, h, N, N}, options);\n    \n    // Launch layernorm + projection kernel\n    dim3 grid(B * N, N);\n    int smem_size = D * sizeof(float);\n    layernorm_proj_kernel&lt;&lt;&lt;grid, BLOCK_SIZE, smem_size&gt;&gt;&gt;(\n        pair_repr.data_ptr&lt;float&gt;(),\n        weight_ln.data_ptr&lt;float&gt;(),\n        bias_ln.data_ptr&lt;float&gt;(),\n        weight_q.data_ptr&lt;float&gt;(),\n        weight_k.data_ptr&lt;float&gt;(),\n        weight_v.data_ptr&lt;float&gt;(),\n        weight_gate.data_ptr&lt;float&gt;(),\n        bias_gate.data_ptr&lt;float&gt;(),\n        weight_bias.data_ptr&lt;float&gt;(),\n        query.data_ptr&lt;float&gt;(),\n        key.data_ptr&lt;float&gt;(),\n        value.data_ptr&lt;float&gt;(),\n        gate.data_ptr&lt;float&gt;(),\n        bias.data_ptr&lt;float&gt;(),\n        B, N, D, h, d\n    );\n    \n    // Use PyTorch for attention computation\n    // Reshape to (B, N, h, d) then permute to (B, h, N, d)\n    // But query/key/value are (B*N, h, N, d) - need to interpret correctly\n    \n    // The BN dimension is for different rows of the pair matrix\n    // For each row i, we have B different batch elements\n    \n    // Actually the shape (B*N, h, N, d) means:\n    // - First dimension: B*N rows of the pair matrix\n    // - Second dimension: h heads\n    // - Third dimension: N columns (keys/values)\n    // - Fourth dimension: d head dimension\n    \n    // Let me reinterpret this correctly\n    // The reference does:\n    // q = self.query(x_flat).view(B * N, N, h, d).transpose(1, 2)\n    // This gives (B*N, h, N, d) - which is what I have\n    \n    // For attention:\n    // attn = q @ k.transpose(-1, -2) / sqrt(d)\n    // q is (B*N, h, N, d), k is (B*N, h, N, d)\n    // k.transpose(-1, -2) is (B*N, h, d, N)\n    // attn is (B*N, h, N, N)\n    \n    auto query_t = query;  // (B*N, h, N, d)\n    auto key_t = key;      // (B*N, h, N, d)\n    auto value_t = value;  // (B*N, h, N, d)\n    \n    // Compute attention scores\n    auto attn = torch::matmul(query_t, key_t.transpose(-1, -2)) / std::sqrt((float)d);\n    // attn: (B*N, h, N, N)\n    \n    // Add bias\n    // bias is (B, h, N, N), need to expand for the B*N dimension\n    // Each batch element b has N rows, so bias[b] should be added to rows b*N to b*N+N-1\n    // This is equivalent to bias.view(B, 1, h, N, N).expand(-1, N, -1, -1, -1).reshape(B*N, h, N, N)\n    \n    // Actually, the bias is the same for all rows i within a batch\n    // But in my kernel, I computed bias for each (i, j) position\n    // bias[b, head, i, j] is added to attn[b*N+i, head, i, j]\n    \n    // Wait, there&#x27;s an issue. In the reference:\n    // attn = attn.view(B, N, h, N, N)\n    // attn = attn + bias.unsqueeze(1)\n    // bias is (B, h, N, N), bias.unsqueeze(1) is (B, 1, h, N, N)\n    // This broadcasts to (B, N, h, N, N)\n    // So for each batch b, row i, head h&#x27;, the bias at position j is bias[b, h&#x27;, i, j]\n    \n    // But in my attention, I have attn[bn, head, i, j] where bn = b*N + i\n    // And the bias should be bias[b, head, i, j]\n    // So I need to map bn back to b and add the corresponding bias\n    \n    // Let me use the bias I computed directly\n    // bias is (B, h, N, N)\n    // For attn[b*N+i, head, i, j], add bias[b, head, i, j]\n    \n    // Reshape attn to (B, N, h, N, N)\n    attn = attn.view({B, N, h, N, N});\n    // Add bias.unsqueeze(1) which broadcasts\n    attn = attn + bias.unsqueeze(1);\n    \n    // Apply mask\n    auto mask_expanded = pair_mask.unsqueeze(1).unsqueeze(2);  // (B, 1, 1, N, N)\n    attn = attn.masked_fill(mask_expanded == 0, -INFINITY);\n    \n    // Softmax\n    attn = attn.view({B * N, h, N, N});\n    attn = torch::softmax(attn, -1);\n    \n    // attn @ v\n    // attn: (B*N, h, N, N)\n    // v: (B*N, h, N, d)\n    // output: (B*N, h, N, d)\n    auto out = torch::matmul(attn, value_t);\n    \n    // out.transpose(1, 2).reshape(B, N, N, D)\n    // out: (B*N, h, N, d) -&gt; transpose(1, 2) -&gt; (B*N, N, h, d)\n    out = out.transpose(1, 2);\n    // reshape to (B*N, N, D)\n    out = out.reshape({B * N, N, D});\n    // reshape to (B, N, N, D)\n    out = out.view({B, N, N, D});\n    \n    // Apply gate\n    out = gate * out;\n    \n    // Output projection\n    out = torch::linear(out, out_weight, out_bias);\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor triangular_attention_forward(\n    torch::Tensor pair_repr,\n    torch::Tensor pair_mask,\n    torch::Tensor weight_ln,\n    torch::Tensor bias_ln,\n    torch::Tensor weight_q,\n    torch::Tensor weight_k,\n    torch::Tensor weight_v,\n    torch::Tensor weight_gate,\n    torch::Tensor bias_gate,\n    torch::Tensor weight_bias,\n    torch::Tensor out_weight,\n    torch::Tensor out_bias,\n    int num_heads\n);\n\&quot;\&quot;\&quot;\n\n# Load the extension\ntriangular_attn = load_inline(\n    name=&#x27;triangular_attention&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;triangular_attention_forward&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, pair_dim, num_heads, dropout=0.0):\n        super().__init__()\n        self.num_heads = num_heads\n        self.head_dim = pair_dim // num_heads\n        assert pair_dim % num_heads == 0\n        self.layer_norm = nn.LayerNorm(pair_dim)\n        self.query = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.key = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.value = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.gate = nn.Linear(pair_dim, pair_dim)\n        self.bias_proj = nn.Linear(pair_dim, num_heads, bias=False)\n        self.out_proj = nn.Linear(pair_dim, pair_dim)\n        self.dropout = nn.Dropout(dropout)\n        self.dropout_p = dropout\n\n    def forward(self, pair_repr: torch.Tensor, pair_mask: torch.Tensor) -&gt; torch.Tensor:\n        return triangular_attn.triangular_attention_forward(\n            pair_repr.contiguous(),\n            pair_mask.contiguous(),\n            self.layer_norm.weight.contiguous(),\n            self.layer_norm.bias.contiguous(),\n            self.query.weight.contiguous(),\n            self.key.weight.contiguous(),\n            self.value.weight.contiguous(),\n            self.gate.weight.contiguous(),\n            self.gate.bias.contiguous(),\n            self.bias_proj.weight.contiguous(),\n            self.out_proj.weight.contiguous(),\n            self.out_proj.bias.contiguous(),\n            self.num_heads\n        )&quot;
 }</div></details><details open><summary>result ← run_correctness (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>run_correctness</b>
 run_correctness FAILED: ? trials did not all match.
-runtime_error: shape &#x27;[232, 58, 64]&#x27; is invalid for input of size 1009664</div></details></div></details></div>
+runtime_error: shape &#x27;[232, 58, 64]&#x27; is invalid for input of size 1009664</div></details></div></details><details class="turn-collapse"><summary><b>turn 6</b> · 1 tool call(s) · 550.5s turn · 98.4s LLM · tokens in=20,075 · out=10,585 · total=30,660 · 35,406 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 6</span><span>550.5s turn · 98.4s LLM · 452.1s tools · <span class="turn-tokens">tokens in=20,075 · out=10,585 · total=30,660</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">The shape issues persist. The problem seems to be in how I&#x27;m computing the projections. Let me carefully trace through the reference implementation:
+
+1. Input: pair_repr (B, N, N, D)
+2. x = layer_norm(pair_repr) -&gt; (B, N, N, D)
+3. g = sigmoid(gate(x)) -&gt; (B, N, N, D)
+4. bias = bias_proj(x).permute(0, 3, 1, 2) -&gt; (B, h, N, N)
+5. x_flat = x.reshape(B * N, N, D) -&gt; (B*N, N, D)
+6. q = query(x_flat).view(B * N, N, h, d).transpose(1, 2) -&gt; (B*N, h, N, d)
+7. Similarly for k, v
+
+The key insight is:
+- x_flat has shape (B*N, N, D)
+- query(x_flat) gives (B*N, N, D) (same output dim)
+- view(B*N, N, h, d) reshapes to (B*N, N, h, d)
+- transpose(1, 2) gives (B*N, h, N, d)
+
+But in my kernel, I&#x27;m computing Q, K, V for each position (b, i, j) separately. The output of the projection for position (b, i, j) is a D-dimensional vector, which should map to (h, d).
+
+The issue is that in my kernel:
+- For position (b, i, j), I compute q[out_idx] where out_idx goes from 0 to D-1
+- I map out_idx to (head, dim) = (out_idx / d, out_idx % d)
+- I store it at index row_idx * h * N * d + head * N * d + j * d + dim
+
+But in the reference:
+- query(x_flat) computes the projection for all N positions in a row at once
+- For row i of batch b, x_flat[b*N + i] has shape (N, D)
+- query(x_flat[b*N + i]) has shape (N, D) - this is the projection for all N positions
+
+Actually, let me re-read the reference more carefully:
+- x_flat = x.reshape(B * N, N, D)
+- This reshapes from (B, N, N, D) to (B*N, N, D)
+- So x_flat[bn] has shape (N, D), where bn = b*N + i
+- query(x_flat) applies the same Linear layer to each of the B*N elements
+- Each Linear operation takes (N, D) -&gt; (N, D)
+- So query(x_flat) has shape (B*N, N, D)
+
+Now the key: when we view as (B*N, N, h, d), we&#x27;re splitting the last dimension D into h*d.
+And then transpose(1, 2) swaps the N and h dimensions.
+
+So for a specific position (b, i, j) in the original pair_repr:
+- x_norm = layer_norm(pair_repr[b, i, j]) has shape (D,)
+- query(x_norm) would be (D,) if we applied the projection to just that position
+
+But the reference applies the projection to x_flat, which has shape (B*N, N, D).
+So for position (b, i, j), the projection is computed as:
+- x_flat[bn, j, :] where bn = b*N + i
+- This is the LayerNorm&#x27;d value at position (b, i, j)
+- query applied to x_flat[bn] gives output for all j positions
+
+So my approach is correct: for each position (b, i, j), compute the projection of the D-dimensional vector.
+
+The issue might be in how I store the result. Let me check the indexing again.
+
+In the reference:
+- q = query(x_flat).view(B * N, N, h, d).transpose(1, 2)
+- query(x_flat) has shape (B*N, N, D)
+- view(B*N, N, h, d) reshapes to (B*N, N, h, d)
+- transpose(1, 2) swaps dimensions 1 and 2, giving (B*N, h, N, d)
+
+So q[bn, head, j, dim] corresponds to:
+- bn = b*N + i
+- The query vector for position (b, i, j) in head `head` and dimension `dim`
+
+In my kernel:
+- For position (b, i, j), I compute the D-dimensional projection
+- I map out_idx = head * d + dim
+- I store at row_idx * h * N * d + head * N * d + j * d + dim
+  where row_idx = b*N + i = bn
+
+So query[bn * h * N * d + head * N * d + j * d + dim] should be correct.
+
+Let me double-check the stride:
+- query[bn, head, j, dim] with shape (B*N, h, N, d)
+- Index = bn * (h * N * d) + head * (N * d) + j * d + dim
+- This matches what I have.
+
+Hmm, let me look at the error message again: &quot;shape &#x27;[232, 58, 64]&#x27; is invalid for input of size 1009664&quot;
+
+232 = B*N for some values. 58 might be N, and 64 is D.
+1009664 = 232 * 58 * 64 = 232 * 3712 = 861... wait let me compute: 232 * 58 = 13456, 13456 * 64 = 861,184.
+
+Hmm, 1009664 / 64 = 15776, and 15776 / 232 = 68.
+
+So it seems like the input might have N=68 or something, not matching what I expect.
+
+Let me also check the bias computation:
+- bias = bias_proj(x).permute(0, 3, 1, 2)
+- bias_proj(x) takes (B, N, N, D) -&gt; (B, N, N, h)
+- permute(0, 3, 1, 2) gives (B, h, N, N)
+
+In my kernel, I compute:
+- For position (b, i, j), bias_proj gives h values
+- I store at b * h * N * N + head * N * N + i * N + j
+
+But wait, in the reference, bias_proj is applied to x, which is (B, N, N, D).
+So bias_proj(x)[b, i, j, :] has shape (h,) for position (b, i, j).
+And bias[b, head, i, j] = bias_proj(x)[b, i, j, head].
+
+In my kernel:
+- I compute b_val for each head from x_norm
+- I store at b * h * N * N + head * N * N + i * N + j
+
+This should be bias[b, head, i, j], which seems correct.
+
+The error message suggests a shape mismatch somewhere. Let me check the C++ code for issues.
+
+Actually, looking at the error, it says the shape is invalid for some tensor. The shapes 232, 58, 64 suggest:
+- 232 might be B*N
+- 58 might be h (but h should be 4...)
+- 64 might be N or d
+
+This doesn&#x27;t match the expected dimensions. The issue might be in the input dimensions.
+
+Wait, looking more carefully at the error: &quot;shape &#x27;[232, 58, 64]&#x27; is invalid for input of size 1009664&quot;
+
+1009664 = 232 * 64 * 68? Let me check: 232 * 64 = 14848, 14848 * 68 = 1009664. Yes!
+
+So the actual input seems to have N=68 (or D=68?), not the 64 in the problem.
+
+But looking at the problem, it says seq_len=64 and pair_dim=64. So something is off.
+
+Actually, looking at the get_inputs function:
+```python
+pair_repr = torch.randn(p.trial_dim(batch_size, &#x27;batch_size&#x27;, mode=mode), 
+                        p.trial_dim(seq_len, &#x27;seq_len&#x27;, mode=mode), 
+                        p.trial_dim(seq_len, &#x27;seq_len&#x27;, mode=mode), 
+                        pair_dim)
+```
+
+The trial_dim function might return different values. The error might be due to variable input sizes.
+
+But the core issue is that my C++ code is trying to reshape a tensor incorrectly. Let me look at the reshape operations:
+
+```cpp
+attn = attn.view({B, N, h, N, N});
+```
+
+This assumes attn has the right number of elements. If the computation is wrong, this will fail.
+
+Let me trace through the computation more carefully:
+
+1. query, key, value have shape (B*N, h, N, d)
+2. attn = matmul(query, key.transpose(-1, -2)) -&gt; (B*N, h, N, N)
+3. attn.view({B, N, h, N, N}) -&gt; this should work if B*N*h*N*N elements match
+
+Actually, the issue might be in the projection kernel itself. Let me check the grid dimensions:
+
+```cpp
+dim3 grid(B * N, N);
+```
+
+This creates B*N blocks in x and N blocks in y. So the total number of blocks is B*N*N.
+
+But the kernel computes for each position (b, i, j), which is correct.
+
+Wait, I see the issue now! In the kernel:
+```cpp
+int row_idx = blockIdx.x;  // 0 to B*N-1
+int j = blockIdx.y;        // 0 to N-1
+
+int b = row_idx / N;
+int i = row_idx % N;
+```
+
+But the projection should be computed for each position (b, i, j), and the query/key/value should be indexed by (b, i, j, head, dim).
+
+Actually, let me re-think. The reference computes:
+- x_flat = x.reshape(B*N, N, D) -&gt; shape (B*N, N, D)
+- query(x_flat) -&gt; shape (B*N, N, D)
+
+This means for each &quot;row&quot; in x_flat (there are B*N rows), we have N positions each with D features.
+The query projection is applied independently to each position, giving D outputs.
+
+So the query at position (b, i, j) is computed from x_norm[b, i, j].
+
+In my kernel, I&#x27;m doing exactly this. For position (b, i, j) = (row_idx/N, row_idx%N, j), I compute the projection.
+
+But then I store:
+```cpp
+int qkv_idx = row_idx * h * N * d + head * N * d + j * d + dim;
+query[qkv_idx] = q_val;
+```
+
+This gives query[row_idx, head, j, dim].
+
+But row_idx = b*N + i, so this is query[b*N + i, head, j, dim].
+
+Hmm, but then when we use it for attention:
+- q is (B*N, h, N, d)
+- For batch b, row i: q[b*N + i] has shape (h, N, d)
+- This contains the queries for all N positions in row i
+- So q[b*N + i, head, j, dim] is the query for position (b, i, j) in head `head`
+
+But wait, in the attention computation:
+```python
+attn = q @ k.transpose(-1, -2) / math.sqrt(d)
+```
+
+For each batch b and row i, we compute attention over the N positions.
+q has shape (B*N, h, N, d), and for each &quot;batch&quot; (b*N+i), we compute attention over N positions.
+
+So the query q[b*N+i, head, j] is the query for position j, and we attend over all positions k to compute the attention score for (q_j, k_k).
+
+But in triangular attention, the query is for row i, and the keys/values are for all positions j in the column dimension.
+
+Actually, I think I&#x27;m overcomplicating this. Let me re-read the reference more carefully:
+
+```python
+x_flat = x.reshape(B * N, N, D)
+q = self.query(x_flat).view(B * N, N, h, d).transpose(1, 2)
+```
+
+So x_flat has shape (B*N, N, D), where each &quot;row&quot; (there are B*N rows) has N positions.
+For row bn (where bn = b*N + i):
+- x_flat[bn] has shape (N, D), representing the N positions (columns) of row i in batch b
+- query(x_flat[bn]) has shape (N, D)
+- This is then reshaped to (N, h, d) and transposed to (h, N, d)
+
+So the query for position (b, i, j) is at q[bn, head, j, dim].
+
+This matches what I&#x27;m computing in the kernel!
+
+Let me check if the issue is elsewhere. Maybe the problem is with how I&#x27;m handling the mask or the bias.
+
+Actually, I notice the dropout is not being applied in my kernel. But that shouldn&#x27;t cause a shape error.
+
+Let me simplify and just ensure the basic kernel works first, without the flash attention optimization.
+
+Let me trace through the exact sizes for a test case:
+- B=4, N=64, D=64, h=4, d=16
+- query/key/value shape: (4*64, 4, 64, 16) = (256, 4, 64, 16)
+- Total elements: 256 * 4 * 64 * 16 = 1,048,576
+
+If the input has B*N*N*D = 4*64*64*64 = 1,048,576 elements, that matches.
+
+But the error says &quot;input of size 1009664&quot;, which is 232 * 64 * 68 = 1009664.
+
+So maybe the test has B=232/N and D=64 and N=68? Or something else.
+
+Actually 232 = B*N if B*N = 232. If N=58, B=4 gives 232.
+But 1009664 / (4*58*58*64) = 1009664 / 861,184 = 1.17..., not an integer.
+
+Let me try: 1009664 / (B*N*N*D) = ?
+If D=64, then B*N*N = 1009664/64 = 15776.
+If N=68, B*N = 15776/68 = 232. So B = 232/68 = 3.4..., not an integer.
+
+Let me try N=58: 15776/58 = 272. So B*N = 272 with N=58 gives B = 4.69..., not an integer.
+
+Let me try N=64: 15776/64 = 246.5, not an integer.
+
+Hmm, let me just compute what 1009664 factors into:
+1009664 = 2^? * ?
+1009664 / 64 = 15776
+15776 / 64 = 246.5
+1009664 / 32 = 31552
+31552 / 64 = 493
+
+So 1009664 = 493 * 32 * 64 = 493 * 2048.
+
+Anyway, the point is that the input size doesn&#x27;t match the expected dimensions. The test framework might be using different dimensions.
+
+But the error is in my code trying to reshape a tensor. Let me check which reshape is failing.
+
+The error &quot;shape &#x27;[232, 58, 64]&#x27; is invalid for input of size 1009664&quot; suggests that somewhere I&#x27;m trying to create a tensor of shape (232, 58, 64), which has 232*58*64 = 861,184 elements, but the input has 1,009,664 elements.
+
+The difference is 1009664 - 861184 = 148480, which is 2320 * 64.
+
+I think the issue might be in how the kernel handles variable input sizes, or there&#x27;s a bug in the indexing.
+
+Let me check the output projection. The reference uses:
+```python
+out = self.out_proj(out)
+```
+
+Where out has shape (B, N, N, D).
+
+In my code:
+```cpp
+out = torch::linear(out, out_weight, out_bias);
+```
+
+This should work correctly.
+
+Actually, let me check the attention output reshape:
+```cpp
+out = out.transpose(1, 2);
+out = out.reshape({B * N, N, D});
+out = out.view({B, N, N, D});
+```
+
+Here, out initially has shape (B*N, h, N, d).
+After transpose(1, 2), it has shape (B*N, N, h, d).
+After reshape({B*N, N, D}), it has shape (B*N, N, D).
+After view({B, N, N, D}), it has shape (B, N, N, D).
+
+This should be correct.
+
+The issue might be in the attention computation itself. Let me check:
+
+```cpp
+auto attn = torch::matmul(query_t, key_t.transpose(-1, -2)) / std::sqrt((float)d);
+```
+
+query_t has shape (B*N, h, N, d)
+key_t.transpose(-1, -2) has shape (B*N, h, d, N)
+matmul result has shape (B*N, h, N, N)
+
+This should be correct.
+
+```cpp
+attn = attn.view({B, N, h, N, N});
+```
+
+Wait! Here&#x27;s the issue!
+
+attn has shape (B*N, h, N, N), which has B*N*h*N*N elements.
+But I&#x27;m trying to view it as (B, N, h, N, N), which has B*N*h*N*N elements.
+
+But B*N ≠ B*N*N in general!
+
+The reference code does:
+```python
+attn = attn.view(B, N, h, N, N)
+```
+
+But wait, attn in the reference has shape (B*N, h, N, N), and we&#x27;re trying to reshape to (B, N, h, N, N).
+
+Hmm, (B*N, h, N, N) has B*N*h*N*N elements, and (B, N, h, N, N) has B*N*h*N*N elements.
+
+So they have the same number of elements! The reshape should work.
+
+But the issue is: for the reshape to work correctly, we need to understand what each dimension represents.
+
+In the reference:
+- q = self.query(x_flat).view(B * N, N, h, d).transpose(1, 2) -&gt; (B*N, h, N, d)
+- k = same shape
+- attn = q @ k.transpose(-1, -2) -&gt; (B*N, h, N, N)
+
+So attn[b*N + i, head, j, k] is the attention score between position j and k in row i of batch b.
+
+Then:
+- attn = attn.view(B, N, h, N, N)
+
+This reshapes so attn[b, i, head, j, k] = attn_original[b*N + i, head, j, k].
+
+Then:
+- attn = attn + bias.unsqueeze(1)
+
+bias has shape (B, h, N, N), so bias.unsqueeze(1) has shape (B, 1, h, N, N).
+This broadcasts to (B, N, h, N, N).
+
+But wait, how does this broadcasting work?
+bias[b, 1, head, i, j] broadcasts to attn[b, i, head, j, k] for all k? No, that doesn&#x27;t make sense.
+
+Let me re-read the reference more carefully:
+```python
+bias = self.bias_proj(x).permute(0, 3, 1, 2)
+```
+
+bias_proj(x) takes (B, N, N, D) and outputs (B, N, N, h).
+permute(0, 3, 1, 2) gives (B, h, N, N).
+
+So bias[b, head, i, j] is the bias for position (i, j) in batch b for head `head`.
+
+Now in the attention:
+```python
+attn = attn.view(B, N, h, N, N)
+attn = attn + bias.unsqueeze(1)
+```
+
+bias.unsqueeze(1) has shape (B, 1, h, N, N).
+attn has shape (B, N, h, N, N).
+
+The addition broadcasts, so bias[b, 1, head, i, j] is added to attn[b, i, head, j, k] for all j? No wait, let me think again.
+
+bias has shape (B, h, N, N), so bias[b, head, i, j].
+bias.unsqueeze(1) has shape (B, 1, h, N, N), so bias[b, 0, head, i, j].
+
+When we add to attn[b, i, head, j, k], the broadcasting should match:
+- bias[b, 0, head, i, j] -&gt; attn[b, i, head, j, k]
+- The dimensions: (B, 1, h, N, N) vs (B, N, h, N, N)
+- The second dimension 1 broadcasts to N, the rest match.
+
+So for each batch b, row i, head, position j, the bias[b, 0, head, i, j] is added to attn[b, i, head, j, k] for all k.
+
+Wait, that doesn&#x27;t make sense either. Let me trace through more carefully.
+
+attn after view has shape (B, N, h, N, N).
+- attn[b, i, head, j, k] is the attention from position j to position k in row i of batch b for head.
+
+bias.unsqueeze(1) has shape (B, 1, h, N, N).
+- bias[b, 0, head, row, col] is the bias at (row, col).
+
+When we add:
+- attn[b, i, head, j, k] += bias[b, 0, head, ?, ?]
+
+The broadcasting aligns dimensions:
+- B: same
+- N (attn) vs 1 (bias): broadcasts
+- h: same
+- N (attn) vs N (bias): same
+- N (attn) vs N (bias): same
+
+So the second N in bias corresponds to the fourth N in attn, and the first N in bias corresponds to... wait, let me think about this differently.
+
+bias.unsqueeze(1) has shape (B, 1, h, N, N).
+The dimensions are: batch, dummy, head, dim1, dim2.
+
+attn has shape (B, N, h, N, N).
+The dimensions are: batch, row_idx, head, query_pos, key_pos.
+
+When we add:
+- batch: same
+- row_idx vs dummy: dummy broadcasts to all row_idx
+- head: same
+- query_pos vs dim1: should match
+- key_pos vs dim2: should match
+
+So bias[b, 0, head, j, k] is added to attn[b, i, head, j, k] for all i.
+
+This means the bias is the same for all rows i within a batch! And bias[b, head, j, k] gives the bias for attention from position j to position k.
+
+But looking at the bias_proj:
+- bias_proj(x) takes (B, N, N, D) and outputs (B, N, N, h)
+- So bias_proj(x)[b, i, j, head] is the bias for position (i, j) in batch b for head.
+- permute(0, 3, 1, 2) gives (B, h, N, N)
+- So bias[b, head, i, j] = bias_proj(x)[b, i, j, head]
+
+So bias[b, head, i, j] is the bias for position (i, j) in batch b for head.
+
+When we add bias.unsqueeze(1) to attn:
+- bias[b, 0, head, i, j] is added to attn[b, row, head, i, j] for all row.
+
+Wait, the dimensions don&#x27;t match up as I expected. Let me re-think.
+
+bias has shape (B, h, N, N), which is (batch, head, row, col) based on the permute.
+bias.unsqueeze(1) has shape (B, 1, h, N, N).
+
+attn has shape (B, N, h, N, N), which is (batch, row_in_batch, head, query_idx, key_idx).
+
+When we broadcast:
+- batch: same
+- row_in_batch vs 1: broadcasts
+- head: same
+- query_idx vs row_in_bias: should align?
+- key_idx vs col_in_bias: should align?
+
+Hmm, the third dimension of bias (after unsqueeze) is h, and the fourth is N, and the fifth is N.
+
+In the permute(0, 3, 1, 2), we had:
+- Original: (B, N, N, h) = (batch, row, col, head)
+- After permute: (B, h, N, N) = (batch, head, row, col)
+
+So bias[b, head, i, j] corresponds to position (i, j) in the original pair matrix.
+
+When we add to attn[b, row, head, query_idx, key_idx]:
+- bias[b, 0, head, i, j] should broadcast to attn[b, row, head, i, j]
+
+So the bias at position (i, j) is added to the attention query at position i and key at position j.
+
+But wait, that would mean:
+- The fourth dimension of bias (N) corresponds to the fourth dimension of attn (query_idx).
+- The fifth dimension of bias (N) corresponds to the fifth dimension of attn (key_idx).
+
+And the second dimension of bias (1) broadcasts to the second dimension of attn (row).
+
+So for attn[b, row, head, i, j], we add bias[b, 0, head, i, j].
+
+But this means the bias is the same for all `row` values! That seems odd.
+
+Actually, I think the issue is that I&#x27;m confusing the semantics. Let me re-read the reference:
+
+The key insight is that attn = attn.view(B, N, h, N, N) reshapes from (B*N, h, N, N).
+
+In the original shape (B*N, h, N, N):
+- First dimension is B*N, representing both batch and row.
+- Second dimension is h, representing head.
+- Third dimension is N, representing... what?
+
+In the reference:
+```python
+q = self.query(x_flat).view(B * N, N, h, d).transpose(1, 2)
+```
+
+q has shape (B*N, h, N, d).
+- First dimension: B*N, representing (batch, row)
+- Second dimension: h, representing head
+- Third dimension: N, representing... column? position in the row?
+- Fourth dimension: d, representing head dimension
+
+For attention:
+```python
+attn = q @ k.transpose(-1, -2) / math.sqrt(d)
+```
+
+q has shape (B*N, h, N, d), k has shape (B*N, h, N, d).
+k.transpose(-1, -2) has shape (B*N, h, d, N).
+attn = q @ k.T has shape (B*N, h, N, N).
+
+So attn[bn, head, j, k] is the attention from position j to position k.
+
+Now, when we view as (B, N, h, N, N):
+- attn.view(B, N, h, N, N)[b, i, head, j, k] = attn_original[bn, head, j, k] where bn = b*N + i
+
+So the first N in the view is the row index i, and the second N is the query position j, and the third N is the key position k.
+
+Now bias.unsqueeze(1) has shape (B, 1, h, N, N):
+- bias[b, 0, head, i, j] is the bias for row i, column j.
+
+When we add to attn[b, row, head, j, k]:
+- We need to match dimensions: (B, 1, h, N, N) + (B, N, h, N, N)
+- The second dimension 1 broadcasts to N.
+- So bias[b, 0, head, i, j] is added to attn[b, row, head, i, j] for all row.
+
+But wait, this means the bias at position (i, j) is added to attention where query is at position i and key is at position j, regardless of the row index in the pair matrix.
+
+Actually, I think the confusion is because in the reference, the first N in the view corresponds to which row of the pair matrix we&#x27;re in (i), and the second N is the query position (j), and the third N is the key position (k).
+
+But the bias is computed from the LayerNorm&#x27;d input, which has shape (B, N, N, D). The bias_proj reduces the last dimension to h, giving (B, N, N, h). Then permute gives (B, h, N, N).
+
+So bias[b, head, i, j] is the bias for position (i, j) in the pair matrix.
+
+Now, when we add bias.unsqueeze(1) to attn:
+- bias[b, 0, head, i, j] is added to attn[b, row, head, j, k]
+
+The broadcasting gives:
+- bias[b, 0, head, i, j] is broadcast to attn[b, row, head, i, j] where i = j (query position) and j = k (key position).
+
+Wait, I&#x27;m confusing myself. Let me be very explicit:
+
+attn after view: shape (B, N, h, N, N)
+- dim 0: batch index b
+- dim 1: row index i (which row of the pair matrix we&#x27;re attending over)
+- dim 2: head index
+- dim 3: query position j (attention from position j)
+- dim 4: key position k (attention to position k)
+
+bias after unsqueeze: shape (B, 1, h, N, N)
+- dim 0: batch index b
+- dim 1: dummy (broadcasts)
+- dim 2: head index
+- dim 3: row index of bias (from original position i)
+- dim 4: col index of bias (from original position j)
+
+When we add:
+- attn[b, i, head, j, k] += bias[b, 0, head, j, k]
+
+So the bias at position (j, k) in the pair matrix is added to the attention from position j to position k, for all rows i.
+
+This makes sense! The bias is a pair-wise bias, and when computing attention from position j to position k, we use the bias at pair position (j, k).
+
+OK so now I understand the logic. Let me go back to the kernel and see what&#x27;s wrong.
+
+In my kernel, I compute:
+- bias[b, head, i, j] for each position (b, i, j)
+
+Then I add:
+```cpp
+attn = attn + bias.unsqueeze(1);
+```
+
+This should give attn[b, i, head, j, k] += bias[b, 0, head, j, k], which is what we want.
+
+But wait, in my kernel, I compute bias[b, head, i, j] = bias_proj(x_norm[b, i, j]).
+And bias_proj(x_norm[b, i, j]) should give the bias for position (i, j).
+
+So bias[b, head, i, j] is the bias for pair position (i, j).
+
+When we add to attn[b, i, head, j, k], we should add bias[b, 0, head, j, k], which is the bias for pair position (j, k).
+
+This matches! So the bias computation and usage should be correct.
+
+The issue might be elsewhere. Let me look at the error message again: &quot;shape &#x27;[232, 58, 64]&#x27; is invalid for input of size 1009664&quot;.
+
+This error occurs when trying to reshape a tensor. The sizes don&#x27;t match.
+
+Actually, I realize I might be looking at this wrong. The error might be coming from a PyTorch operation in my code, not from the kernel itself.
+
+Let me check if there&#x27;s an issue with how I&#x27;m using the PyTorch tensors.
+
+In my code:
+```cpp
+auto attn = torch::matmul(query_t, key_t.transpose(-1, -2)) / std::sqrt((float)d);
+attn = attn.view({B, N, h, N, N});
+```
+
+If query_t or key_t has the wrong shape, this would cause issues.
+
+The query/key/value tensors are allocated as:
+```cpp
+auto query = torch::empty({B * N, h, N, d}, options);
+```
+
+And the kernel writes to them. If the kernel writes the wrong number of elements, the tensor would have incorrect data but correct shape.
+
+But wait, the error says the tensor has size 1009664, not that the shape doesn&#x27;t match the expected size.
+
+Actually, looking at this more carefully, the error &quot;shape &#x27;[232, 58, 64]&#x27; is invalid for input of size 1009664&quot; suggests that some operation is trying to create a tensor of shape (232, 58, 64) from a tensor of size 1009664 elements.
+
+232 * 58 * 64 = 861,184 ≠ 1,009,664.
+
+So somewhere in my code, I&#x27;m trying to do a reshape that doesn&#x27;t work.
+
+Let me check all the view/reshape operations:
+
+1. `attn = attn.view({B, N, h, N, N});`
+   - Input: attn has B*N*h*N*N elements
+   - Output: B*N*h*N*N elements
+   - Should match if the product is the same.
+
+2. `attn = attn.view({B * N, h, N, N});`
+   - Should match.
+
+3. `out = out.reshape({B * N, N, D});`
+   - Input: B*N*N*h*d = B*N*N*D elements
+   - Output: B*N*N*D elements
+   - Should match.
+
+4. `out = out.view({B, N, N, D});`
+   - Should match.
+
+None of these seem problematic on their own.
+
+Wait, maybe the issue is that the kernel is not being executed, and the query/key/value tensors are uninitialized or have wrong data, which then causes downstream issues.
+
+Let me check if there&#x27;s a CUDA error after the kernel launch. I should add error checking.
+
+Actually, for a quick fix, let me try using PyTorch operations for everything and just optimize the LayerNorm part in CUDA. This will help verify if the issue is in the projection kernel or elsewhere.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me look at the error more carefully. The shape mismatch suggests issues with how I&#x27;m computing projections. Let me trace through the reference implementation and fix the shapes:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport math\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the CUDA source for triangular attention\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n\nconstexpr int BLOCK_SIZE = 256;\n\n__device__ __forceinline__ float warp_reduce_sum(float val) {\n    #pragma unroll\n    for (int mask = 16; mask &gt; 0; mask &gt;&gt;= 1) {\n        val += __shfl_xor_sync(0xffffffff, val, mask, 32);\n    }\n    return val;\n}\n\n__device__ __forceinline__ float block_reduce_sum(float val) {\n    __shared__ float shared[32];\n    int lane = threadIdx.x % 32;\n    int wid = threadIdx.x / 32;\n    val = warp_reduce_sum(val);\n    if (lane == 0) shared[wid] = val;\n    __syncthreads();\n    val = (threadIdx.x &lt; blockDim.x / 32) ? shared[lane] : 0.0f;\n    if (wid == 0) val = warp_reduce_sum(val);\n    return val;\n}\n\n// LayerNorm + projection kernel\n// Input: pair_repr (B, N, N, D) - same as reference\n// We process each (b, i, j) position independently\n__global__ void layernorm_proj_kernel(\n    const float* __restrict__ input,      // (B, N, N, D)\n    const float* __restrict__ weight_ln,  // (D,)\n    const float* __restrict__ bias_ln,    // (D,)\n    const float* __restrict__ weight_q,   // (D, D) - stored as (out_dim, in_dim)\n    const float* __restrict__ weight_k,   // (D, D)\n    const float* __restrict__ weight_v,   // (D, D)\n    const float* __restrict__ weight_gate, // (D, D)\n    const float* __restrict__ bias_gate,   // (D,)\n    const float* __restrict__ weight_bias, // (h, D)\n    float* __restrict__ query,            // (B, N, N, D) - intermediate, then reshaped\n    float* __restrict__ key,              // (B, N, N, D)\n    float* __restrict__ value,            // (B, N, N, D)\n    float* __restrict__ gate,             // (B, N, N, D)\n    float* __restrict__ bias,             // (B, N, N, h)\n    int B, int N, int D, int h, int d\n) {\n    // Flatten (B, N, N) into grid\n    int total_positions = B * N * N;\n    int pos_idx = blockIdx.x * blockDim.x + threadIdx.x;\n    \n    if (pos_idx &gt;= total_positions) return;\n    \n    int b = pos_idx / (N * N);\n    int rem = pos_idx % (N * N);\n    int i = rem / N;\n    int j = rem % N;\n    \n    int idx = b * N * N * D + i * N * D + j * D;\n    const float* x_ptr = input + idx;\n    \n    // Compute mean\n    float mean = 0.0f;\n    for (int k = 0; k &lt; D; k++) {\n        mean += x_ptr[k];\n    }\n    mean /= D;\n    \n    // Compute variance\n    float var = 0.0f;\n    for (int k = 0; k &lt; D; k++) {\n        float diff = x_ptr[k] - mean;\n        var += diff * diff;\n    }\n    var /= D;\n    float inv_std = rsqrtf(var + 1e-5f);\n    \n    // Apply LayerNorm and store temporarily\n    // Note: each thread handles its own position, so we can use registers\n    float x_norm[64];  // Assuming D &lt;= 64\n    \n    for (int k = 0; k &lt; D; k++) {\n        x_norm[k] = (x_ptr[k] - mean) * inv_std * weight_ln[k] + bias_ln[k];\n    }\n    \n    // Compute Q, K, V projections\n    // Linear: output = input @ weight.T\n    // weight shape: (D, D) -&gt; output[k] = sum_i x_norm[i] * weight[k, i]\n    for (int k = 0; k &lt; D; k++) {\n        float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;\n        for (int i = 0; i &lt; D; i++) {\n            q_val += x_norm[i] * weight_q[k * D + i];\n            k_val += x_norm[i] * weight_k[k * D + i];\n            v_val += x_norm[i] * weight_v[k * D + i];\n        }\n        query[idx + k] = q_val;\n        key[idx + k] = k_val;\n        value[idx + k] = v_val;\n    }\n    \n    // Compute gate projection\n    for (int k = 0; k &lt; D; k++) {\n        float g_val = 0.0f;\n        for (int i = 0; i &lt; D; i++) {\n            g_val += x_norm[i] * weight_gate[k * D + i];\n        }\n        g_val += bias_gate[k];\n        gate[idx + k] = 1.0f / (1.0f + expf(-g_val));\n    }\n    \n    // Compute bias projection\n    // bias_proj: (D,) -&gt; (h,)\n    // weight_bias shape: (h, D)\n    for (int head = 0; head &lt; h; head++) {\n        float b_val = 0.0f;\n        for (int i = 0; i &lt; D; i++) {\n            b_val += x_norm[i] * weight_bias[head * D + i];\n        }\n        // bias shape: (B, N, N, h)\n        int bias_idx = b * N * N * h + i * N * h + j * h + head;\n        bias[bias_idx] = b_val;\n    }\n}\n\ntorch::Tensor triangular_attention_forward(\n    torch::Tensor pair_repr,\n    torch::Tensor pair_mask,\n    torch::Tensor weight_ln,\n    torch::Tensor bias_ln,\n    torch::Tensor weight_q,\n    torch::Tensor weight_k,\n    torch::Tensor weight_v,\n    torch::Tensor weight_gate,\n    torch::Tensor bias_gate,\n    torch::Tensor weight_bias,\n    torch::Tensor out_weight,\n    torch::Tensor out_bias,\n    int num_heads\n) {\n    int B = pair_repr.size(0);\n    int N = pair_repr.size(1);\n    int D = pair_repr.size(3);\n    int h = num_heads;\n    int d = D / h;\n    \n    auto options = pair_repr.options();\n    \n    // Allocate outputs matching reference shapes\n    auto query = torch::empty({B, N, N, D}, options);\n    auto key = torch::empty({B, N, N, D}, options);\n    auto value = torch::empty({B, N, N, D}, options);\n    auto gate = torch::empty({B, N, N, D}, options);\n    auto bias = torch::empty({B, N, N, h}, options);\n    \n    // Launch kernel\n    int total_positions = B * N * N;\n    int blocks = (total_positions + BLOCK_SIZE - 1) / BLOCK_SIZE;\n    \n    layernorm_proj_kernel&lt;&lt;&lt;blocks, BLOCK_SIZE&gt;&gt;&gt;(\n        pair_repr.data_ptr&lt;float&gt;(),\n        weight_ln.data_ptr&lt;float&gt;(),\n        bias_ln.data_ptr&lt;float&gt;(),\n        weight_q.data_ptr&lt;float&gt;(),\n        weight_k.data_ptr&lt;float&gt;(),\n        weight_v.data_ptr&lt;float&gt;(),\n        weight_gate.data_ptr&lt;float&gt;(),\n        bias_gate.data_ptr&lt;float&gt;(),\n        weight_bias.data_ptr&lt;float&gt;(),\n        query.data_ptr&lt;float&gt;(),\n        key.data_ptr&lt;float&gt;(),\n        value.data_ptr&lt;float&gt;(),\n        gate.data_ptr&lt;float&gt;(),\n        bias.data_ptr&lt;float&gt;(),\n        B, N, D, h, d\n    );\n    \n    // Now follow the reference implementation exactly\n    // Reshape for attention: x_flat equivalent\n    // query, key, value are now (B, N, N, D)\n    // We need to reshape to match the reference:\n    // q = query(x_flat).view(B * N, N, h, d).transpose(1, 2) -&gt; (B*N, h, N, d)\n    \n    // For query: reshape (B, N, N, D) -&gt; (B*N, N, D), then view as (B*N, N, h, d), transpose to (B*N, h, N, d)\n    auto q = query.view({B * N, N, D}).view({B * N, N, h, d}).transpose(1, 2);\n    auto k = key.view({B * N, N, D}).view({B * N, N, h, d}).transpose(1, 2);\n    auto v = value.view({B * N, N, D}).view({B * N, N, h, d}).transpose(1, 2);\n    \n    // Compute attention\n    float scale = 1.0f / std::sqrt((float)d);\n    auto attn = torch::matmul(q, k.transpose(-1, -2)) * scale;\n    // attn: (B*N, h, N, N)\n    \n    // Reshape and add bias\n    attn = attn.view({B, N, h, N, N});\n    // bias is (B, N, N, h), need to permute to (B, h, N, N) then unsqueeze\n    auto bias_permuted = bias.permute({0, 3, 1, 2});  // (B, h, N, N)\n    attn = attn + bias_permuted.unsqueeze(1);  // (B, 1, h, N, N) broadcasts to (B, N, h, N, N)\n    \n    // Apply mask\n    auto mask_expanded = pair_mask.unsqueeze(1).unsqueeze(2);  // (B, 1, 1, N, N)\n    attn = attn.masked_fill(mask_expanded == 0, -INFINITY);\n    \n    // Softmax\n    attn = attn.view({B * N, h, N, N});\n    attn = torch::softmax(attn, -1);\n    \n    // Attention output\n    auto out = torch::matmul(attn, v);  // (B*N, h, N, d)\n    out = out.transpose(1, 2).reshape({B * N, N, D});  // (B*N, N, D)\n    out = out.view({B, N, N, D});\n    \n    // Apply gate\n    out = gate * out;\n    \n    // Output projection\n    out = torch::linear(out, out_weight, out_bias);\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor triangular_attention_forward(\n    torch::Tensor pair_repr,\n    torch::Tensor pair_mask,\n    torch::Tensor weight_ln,\n    torch::Tensor bias_ln,\n    torch::Tensor weight_q,\n    torch::Tensor weight_k,\n    torch::Tensor weight_v,\n    torch::Tensor weight_gate,\n    torch::Tensor bias_gate,\n    torch::Tensor weight_bias,\n    torch::Tensor out_weight,\n    torch::Tensor out_bias,\n    int num_heads\n);\n\&quot;\&quot;\&quot;\n\n# Load the extension\ntriangular_attn = load_inline(\n    name=&#x27;triangular_attention&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;triangular_attention_forward&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, pair_dim, num_heads, dropout=0.0):\n        super().__init__()\n        self.num_heads = num_heads\n        self.head_dim = pair_dim // num_heads\n        assert pair_dim % num_heads == 0\n        self.layer_norm = nn.LayerNorm(pair_dim)\n        self.query = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.key = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.value = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.gate = nn.Linear(pair_dim, pair_dim)\n        self.bias_proj = nn.Linear(pair_dim, num_heads, bias=False)\n        self.out_proj = nn.Linear(pair_dim, pair_dim)\n        self.dropout = nn.Dropout(dropout)\n        self.dropout_p = dropout\n\n    def forward(self, pair_repr: torch.Tensor, pair_mask: torch.Tensor) -&gt; torch.Tensor:\n        return triangular_attn.triangular_attention_forward(\n            pair_repr.contiguous(),\n            pair_mask.contiguous(),\n            self.layer_norm.weight.contiguous(),\n            self.layer_norm.bias.contiguous(),\n            self.query.weight.contiguous(),\n            self.key.weight.contiguous(),\n            self.value.weight.contiguous(),\n            self.gate.weight.contiguous(),\n            self.gate.bias.contiguous(),\n            self.bias_proj.weight.contiguous(),\n            self.out_proj.weight.contiguous(),\n            self.out_proj.bias.contiguous(),\n            self.num_heads\n        )&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
