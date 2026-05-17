@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-17 07:15:37 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-17 07:17:59 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_EdgeSoftmaxMultiHeadCSR.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">10328</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -67,5 +67,732 @@ def get_inputs():
 
 def get_init_inputs():
     return []
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 437.2s turn · 85.5s LLM · tokens in=2,183 · out=8,145 · total=10,328 · 36,830 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>437.2s turn · 85.5s LLM · 351.7s tools · <span class="turn-tokens">tokens in=2,183 · out=8,145 · total=10,328</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the task:
+
+1. I need to implement a multi-head row-wise softmax over CSR edge scores
+2. The input is `row_ptr` (CSR row pointers) and `edge_scores` (edge scores for all edges, with multiple heads)
+3. For each node (row), I need to apply softmax independently for each head
+4. The CSR format means `row_ptr[node]` to `row_ptr[node+1]` gives the edge indices for that node
+
+Let me understand the data layout:
+- `row_ptr` has shape (num_nodes + 1,)
+- `edge_scores` likely has shape (total_edges, num_heads) or (total_edges * num_heads,)
+- For each node, we have edges from `start` to `end` (exclusive)
+- For each node, we apply softmax over those edges for each head independently
+
+Wait, let me look at the reference more carefully:
+```python
+out[start:end] = torch.softmax(edge_scores[start:end], dim=0)
+```
+
+This applies softmax on dim=0, meaning across the edges for that node. If `edge_scores[start:end]` has shape (num_edges_for_node, num_heads), then softmax on dim=0 would normalize across edges for each head.
+
+So the edge_scores shape is (total_edges, num_heads), and for each node we normalize the scores for its edges independently for each head.
+
+Now let me think about the CUDA kernel:
+
+1. Each thread block could handle one node
+2. Within a node, we need to:
+   - Find the max score for each head (for numerical stability)
+   - Compute exp(score - max) for each edge and head
+   - Sum the exp values for each head
+   - Divide each exp by the sum
+
+For efficient implementation:
+- Use shared memory for the max values and sum values per head
+- Each thread handles one edge (or multiple if there are more edges than threads)
+
+
+- Apply a parallel reduction for max and sum across the edges within each node&#x27;s range
+
+I&#x27;ll start with a basic implementation and then optimize it.
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cmath&gt;
+
+template &lt;typename scalar_t&gt;
+__global__ void csr_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const scalar_t* __restrict__ edge_scores,
+    scalar_t* __restrict__ out,
+    int num_nodes,
+    int num_heads,
+    int total_edges) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    int tid = threadIdx.x;
+    int head = threadIdx.y;
+    
+    // Shared memory for max and sum per head
+    extern __shared__ char shared_mem[];
+    scalar_t* max_vals = (scalar_t*)shared_mem;
+    scalar_t* sum_vals = max_vals + num_heads;
+    
+    // Initialize max and sum
+    if (head &lt; num_heads) {
+        max_vals[head] = -INFINITY;
+        sum_vals[head] = 0;
+    }
+    __syncthreads();
+    
+    // Find max for each head (across all edges)
+    for (int i = tid; i &lt; num_edges; i += blockDim.x) {
+        int edge_idx = start + i;
+        if (head &lt; num_heads) {
+            scalar_t val = edge_scores[edge_idx * num_heads + head];
+            atomicMax(reinterpret_cast&lt;unsigned long long*&gt;(&amp;max_vals[head]), 
+                      __float_as_uint(val));
+        }
+    }
+    __syncthreads();
+    
+    // Compute exp(x - max) and sum
+    for (int i = tid; i &lt; num_edges; i += blockDim.x) {
+        int edge_idx = start + i;
+        if (head &lt; num_heads) {
+            scalar_t val = edge_scores[edge_idx * num_heads + head];
+            scalar_t exp_val = exp(val - max_vals[head]);
+            out[edge_idx * num_heads + head] = exp_val;
+            atomicAdd(&amp;sum_vals[head], exp_val);
+        }
+    }
+    __syncthreads();
+    
+    // Normalize
+    for (int i = tid; i &lt; num_edges; i += blockDim.x) {
+        int edge_idx = start + i;
+        if (head &lt; num_heads) {
+            out[edge_idx * num_heads + head] /= sum_vals[head];
+        }
+    }
+}
+
+torch::Tensor csr_softmax_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores) {
+    int num_nodes = row_ptr.numel() - 1;
+    int total_edges = edge_scores.size(0);
+    int num_heads = edge_scores.size(1);
+    
+    auto out = torch::empty_like(edge_scores);
+    
+    // Launch kernel
+    int threads_per_block = 256;
+    int blocks = num_nodes;
+    
+    size_t shared_mem_size = 2 * num_heads * sizeof(float);
+    
+    AT_DISPATCH_FLOATING_TYPES(edge_scores.type(), &quot;csr_softmax_kernel&quot;, ([&amp;] {
+        csr_softmax_kernel&lt;scalar_t&gt;&lt;&lt;&lt;blocks, threads_per_block, shared_mem_size&gt;&gt;&gt;(
+            row_ptr.data_ptr&lt;int64_t&gt;(),
+            edge_scores.data_ptr&lt;scalar_t&gt;(),
+            out.data_ptr&lt;scalar_t&gt;(),
+            num_nodes,
+            num_heads,
+            total_edges
+        );
+    }));
+    
+    return out;
+}
+&quot;&quot;&quot;
+
+module = load_inline(
+    name=&#x27;csr_softmax&#x27;,
+    cpp_sources=[&#x27;torch::Tensor csr_softmax_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores);&#x27;],
+    cuda_sources=[cuda_source],
+    functions=[&#x27;csr_softmax_cuda&#x27;],
+    with_cuda=True,
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:
+        return module.csr_softmax_cuda(row_ptr, edge_scores)
+```
+
+I need to reconsider the data layout and kernel design. The edge_scores are stored as (total_edges, num_heads), and I&#x27;m iterating over edges in the inner loop while parallelizing across nodes. The kernel should handle each node&#x27;s edge range independently, computing softmax across the head dimension for each edge. I need to compute the softmax across the edge dimension for each head separately. For a given node and head, I should find the maximum value among all edges belonging to that node, then subtract this maximum from each edge value before exponentiation to maintain numerical stability. This requires coordinating across both the edge and head dimensions - I need to reduce over edges while keeping heads independent. A 2D thread block organization would work well here, with one dimension handling the edge loop and the other processing heads in parallel. I&#x27;m going to set up a basic kernel structure first. Each block handles one node, and I&#x27;ll organize threads so each one processes a specific edge-head pair. The shared memory will store the max and sum values per head for the reduction steps.
+
+```cpp
+template &lt;typename scalar_t&gt;
+__global__ void csr_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const scalar_t* __restrict__ edge_scores,
+    scalar_t* __restrict__ out,
+    int num_nodes,
+    int num_heads) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    int tid = threadIdx.x;
+    
+    // Shared memory for max and sum per head
+    extern __shared__ char shared_mem[];
+    scalar_t* max_vals = (scalar_t*)shared_mem;  // size: num_heads
+    scalar_t* sum_vals = max_vals + num_heads;    // size: num_heads
+    
+    // Initialize max and sum for the heads this thread handles
+    for (int h = tid; h &lt; num_heads; h += blockDim.x) {
+        max_vals[h] = -INFINITY;
+        sum_vals[h] = 0;
+    }
+    __syncthreads();
+    
+    // Find max for each head
+    for (int h = tid; h &lt; num_heads; h += blockDim.x) {
+        scalar_t local_max = -INFINITY;
+        for (int i = 0; i &lt; num_edges; i++) {
+            int edge_idx = start + i;
+            scalar_t val = edge_scores[edge_idx * num_heads + h];
+            local_max = max(local_max, val);
+        }
+        // Atomic max
+        atomicMax(reinterpret_cast&lt;float*&gt;(&amp;max_vals[h]), local_max);
+    }
+    __syncthreads();
+    
+    // Compute exp and sum
+    for (int h = tid; h &lt; num_heads; h += blockDim.x) {
+        scalar_t local_sum = 0;
+        for (int i = 0; i &lt; num_edges; i++) {
+            int edge_idx = start + i;
+            scalar_t val = edge_scores[edge_idx * num_heads + h];
+            scalar_t exp_val = exp(val - max_vals[h]);
+            out[edge_idx * num_heads + h] = exp_val;
+            local_sum += exp_val;
+        }
+        atomicAdd(&amp;sum_vals[h], local_sum);
+    }
+    __syncthreads();
+    
+    // Normalize
+    for (int h = tid; h &lt; num_heads; h += blockDim.x) {
+        for (int i = 0; i &lt; num_edges; i++) {
+            int edge_idx = start + i;
+            out[edge_idx * num_heads + h] /= sum_vals[h];
+        }
+    }
+}
+```
+
+Atomic operations on floats might be inefficient here. A better strategy would be to assign one thread per head within the block, then have that thread loop through all edges to compute max and sum without atomics. This avoids the overhead of atomic operations entirely.
+
+However, since there are only 8 heads and potentially hundreds of edges, that approach would leave most threads idle. I should reconsider the distribution: perhaps each thread handles multiple edges and uses a parallel reduction to compute max and sum efficiently.
+
+Looking at the actual numbers—518 nodes with average degree 18 and 8 heads—the total edges come to about 9324. The ratio of edges to heads per node is roughly 18:8, which suggests threads could process multiple edges per head while keeping the workload balanced.
+
+If I assign one thread per head within each node&#x27;s block, each thread loops through ~18 edges to find the max, compute exp values, and sum them. That&#x27;s computationally light, but with only 8 active threads per block, occupancy suffers. I should restructure the kernel to have each thread handle a single (edge, head) pair instead, using shared memory to store max and sum values for each head, then accumulate results through parallel reduction.
+
+Each thread computes its local value, updates the shared max via atomic operation, then synchronizes before computing exp(val - max_val) and accumulating the sum. After another synchronization, threads normalize their values by dividing through the shared sum.
+
+The kernel uses a 2D thread arrangement where threadIdx.x loops over edges and threadIdx.y corresponds to different heads. This allows parallel processing across both dimensions efficiently.
+
+For each head, threads compute the maximum value across all edges using atomic operations, then synchronize before computing the exponential of each element minus its maximum. The exponentials are stored in the output and accumulated using atomic adds to get the sum for normalization. After another synchronization, each thread divides its output by the sum to complete the softmax computation.
+
+The kernel is launched with one block per node, using 2D thread blocks sized (edges_per_block, num_heads) and shared memory sized for two arrays of num_heads elements. I need to reconsider the approach since the 2D thread indexing might complicate things. Instead, I can use a linear thread layout where each thread handles a specific (edge, head) pair across the entire edge range.
+
+```cpp
+template &lt;typename scalar_t&gt;
+__global__ void csr_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const scalar_t* __restrict__ edge_scores,
+    scalar_t* __restrict__ out,
+    int num_nodes,
+    int num_heads) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+    
+    // Shared memory
+    extern __shared__ char shared_mem[];
+    scalar_t* max_vals = (scalar_t*)shared_mem;  // size: num_heads
+    scalar_t* sum_vals = max_vals + num_heads;    // size: num_heads
+    
+    // Initialize max and sum
+    for (int h = tid; h &lt; num_heads; h += total_threads) {
+        max_vals[h] = -1e30f;  // Use large negative instead of -INFINITY for atomic max
+        sum_vals[h] = 0;
+    }
+    __syncthreads();
+    
+    // Find max for each head - each thread processes (edge, head) pairs
+    for (int idx = tid; idx &lt; num_edges * num_heads; idx += total_threads) {
+        int i = idx / num_heads;  // edge index
+        int h = idx % num_heads;  // head index
+        int edge_idx = start + i;
+        scalar_t val = edge_scores[edge_idx * num_heads + h];
+        
+        // Atomic max
+        atomicMax(reinterpret_cast&lt;unsigned long long*&gt;(&amp;max_vals[h]), 
+                  __float_as_uint(val));
+    }
+    __syncthreads();
+    
+    // Compute exp(x - max) and sum
+    for (int idx = tid; idx &lt; num_edges * num_heads; idx += total_threads) {
+        int i = idx / num_heads;
+        int h = idx % num_heads;
+        int edge_idx = start + i;
+        scalar_t val = edge_scores[edge_idx * num_heads + h];
+        scalar_t exp_val = exp(val - max_vals[h]);
+        out[edge_idx * num_heads + h] = exp_val;
+        atomicAdd(&amp;sum_vals[h], exp_val);
+    }
+    __syncthreads();
+    
+    // Normalize
+    for (int idx = tid; idx &lt; num_edges * num_heads; idx += total_threads) {
+        int i = idx / num_heads;
+        int h = idx % num_heads;
+        int edge_idx = start + i;
+        out[edge_idx * num_heads + h] /= sum_vals[h];
+    }
+}
+```
+
+Each thread now iterates over a strided range of (edge, head) pairs, computing the max across all edges for each head using atomic operations, then exponentiating and normalizing.
+
+The atomic max operation needs careful handling since it works on integer representations. I should use a proper reduction approach instead—threads can compute local maximums first, then write the final max value after synchronization.
+
+```cpp
+template &lt;typename scalar_t&gt;
+__global__ void csr_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const scalar_t* __restrict__ edge_scores,
+    scalar_t* __restrict__ out,
+    int num_nodes,
+    int num_heads) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+    
+    // Shared memory
+    extern __shared__ char shared_mem[];
+    scalar_t* max_vals = (scalar_t*)shared_mem;
+    scalar_t* sum_vals = max_vals + num_heads;
+    
+    // Local storage for each thread
+    scalar_t local_max[8];  // Assume num_heads &lt;= 8
+    scalar_t local_sum[8];
+    
+    // Initialize local max and sum
+    for (int h = 0; h &lt; num_heads; h++) {
+        local_max[h] = -INFINITY;
+        local_sum[h] = 0;
+    }
+    
+    // Initialize shared memory
+    if (tid &lt; num_heads) {
+        max_vals[tid] = -INFINITY;
+        sum_vals[tid] = 0;
+    }
+    __syncthreads();
+    
+    // Find local max for each head
+    for (int idx = tid; idx &lt; num_edges * num_heads; idx += total_threads) {
+        int i = idx / num_heads;
+        int h = idx % num_heads;
+        int edge_idx = start + i;
+        scalar_t val = edge_scores[edge_idx * num_heads + h];
+        local_max[h] = max(local_max[h], val);
+    }
+    
+    // Reduce to shared memory
+    for (int h = 0; h &lt; num_heads; h++) {
+        atomicMax(reinterpret_cast&lt;unsigned long long*&gt;(&amp;max_vals[h]), 
+                  __float_as_uint(local_max[h]));
+    }
+    __syncthreads();
+    
+    // Compute exp and local sum
+    for (int idx = tid; idx &lt; num_edges * num_heads; idx += total_threads) {
+        int i = idx / num_heads;
+        int h = idx % num_heads;
+        int edge_idx = start + i;
+        scalar_t val = edge_scores[edge_idx * num_heads + h];
+        scalar_t exp_val = exp(val - max_vals[h]);
+        out[edge_idx * num_heads + h] = exp_val;
+        local_sum[h] += exp_val;
+    }
+    
+    // Reduce sums to shared memory
+    for (int h = 0; h &lt; num_heads; h++) {
+        atomicAdd(&amp;sum_vals[h], local_sum[h]);
+    }
+    __syncthreads();
+    
+    // Normalize
+    for (int idx = tid; idx &lt; num_edges * num_heads; idx += total_threads) {
+        int i = idx / num_heads;
+        int h = idx % num_heads;
+        int edge_idx = start + i;
+        out[edge_idx * num_heads + h] /= sum_vals[h];
+    }
+}
+```
+
+For float types, atomicMax works through the integer reinterpretation trick. I&#x27;m storing local max and sum for each head in registers, then reducing to shared memory with atomic operations. The approach avoids redundant global memory access during the normalization phase.
+
+Actually, `__float_as_uint` returns an unsigned int, not unsigned long long, so I need to adjust the cast. For fp32, I can use `atomicMax` on the reinterpretation as float directly since CUDA supports atomic operations on floats. For double precision, I&#x27;d need to handle the 64-bit case separately.
+
+Let me restructure with separate kernel implementations for each scalar type. For float, I&#x27;ll use shared memory to store max and sum values per head, then have each thread compute its local max across assigned edges before writing atomically to shared memory.
+
+Each thread iterates through its assigned edges and heads, tracking the maximum value locally, then atomically updates the shared max_vals array. After synchronization, threads compute exponentials of values minus the head&#x27;s maximum and accumulate the sums atomically. Finally, I normalize by dividing through the sum_vals array.
+
+However, atomic operations on floats with potentially negative values could cause issues since float atomicMax interprets bit patterns rather than actual float comparisons. A cleaner approach uses warp-level primitives like warpReduceMax for more efficient reduction without atomics, or assigns one thread per head to sequentially compute the maximum across edges. For small head counts like 8, this sequential approach works well, though it leaves most threads idle if there are many edges.
+
+The optimal strategy depends on the problem dimensions. Since we have 8 heads but ~18 edges per node on average, I can partition threads into groups of 8 where each group handles one head across multiple edges in parallel, with each thread processing a different edge simultaneously. This balances the workload across all threads while maintaining parallelism across both heads and edges.
+
+Alternatively, I could reorganize by making each thread responsible for one head, then having all threads within a warp collaborate on edge computations through cooperative loading and reduction operations. This approach leverages warp-level primitives efficiently and keeps the parallel structure simple.
+
+However, since each node has different edge counts, the work distribution becomes uneven. A more practical approach assigns each thread to handle specific (edge, head) pairs directly, reducing max and sum values through atomic operations in shared memory. With around 18 edges per node and 8 heads yielding roughly 144 work items, I can use a block of 128 or 256 threads to cover all pairs efficiently. The tradeoff is atomic operation overhead, but shared memory atomics are significantly faster than global memory alternatives.
+
+I&#x27;ll implement this strategy now, computing thread indices to map each thread to its assigned edge-head pair and then applying the softmax normalization across edges for each head.
+
+```cpp
+template &lt;typename scalar_t&gt;
+__global__ void csr_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const scalar_t* __restrict__ edge_scores,
+    scalar_t* __restrict__ out,
+    int num_nodes,
+    int num_heads) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+    
+    // Shared memory for per-head max and sum
+    extern __shared__ char shared_mem[];
+    scalar_t* max_vals = (scalar_t*)shared_mem;
+    scalar_t* sum_vals = max_vals + num_heads;
+    
+    // Initialize shared memory (first num_heads threads)
+    if (tid &lt; num_heads) {
+        max_vals[tid] = -1e30f;
+        sum_vals[tid] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Register-based local max per thread
+    scalar_t local_max = -1e30f;
+    int my_head = tid % num_heads;  // Assign head to thread cyclically
+    
+    // Phase 1: Find max for assigned head
+    for (int i = tid / num_heads; i &lt; num_edges; i += total_threads / num_heads) {
+        int edge_idx = start + i;
+        scalar_t val = edge_scores[edge_idx * num_heads + my_head];
+        local_max = max(local_max, val);
+    }
+    
+    // Atomic max to shared memory
+    // Use atomicMax on float directly (CUDA supports this)
+    atomicMax(&amp;max_vals[my_head], local_max);
+    __syncthreads();
+    
+    // Phase 2: Compute exp and sum
+    scalar_t local_sum = 0.0f;
+    for (int i = tid / num_heads; i &lt; num_edges; i += total_threads / num_heads) {
+        int edge_idx = start + i;
+        scalar_t val = edge_scores[edge_idx * num_heads + my_head];
+        scalar_t exp_val = exp(val - max_vals[my_head]);
+        out[edge_idx * num_heads + my_head] = exp_val;
+        local_sum += exp_val;
+    }
+    
+    atomicAdd(&amp;sum_vals[my_head], local_sum);
+    __syncthreads();
+    
+    // Phase 3: Normalize
+    for (int i = tid / num_heads; i &lt; num_edges; i += total_threads / num_heads) {
+        int edge_idx = start + i;
+        out[edge_idx * num_heads + my_head] /= sum_vals[my_head];
+    }
+}
+```
+
+The thread distribution means `tid / num_heads` could be zero for threads 0-7, so the edge loop handles that correctly by iterating through all edges assigned to each thread&#x27;s head.
+
+The main concern is workload imbalance—if num_heads is 8 and blockDim.x is 256, then each thread group processes roughly 2-3 edges, but some might get none depending on the actual edge count. The cyclic assignment could leave threads idle or overworked.
+
+A simpler strategy would be having each thread claim specific (edge, head) pairs sequentially rather than using cyclic distribution, which might distribute work more evenly across the block. .x;
+    
+    // Shared memory for per-head max and sum
+    extern __shared__ char shared_mem[];
+    scalar_t* max_vals = (scalar_t*)shared_mem;
+    scalar_t* sum_vals = max_vals + num_heads;
+    
+    // Initialize shared memory
+    for (int h = tid; h &lt; num_heads; h += total_threads) {
+        max_vals[h] = -1e30f;
+        sum_vals[h] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Phase 1: Find max for each head
+    // Each thread loops over all edges for a subset of heads
+    for (int h = tid; h &lt; num_heads; h += total_threads) {
+        scalar_t local_max = -1e30f;
+        for (int i = 0; i &lt; num_edges; i++) {
+            int edge_idx = start + i;
+            scalar_t val = edge_scores[edge_idx * num_heads + h];
+            local_max = max(local_max, val);
+        }
+        atomicMax(&amp;max_vals[h], local_max);
+    }
+    __syncthreads();
+    
+    // Phase 2: Compute exp and sum
+    for (int h = tid; h &lt; num_heads; h += total_threads) {
+        scalar_t local_sum = 0.0f;
+        for (int i = 0; i &lt; num_edges; i++) {
+            int edge_idx = start + i;
+            scalar_t val = edge_scores[edge_idx * num_heads + h];
+            scalar_t exp_val = exp(val - max_vals[h]);
+            out[edge_idx * num_heads + h] = exp_val;
+            local_sum += exp_val;
+        }
+        atomicAdd(&amp;sum_vals[h], local_sum);
+    }
+    __syncthreads();
+    
+    // Phase 3: Normalize
+    for (int h = tid; h &lt; num_heads; h += total_threads) {
+        for (int i = 0; i &lt; num_edges; i++) {
+            int edge_idx = start + i;
+            out[edge_idx * num_heads + h] /= sum_vals[h];
+        }
+    }
+}
+
+With 256 threads and 8 heads, each head gets 32 threads, but that&#x27;s excessive when there are only ~18 edges per node. I should reconsider using a more direct (edge, head) pairing approach instead. I need to finish the partial thought about normalizing the output values. Since there are 8 heads and roughly 18 edges per node, each thread processes about 0.56 elements on average, meaning most of the 128 threads will handle one element while some remain idle.
+
+A cleaner strategy would be assigning each thread to a specific head and having it iterate through edges, which reduces atomic operation overhead. Alternatively, I could use a warp-level reduction instead of atomics to handle the max and sum calculations more efficiently across the parallel threads.
+
+The most straightforward approach is to let each thread handle one head and loop through all edges for that head, computing the max, then exponentials and sums. This works well when num_heads is small and num_edges is moderate—like 8 heads and 18 edges—but the efficiency drops if either dimension grows large, leaving threads either overworked or idle.
+
+Since the specific configuration has 8 heads and roughly 18 edges, I&#x27;ll go with this simpler design where threads iterate over edges. d]; h &lt; num_heads; h += total_threads) {
+        scalar_t local_sum = 0.0f;
+        for (int i = 0; i &lt; num_edges; i++) {
+            int edge_idx = start + i;
+            scalar_t val = edge_scores[edge_idx * num_heads + h];
+            scalar_t exp_val = exp(val - max_vals[h]);
+            out[edge_idx * num_heads + h] = exp_val;
+            local_sum += exp_val;
+        }
+        atomicAdd(&amp;sum_vals[h], local_sum);
+    }
+    __syncthreads();
+    
+    // Normalize each head&#x27;s output
+    for (int h = tid; h &lt; num_heads; h += total_threads) {
+        scalar_t inv_sum = 1.0f / sum_vals[h];
+        for (int i = 0; i &lt; num_edges; i++) {
+            int edge_idx = start + i;
+            out[edge_idx * num_heads + h] *= inv_sum;
+        }
+    }
+}
+
+Each thread now handles multiple heads by striding through them, computing exponentials and accumulating sums, then normalizing by the inverse sum to avoid repeated division operations.
+
+However, I&#x27;m concerned about the atomic operations on float values—`atomicMax` might not work as expected with floating-point representations. I should verify the CUDA atomic behavior and potentially implement a custom max reduction that handles floats correctly, or use a different synchronization strategy entirely. For double precision, I need to handle it separately since atomicMax doesn&#x27;t work on doubles. I can use an atomic compare-and-swap approach with atomicCAS, treating the double as an unsigned long long for the bit manipulation. The function loops until it successfully updates the maximum value, using bitwise operations to compare and swap the double representation. The atomicMax implementation has a critical flaw—when all values are negative, `__longlong_as_double(0)` interprets as 0.0, which becomes the maximum since it&#x27;s larger than any negative number. This breaks correctness for negative inputs.
+
+I should switch to a parallel reduction approach without atomics instead. With only 8 threads handling 8 heads, I can have each thread compute a local maximum, then use warp shuffle operations to combine these values across the warp. Each thread then uses the final max to compute its exponentials and partial sums, which can also be reduced via warp shuffles.
+
+However, with 8 heads per block, I&#x27;d only have 8 active threads—far below the GPU&#x27;s capacity and inefficient for occupancy. I need a design that scales better with the problem size. Since I have ~18 edges per node and 8 heads, I should distribute work so threads handle multiple (edge, head) pairs rather than just one head each.
+
+A better approach: use blockDim = 256 threads per block, where each thread processes a subset of (edge, head) pairs in a round-robin fashion. All threads cooperate on finding the maximum per head, then compute partial sums, with results written to shared memory at the end.
+
+Each thread maintains a local max and sum for its assigned head. It iterates through its designated edges, reading the corresponding scores and updating local_max. After the loop, threads write their local_max values to shared memory. A parallel reduction in shared memory then combines these per-thread maxima into the final per-head maximum. = max_vals[h];
+        scalar_t local_sum = 0.0f;
+        for (int i = 0; i &lt; num_edges; i++) {
+            int edge_idx = start + i;
+            scalar_t val = edge_scores[edge_idx * num_heads + h];
+            scalar_t exp_val = exp(val - head_max);
+            out[edge_idx * num_heads + h] = exp_val;
+            local_sum += exp_val;
+        }
+        atomicAdd(&amp;sum_vals[h], local_sum);
+    }
+    __syncthreads();
+    
+    // Normalize
+    for (int h = tid; h &lt; num_heads; h += total_threads) {
+        scalar_t inv_sum = 1.0f / sum_vals[h];
+        for (int i = 0; i &lt; num_edges; i++) {
+            int edge_idx = start + i;
+            out[edge_idx * num_heads + h] *= inv_sum;
+        }
+    }
+}
+
+Each thread iterates through all edges for its assigned head, exponentiates values after subtracting the head&#x27;s maximum, and accumulates the sum before atomically adding it to shared memory. After synchronization, threads normalize by multiplying each output by the inverse sum for their head.
+
+The approach handles the strided head assignment correctly, but there&#x27;s an issue with how the reduction works. Since threads are distributed across heads in a cyclic pattern with blockDim = 256 and num_heads = 8, multiple threads end up responsible for the same head. When they each compute local_max and write to shared_max[tid], the shared memory layout doesn&#x27;t properly aggregate values per head—each thread writes to its own slot rather than combining values for the same head.
+
+A cleaner design would dedicate fewer threads per block, assign each thread to a specific head, and have them iterate through edges sequentially. This avoids synchronization overhead and memory access conflicts since each thread computes its head&#x27;s maximum independently.
+
+However, this wastes GPU resources since most threads sit idle while only 8 compute. A better strategy uses 256 threads per block but assigns groups of threads to each head, enabling parallel edge processing with efficient reductions.
+
+With 8 heads and 256 threads, I&#x27;d allocate 32 threads per head. Each thread processes roughly half the edges independently, computes a local maximum, then participates in a reduction to consolidate the per-head maxima. Shared memory holds intermediate results—local maxima and sums per thread group.
+
+```cpp
+template &lt;typename scalar_t, int BLOCK_SIZE, int THREADS_PER_HEAD&gt;
+__global__ void csr_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const scalar_t* __restrict__ edge_scores,
+    scalar_t* __restrict__ out,
+    int num_nodes,
+    int num_heads) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    int tid = threadIdx.x;
+    int head = tid / THREADS_PER_HEAD;
+    int lane = tid % THREADS_PER_HEAD;
+    
+    if (head &gt;= num_heads) return;
+    
+    // Shared memory for max and sum per head
+    __shared__ scalar_t max_vals[8];  // Assume num_heads &lt;= 8
+    __shared__ scalar_t sum_vals[8];
+    
+    // Phase 1: Find max for this head
+    scalar_t local_max = -1e30f;
+    for (int i = lane; i &lt; num_edges; i += THREADS_PER_HEAD) {
+        int edge_idx = start + i;
+        scalar_t val = edge_scores[edge_idx * num_heads + head];
+        local_max = max(local_max, val);
+    }
+    
+    // Reduce within the group
+    for (int offset = THREADS_PER_HEAD / 2; offset &gt; 0; offset /= 2) {
+        local_max = max(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    
+    if (lane == 0) {
+        max_vals[head] = local_max;
+    }
+    __syncthreads();
+    
+    // Phase 2: Compute exp and sum
+    scalar_t local_sum = 0.0f;
+    scalar_t head_max = max_vals[head];
+    for (int i = lane; i &lt; num_edges; i += THREADS_PER_HEAD) {
+        int edge_idx = start + i;
+        scalar_t val = edge_scores[edge_idx * num_heads + head];
+        scalar_t exp_val = exp(val - head_max);
+        out[edge_idx * num_heads + head] = exp_val;
+        local_sum += exp_val;
+    }
+    
+    // Reduce sum
+    for (int offset = THREADS_PER_HEAD / 2; offset &gt; 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset));
+    }
+    
+    if (lane == 0) {
+        sum_vals[head] = local_sum;
+    }
+    __syncthreads();
+    
+    // Phase 3: Normalize
+    scalar_t inv_sum = 1.0f / sum_vals[head];
+    for (int i = lane; i &lt; num_edges; i += THREADS_PER_HEAD) {
+        int edge_idx = start + i;
+        out[edge_idx * num_heads + head] *= inv_sum;
+    }
+}
+```
+
+Each thread group collaborates through warp shuffles to aggregate local maxima and sums, avoiding shared memory bank conflicts and atomic overhead. Groups operate independently on their assigned head, then synchronize only when writing the final max and sum values. Groups of 32 threads work together, with each group assigned to one head. Within a group, threads perform a parallel reduction using warp shuffles to compute the maximum value efficiently.
+
+I need to handle the reduction carefully since THREADS_PER_HEAD=32 is a full warp, but only the first 8 groups (256 threads total) are active—the remaining threads should be masked out. The shuffle operations work across the entire warp, so the mask must account for which threads actually have valid data.
+
+A cleaner design separates heads into their own warps and assigns one thread per edge within each head. This avoids cross-group interference and simplifies the reduction logic.
+
+With 8 heads spread across 8 warps, each warp processes one head independently. The threads iterate through their assigned edges, computing local max values in parallel. After all threads finish their edge processing, the warp performs a shuffle reduction to consolidate the maximum value across all edges for that head.
+
+The reduction proceeds by repeatedly halving the active threads and comparing values via shuffle operations, with only the lowest-indexed threads keeping the final result. Thread 0 then stores the computed maximum for its head.
+
+A cleaner approach would skip warp shuffles entirely and instead use shared memory atomics for reduction—this simplifies the logic and avoids the complexity of managing active lanes during sequential reductions. Phase 3: Normalize each element by dividing by the sum for its head. Iterate through all edges for each assigned head, computing the exponential of the difference from the maximum, storing the result, and accumulating the sum. After synchronizing threads, multiply each output by the inverse of its head&#x27;s sum to achieve normalization. This approach relies on atomics for reduction, which is efficient for shared memory on modern GPUs given the small thread count and minimal collisions.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Looking at this task, I need to implement a multi-head row-wise softmax over CSR edge scores. Let me first understand the problem and then implement an efficient CUDA kernel.
+</div><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
 </body></html>
