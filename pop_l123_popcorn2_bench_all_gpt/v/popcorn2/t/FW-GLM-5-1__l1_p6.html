@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-18 16:04:34 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-18 16:06:56 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_EdgeSoftmaxMultiHeadCSR.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">2947</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">7208</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -131,5 +131,155 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 220.0s turn · 17.8s LLM · tokens in=2,458 · out=1,803 · total=4,261 · 11,236 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>220.0s turn · 17.8s LLM · 202.1s tools · <span class="turn-tokens">tokens in=2,458 · out=1,803 · total=4,261</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me understand the problem:
+- We have a CSR (Compressed Sparse Row) format with row pointers
+- For each row (node), we compute softmax over its edges
+- The edge scores have multiple heads (8 heads)
+- Each row is normalized independently for each head
+
+The reference implementation loops over nodes and for each node applies softmax on the edge scores. This is very inefficient because:
+1. It&#x27;s a Python loop over 518 nodes
+2. Each softmax call has Python overhead
+3. No parallelization across nodes
+
+Let me create a CUDA kernel that processes rows in parallel. The key insight is:
+- We can parallelize over nodes (each thread handles one node&#x27;s softmax)
+- For softmax, we need:
+  1. Find max value in the row (for numerical stability)
+  2. Compute exp(x - max) and sum
+  3. Divide by sum
+
+Let me write the first version:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+__global__ void edge_softmax_csr_kernel(
+    const long* __restrict__ row_ptr,
+    const float* __restrict__ edge_scores,
+    float* __restrict__ out,
+    int num_nodes,
+    int num_heads) {
+    
+    int node = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    // For each head, compute softmax
+    for (int h = 0; h &lt; num_heads; h++) {
+        // Find max
+        float max_val = -INFINITY;
+        for (int e = 0; e &lt; num_edges; e++) {
+            float val = edge_scores[(start + e) * num_heads + h];
+            max_val = fmaxf(max_val, val);
+        }
+        
+        // Compute exp and sum
+        float sum = 0.0f;
+        for (int e = 0; e &lt; num_edges; e++) {
+            int idx = (start + e) * num_heads + h;
+            float val = expf(edge_scores[idx] - max_val);
+            out[idx] = val;
+            sum += val;
+        }
+        
+        // Normalize
+        float inv_sum = 1.0f / sum;
+        for (int e = 0; e &lt; num_edges; e++) {
+            int idx = (start + e) * num_heads + h;
+            out[idx] *= inv_sum;
+        }
+    }
+}
+
+torch::Tensor edge_softmax_csr(
+    torch::Tensor row_ptr,
+    torch::Tensor edge_scores) {
+    
+    int num_nodes = row_ptr.numel() - 1;
+    int num_heads = edge_scores.size(1);
+    
+    auto out = torch::empty_like(edge_scores);
+    
+    int threads = 256;
+    int blocks = (num_nodes + threads - 1) / threads;
+    
+    edge_softmax_csr_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        row_ptr.data_ptr&lt;long&gt;(),
+        edge_scores.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(),
+        num_nodes,
+        num_heads);
+    
+    return out;
+}
+&quot;&quot;&quot;
+
+ext = load_inline(
+    name=&quot;edge_softmax_ext&quot;,
+    cpp_sources=&quot;&quot;,
+    cuda_sources=cuda_source,
+    functions=[&quot;edge_softmax_csr&quot;],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ext = ext
+    
+    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:
+        return self.ext.edge_softmax_csr(row_ptr, edge_scores)
+```
+
+Wait, let me check the input format more carefully. The reference code does:
+```python
+out[start:end] = torch.softmax(edge_scores[start:end], dim=0)
+```
+
+This suggests that `edge_scores` is a 1D tensor, and the softmax is applied over dim=0 on a slice. But wait, the description says &quot;multiple attention heads&quot;...
+
+Let me check the data generation code: `make_csr_multihead_edge_scores`. This probably creates a tensor of shape `(num_edges, num_heads)`.
+
+Actually, looking more carefully at the code:
+- `edge_scores[start:end]` gets a slice of shape `(num_edges_in_row, ...)`
+- `torch.softmax(..., dim=0)` applies softmax over the first dimension
+
+If edge_scores has shape `(total_edges, num_heads)`, then for each row, we&#x27;d have `(num_edges_in_row, num_heads)` and softmax over dim=0 would compute softmax independently for each head column.
+
+So the layout is:
+- edge_scores: shape (total_edges, num_heads)
+- For each node, edges from start to end
+- For each head column, compute softmax over those edges
+
+Let me verify my kernel handles this correctly...
+
+Actually in my kernel I&#x27;m accessing `edge_scores[(start + e) * num_heads + h]`, which suggests the layout is row-major with num_heads as the last dimension. This should be correct if the tensor is (total_edges, num_heads) in row-major format.
+
+Let me compile and test this version first.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me understand the problem better by writing a first version of the kernel and checking correctness:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;c10/cuda/CUDAException.h&gt;\n\n__global__ void edge_softmax_csr_kernel(\n    const int64_t* __restrict__ row_ptr,\n    const float* __restrict__ edge_scores,\n    float* __restrict__ out,\n    int num_nodes,\n    int num_heads) {\n    \n    int node = blockIdx.x * blockDim.x + threadIdx.x;\n    if (node &gt;= num_nodes) return;\n    \n    int64_t start = row_ptr[node];\n    int64_t end = row_ptr[node + 1];\n    int64_t num_edges = end - start;\n    \n    if (num_edges == 0) return;\n    \n    // For each head, compute softmax\n    for (int h = 0; h &lt; num_heads; h++) {\n        // Find max\n        float max_val = -INFINITY;\n        for (int64_t e = 0; e &lt; num_edges; e++) {\n            float val = edge_scores[(start + e) * num_heads + h];\n            if (val &gt; max_val) max_val = val;\n        }\n        \n        // Compute exp and sum\n        float sum = 0.0f;\n        for (int64_t e = 0; e &lt; num_edges; e++) {\n            int64_t idx = (start + e) * num_heads + h;\n            float val = expf(edge_scores[idx] - max_val);\n            out[idx] = val;\n            sum += val;\n        }\n        \n        // Normalize\n        float inv_sum = 1.0f / sum;\n        for (int64_t e = 0; e &lt; num_edges; e++) {\n            int64_t idx = (start + e) * num_heads + h;\n            out[idx] *= inv_sum;\n        }\n    }\n}\n\ntorch::Tensor edge_softmax_csr(\n    torch::Tensor row_ptr,\n    torch::Tensor edge_scores) {\n    \n    int64_t num_nodes = row_ptr.numel() - 1;\n    int64_t num_heads = edge_scores.size(1);\n    \n    auto out = torch::empty_like(edge_scores);\n    \n    int threads = 256;\n    int blocks = (num_nodes + threads - 1) / threads;\n    \n    edge_softmax_csr_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(\n        row_ptr.data_ptr&lt;int64_t&gt;(),\n        edge_scores.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        num_nodes,\n        num_heads);\n    \n    C10_CUDA_CHECK(cudaGetLastError());\n    return out;\n}\n\&quot;\&quot;\&quot;\n\next = load_inline(\n    name=\&quot;edge_softmax_ext_v1\&quot;,\n    cpp_sources=\&quot;\&quot;,\n    cuda_sources=cuda_source,\n    functions=[\&quot;edge_softmax_csr\&quot;],\n    verbose=False,\n    extra_cuda_cflags=[\&quot;-O3\&quot;]\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:\n        return ext.edge_softmax_csr(row_ptr, edge_scores)&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;edge_softmax_ext_v1&#x27;: [1/3] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=edge_softmax_ext_v1 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/abaner/KernelBench/runs/pop_l123_popcorn2_bench_all_gpt/popcorn2/FW-GLM-5-1/level_1_problem_6_cache/k_6772b67701be/edge_softmax_ext_v1/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=edge_softmax_ext_v1 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/abaner/KernelBench/runs/pop_l123_popcorn2_bench_all_gpt/popcorn2/FW-GLM-5-1/level_1_problem_6_cache/k_6772b67701be/edge_softmax_ext_v1/main.cpp -o main.o 
+/scratch/abaner/KernelBench/runs/pop_l123_popcorn2_bench_all_gpt/popcorn2/FW-GLM-5-1/level_1_problem_6_cache/k_6772b67701be/edge_softmax_ext_v1/main.cpp: In function &#x27;void pybind11_init_edge_softmax_ext_v1(pybind11::module_&amp;)&#x27;:
+/scratch/abaner/KernelBench/runs/pop_l123_popcorn2_bench_all_gpt/popcorn2/FW-GLM-5-1/level_1_problem_6_cache/k_6772b67701be/edge_softmax_ext_v1/main.cpp:4:55: error: &#x27;edge_softmax_csr&#x27; was not declared in this scope
+    4 | m.def(&quot;edge_softmax_csr&quot;, torch::wrap_pybind_function(edge_softmax_csr), &quot;edge_softmax_csr&quot;);
+      |                                                       ^~~~~~~~~~~~~~~~
+[2/3] /usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=edge_softmax_ext_v1 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90,code=compute_90 -gencode=arch=compute_90,code=sm_90 --compiler-options &#x27;-fPIC&#x27; -O3 -std=c++17 -c /scratch/abaner/KernelBench/runs/pop_l123_popcorn2_bench_all_gpt/popcorn2/FW-GLM-5-1/level_1_problem_6_cache/k_6772b67701be/edge_softmax_ext_v1/cuda.cu -o cuda.cuda.o 
+nvcc warning : incompatible redefinition for option &#x27;compiler-bindir&#x27;, the last value of this option was used
+ninja: build stopped: subcommand failed.
+</div></details></div></details></div>
 </body></html>
