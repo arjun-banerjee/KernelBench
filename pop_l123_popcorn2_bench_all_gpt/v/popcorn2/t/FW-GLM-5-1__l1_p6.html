@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-18 23:53:53 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-18 23:56:16 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_EdgeSoftmaxMultiHeadCSR.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">3887</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">9166</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -201,5 +201,143 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div></details><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 327.9s turn · 29.0s LLM · tokens in=2,470 · out=2,809 · total=5,279 · 12,540 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>327.9s turn · 29.0s LLM · 299.0s tools · <span class="turn-tokens">tokens in=2,470 · out=2,809 · total=5,279</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me write a CUDA kernel for this operation. The key insight is:
+1. Each row (node) needs its own softmax
+2. The softmax is over edges, but each head is normalized independently
+3. The layout is CSR with [num_edges, num_heads] tensor
+
+Wait, I need to understand the tensor layout better. Looking at the reference:
+- `edge_scores[start:end]` is sliced by edges, then softmax over dim=0
+- But `edge_scores` seems to be 2D with shape [num_edges, num_heads]
+
+Actually, let me re-read. `torch.softmax(edge_scores[start:end], dim=0)` applies softmax along dimension 0. So if edge_scores[start:end] has shape [num_edges_in_row, num_heads], then softmax over dim=0 would normalize across edges independently for each head.
+
+So the layout is:
+- edge_scores: [num_edges, num_heads]
+- For each node, take its edges [start:end] and apply softmax along the edge dimension (dim=0)
+- This normalizes edge scores independently per head
+
+I can parallelize this by:
+- One warp per node, where threads cooperatively compute softmax for all edges of that node
+- Or, have threads work on different heads within a node
+
+Actually, let me think about this more carefully. The key challenge is that rows have variable lengths (CSR format). Some rows might have very few edges, others might have many.
+
+One approach:
+- Each thread block handles multiple rows
+- Within a row, threads collaborate on the reduction operations
+
+Another approach:
+- Each warp handles one row
+- Threads in a warp work together on the reduction (max, sum)
+
+Given avg_degree = 18 and num_heads = 8, typical row has ~18 edges, and edge_scores has shape [18, 8] per row. 
+
+Softmax requires three operations: finding the max along dimension 0 (resulting shape [num_heads]), computing exp(score - max) for each element, and summing these exponentials along dimension 0 (shape [num_heads]). Then dividing each element by its corresponding sum.
+
+Since each row has ~18 edges and 8 heads, a warp (32 threads) can efficiently handle one row by assigning threads to different heads or partitioning the work across edges.
+
+The challenge is that CSR row lengths vary significantly, creating load imbalance. Rather than assigning one warp per row, I should use parallel primitives within a single thread block to process multiple rows together, using shared memory for reductions and coordinating the three softmax phases across all rows in the batch.
+
+Here&#x27;s a concrete approach: launch one thread block per row with dynamic shared memory sized to hold max and sum values per head. Each thread handles a subset of edges for its assigned row, computing local max and sum values, then synchronizing across the block. Threads iterate through their assigned edges again, applying the softmax transformation by subtracting the global max, exponentiating, and normalizing by the global sum. dge_idx * num_heads + head];
+        }
+    }
+    __syncwarp();
+    
+    // Warp-level reduction for max
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        local_max = max(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    float row_max = local_max;  // Broadcast from lane 0
+    row_max = __shfl_sync(0xffffffff, row_max, 0);
+    
+    // Compute sum of exp(x - max)
+    float local_sum = 0.0f;
+    #pragma unroll
+    for (int h = 0; h &lt; num_heads; h++) {
+        int edge_idx = my_edge + h / num_heads;  // This doesn&#x27;t work...
+    }
+
+I need to reconsider the indexing. Since each thread owns one edge, I should iterate through all heads for that edge directly rather than trying to map threads to heads. int edge_idx = my_edge;
+    if (edge_idx &lt; end) {
+        for (int head = lane_id; head &lt; num_heads; head += 32) {
+            float val = edge_scores[edge_idx * num_heads + head];
+            float exp_val = expf(val - row_max);
+            out[edge_idx * num_heads + head] = exp_val;
+            local_sum += exp_val;
+        }
+    }
+    
+    // Warp-level reduction for sum
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    float row_sum = local_sum;
+    row_sum = __shfl_sync(0xffffffff, row_sum, 0);
+    
+    // Final normalization
+    if (edge_idx &lt; end) {
+        for (int head = lane_id; head &lt; num_heads; head += 32) {
+            int idx = edge_idx * num_heads + head;
+            out[idx] = out[idx] / row_sum;
+        }
+    }
+}
+```
+
+Each warp processes one row, with threads iterating through their assigned edges and all heads. Lane 0 handles edge cases where rows have fewer edges than the warp size. The approach requires three passes over the data per row: computing the max, then the sum of exponentials, then normalizing. This could be optimized by reducing to two passes if shared memory is available.
+
+A better strategy uses one thread block per row with shared memory for row-level reductions. Each thread handles a subset of edges for its row, computing partial max values that get reduced in shared memory, then computing partial sums of exponentials that also get reduced, before the final normalization step. }
+    __syncthreads();
+    
+    // Load final max from shared memory
+    if (threadIdx.x &lt; num_heads) {
+        row_max[threadIdx.x] = sm_max[threadIdx.x];
+    }
+    __syncthreads();
+    
+    // Pass 2: Compute sum of exp(x - max)
+    float local_sums[8] = {0.0f};
+    for (int i = threadIdx.x; i &lt; row_len; i += blockDim.x) {
+        int edge_idx = start + i;
+        #pragma unroll
+        for (int h = 0; h &lt; num_heads; h++) {
+            float val = edge_scores[edge_idx * num_heads + h];
+            float exp_val = expf(val - row_max[h]);
+            out[edge_idx * num_heads + h] = exp_val;
+            local_sums[h] += exp_val;
+        }
+    }
+    
+    // Reduce sums to shared memory
+    for (int h = 0; h &lt; num_heads; h++) {
+        atomicAdd(&amp;sm_sum[h], local_sums[h]);
+    }
+    __syncthreads();
+    
+    // Normalize by sum
+    for (int i = threadIdx.x; i &lt; row_len; i += blockDim.x) {
+        int edge_idx = start + i;
+        #pragma unroll
+        for (int h = 0; h &lt; num_heads; h++) {
+            int idx = edge_idx * num_heads + h;
+            out[idx] = out[idx] / sm_sum[h];
+        }
+    }
+}
+```
+
+The kernel processes each row by first finding the maximum value across all edges for numerical stability, then computing exponentials of the centered values and summing them, finally normalizing each element by its corresponding head&#x27;s sum. Shared memory holds the per-head maxima and sums for efficient parallel reduction, with threads iterating through edges in a stride pattern to cover the entire row.
+
+For typical CSR graphs with average degree around 18, most rows will have fewer than 32 edges, meaning a single warp (32 threads) can handle each row efficiently. The kernel launches with one block per row and 32 threads per block, which maps well to the warp granularity. Edge scores are stored in a flat array of shape [num_edges, num_heads], and the row pointers define the CSR structure.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Now let me write the CUDA kernel. This is a multi-head row-wise softmax over CSR edge scores, where each row is normalized independently for each head.
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = r\&quot;\&quot;\&quot;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n\n// One thread block per CSR row\n// Threads process edges cooperatively\n// Shared memory used for reductions across heads\n\ntemplate &lt;int NUM_HEADS&gt;\n__global__ void csr_row_softmax_kernel(\n    const int* __restrict__ row_ptr,\n    const float* __restrict__ edge_scores,\n    float* __restrict__ out,\n    int num_nodes\n) {\n    int node = blockIdx.x;\n    if (node &gt;= num_nodes) return;\n    \n    int start = row_ptr[node];\n    int end = row_ptr[node + 1];\n    int row_len = end - start;\n    \n    if (row_len == 0) return;\n    \n    // Shared memory for per-head max and sum\n    extern __shared__ float sm_data[];\n    float* sm_max = sm_data;                    // NUM_HEADS elements\n    float* sm_sum = sm_data + NUM_HEADS;        // NUM_HEADS elements\n    \n    // Initialize shared memory\n    if (threadIdx.x &lt; NUM_HEADS) {\n        sm_max[threadIdx.x] = -INFINITY;\n        sm_sum[threadIdx.x] = 0.0f;\n    }\n    __syncthreads();\n    \n    // Pass 1: Find max per head\n    float local_max[NUM_HEADS];\n    #pragma unroll\n    for (int h = 0; h &lt; NUM_HEADS; h++) {\n        local_max[h] = -INFINITY;\n    }\n    \n    for (int i = threadIdx.x; i &lt; row_len; i += blockDim.x) {\n        int edge_idx = start + i;\n        #pragma unroll\n        for (int h = 0; h &lt; NUM_HEADS; h++) {\n            float val = edge_scores[edge_idx * NUM_HEADS + h];\n            local_max[h] = fmaxf(local_max[h], val);\n        }\n    }\n    \n    // Reduce to shared memory using atomicMax (workaround for no atomicMax on float)\n    for (int h = 0; h &lt; NUM_HEADS; h++) {\n        // Use atomic compare-and-swap approach\n        atomicMax(reinterpret_cast&lt;int*&gt;(&amp;sm_max[h]), __float_as_int(local_max[h]));\n    }\n    __syncthreads();\n    \n    // Load final max per head\n    float row_max[NUM_HEADS];\n    #pragma unroll\n    for (int h = 0; h &lt; NUM_HEADS; h++) {\n        row_max[h] = sm_max[h];\n    }\n    \n    // Pass 2: Compute exp(x - max) and sum per head\n    float local_sum[NUM_HEADS];\n    #pragma unroll\n    for (int h = 0; h &lt; NUM_HEADS; h++) {\n        local_sum[h] = 0.0f;\n    }\n    \n    for (int i = threadIdx.x; i &lt; row_len; i += blockDim.x) {\n        int edge_idx = start + i;\n        #pragma unroll\n        for (int h = 0; h &lt; NUM_HEADS; h++) {\n            float val = edge_scores[edge_idx * NUM_HEADS + h];\n            float exp_val = expf(val - row_max[h]);\n            out[edge_idx * NUM_HEADS + h] = exp_val;\n            local_sum[h] += exp_val;\n        }\n    }\n    \n    // Reduce sums to shared memory\n    for (int h = 0; h &lt; NUM_HEADS; h++) {\n        atomicAdd(&amp;sm_sum[h], local_sum[h]);\n    }\n    __syncthreads();\n    \n    // Pass 3: Normalize by sum\n    for (int i = threadIdx.x; i &lt; row_len; i += blockDim.x) {\n        int edge_idx = start + i;\n        #pragma unroll\n        for (int h = 0; h &lt; NUM_HEADS; h++) {\n            int idx = edge_idx * NUM_HEADS + h;\n            out[idx] = out[idx] / sm_sum[h];\n        }\n    }\n}\n\&quot;\&quot;\&quot;\n\n# Load the CUDA extension\nextension = load_inline(\n    name=&#x27;csr_softmax_ext&#x27;,\n    cpp_sources=&#x27;&#x27;,\n    cuda_sources=cuda_source,\n    functions=[&#x27;csr_row_softmax_kernel&lt;8&gt;&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],\n    verbose=False\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.ext = extension\n        self.num_heads = 8\n    \n    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:\n        num_nodes = row_ptr.numel() - 1\n        out = torch.empty_like(edge_scores)\n        \n        # Shared memory: 2 * num_heads floats for max and sum\n        sm_size = 2 * self.num_heads * 4  # 4 bytes per float\n        \n        self.ext.csr_row_softmax_kernel&lt;8&gt;(\n            row_ptr, edge_scores, out, num_nodes,\n            block=(32, 1, 1),\n            grid=(num_nodes, 1),\n            shared=sm_size\n        )\n        \n        return out&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: ModelNew class not found or syntax error prevented execution.
+Syntax Error in custom generated code or Compilation Error invalid syntax. Maybe you meant &#x27;==&#x27; or &#x27;:=&#x27; instead of &#x27;=&#x27;? (&lt;string&gt;, line 134)
+</div></details></div></details></div>
 </body></html>
