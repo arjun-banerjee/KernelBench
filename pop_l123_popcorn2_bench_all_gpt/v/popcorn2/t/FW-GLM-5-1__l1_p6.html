@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-18 06:44:51 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-18 06:47:13 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_EdgeSoftmaxMultiHeadCSR.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">2402</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">8535</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -102,5 +102,282 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 111.3s turn · 39.4s LLM · tokens in=2,431 · out=3,702 · total=6,133 · 15,232 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>111.3s turn · 39.4s LLM · 71.9s tools · <span class="turn-tokens">tokens in=2,431 · out=3,702 · total=6,133</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me write a CUDA kernel for this multi-head edge softmax with CSR layout. The key aspects:
+
+1. Each row (node) has a varying number of edges
+2. Each edge has num_heads (8) scores
+3. We need to compute softmax over edges for each head independently
+4. Output format: edge_scores is [num_edges * num_heads] where for each edge, all head scores are contiguous
+
+Let me design the kernel:
+
+Strategy 1: One warp per row, compute max and sum using parallel reduction within the warp
+Strategy 2: One thread block per row, for rows with many edges
+Strategy 3: Hybrid approach based on row size
+
+Given avg_degree = 18 and num_heads = 8, each row has about 18 edges * 8 heads = 144 elements.
+
+A warp-based approach could work well:
+- One warp handles one row
+- Each thread in the warp handles multiple edges/heads if needed
+- Use warp shuffle for reductions
+
+Let me implement a kernel:
+
+```cpp
+#include &lt;cuda.h&gt;
+#include &lt;cuda_fp16.h&gt;
+#include &lt;cfloat&gt;
+
+template &lt;typename scalar_t&gt;
+__global__ void csr_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const scalar_t* __restrict__ edge_scores,
+    scalar_t* __restrict__ out,
+    int num_nodes,
+    int num_heads,
+    int num_edges) {
+    
+    // One warp per row
+    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    int lane = threadIdx.x % 32;
+    
+    if (row &gt;= num_nodes) return;
+    
+    int start = row_ptr[row];
+    int end = row_ptr[row + 1];
+    int num_edges_in_row = end - start;
+    
+    // Each edge has num_heads values
+    // Total elements in this row: num_edges_in_row * num_heads
+    int total_elements = num_edges_in_row * num_heads;
+    
+    if (total_elements == 0) return;
+    
+    // For each head, we need to compute softmax over edges
+    // So for head h, the elements are at indices: start + e*num_heads + h for e in [0, num_edges_in_row)
+    
+    // Process each head separately
+    for (int h = lane; h &lt; num_heads; h += 32) {
+        // Find max for this head
+        scalar_t max_val = -FLT_MAX;
+        for (int e = 0; e &lt; num_edges_in_row; e++) {
+            int idx = (start + e) * num_heads + h;
+            scalar_t val = edge_scores[idx];
+            max_val = max(max_val, val);
+        }
+        
+        // Compute sum of exp(x - max)
+        scalar_t sum_exp = 0;
+        for (int e = 0; e &lt; num_edges_in_row; e++) {
+            int idx = (start + e) * num_heads + h;
+            scalar_t val = exp(edge_scores[idx] - max_val);
+            out[idx] = val;
+            sum_exp += val;
+        }
+        
+        // Normalize
+        for (int e = 0; e &lt; num_edges_in_row; e++) {
+            int idx = (start + e) * num_heads + h;
+            out[idx] = out[idx] / sum_exp;
+        }
+    }
+}
+```
+
+Wait, this approach has each lane handling a different head. But with 8 heads and 32 lanes, lanes 8-31 would be idle. Let me reconsider.
+
+Alternative: Each lane handles multiple heads if num_heads &lt; 32.
+
+Actually, let me think more carefully. The data layout seems to be:
+- edge_scores has shape [num_edges * num_heads]
+- For edge i, the scores for all heads are contiguous: edge_scores[i*num_heads + h] gives the score for head h on edge i
+
+So for a node with edges [start, end), the data for head h is:
+- edge_scores[start*num_heads + h], edge_scores[(start+1)*num_heads + h], ..., edge_scores[(end-1)*num_heads + h]
+
+This is strided access! The stride is num_heads between consecutive edges for the same head.
+
+Given num_heads = 8, each head&#x27;s data has stride 8. This is still reasonably coalesced if we have multiple threads accessing different heads.
+
+Let me think about parallelization:
+- 518 nodes
+- 8 heads
+- avg 18 edges per node
+
+If I use one warp per node:
+- 518 warps needed
+- With 32 warps per block (1024 threads), I need 17 blocks
+- Each warp has 32 threads, but only 8 heads to process
+- So each thread could process up to 4 heads (if we want to use all lanes)
+
+Actually, a better approach: each thread processes one head. With 8 heads per node, we use 8 lanes, leaving 24 idle. This is not great for occupancy.
+
+Alternative: Process multiple nodes per warp.
+- Each lane handles one head for multiple nodes
+- E.g., with 32 lanes and 8 heads, each lane processes 4 nodes (if we group nodes)
+
+But this gets complicated. Let me try a simpler approach first:
+
+Approach 1: One thread per head per node (launch 518 * 8 = 4144 threads)
+- Simple and straightforward
+- Each thread handles one (node, head) pair
+- Thread k computes softmax for node k/8, head k%8
+
+This uses 4144 threads, which is about 4 warps worth. Not great for GPU utilization.
+
+Approach 2: One thread block per node, process all heads within block
+- 518 blocks
+- Each block has num_edges_in_row * num_heads elements to process
+- For avg 18 edges and 8 heads, that&#x27;s 144 elements
+
+This could work but may have low occupancy if many nodes have few edges.
+
+Approach 3: One warp per (node, head) pair
+- 518 * 8 = 4144 warps needed
+- Use parallel reduction within warp for each softmax
+- Overkill for small number of edges
+
+Let me try Approach 1 first since it&#x27;s simple, then optimize.
+
+Actually, let me reconsider. The reference iterates:
+```python
+for node in range(num_nodes):
+    start = int(row_ptr[node].item())
+    end = int(row_ptr[node + 1].item())
+    if end &gt; start:
+        out[start:end] = torch.softmax(edge_scores[start:end], dim=0)
+```
+
+Hmm, `out[start:end]` suggests out has the same shape as edge_scores. And `torch.softmax(edge_scores[start:end], dim=0)` is applied along dimension 0.
+
+So edge_scores[start:end] is a slice of shape [num_edges_in_row, ?] where ? is some dimension. If edge_scores is 1D of length num_edges * num_heads, then edge_scores[start:end] would be a 1D slice of length (end-start)*num_heads if we&#x27;re thinking in terms of edges.
+
+Wait, let me re-read. `row_ptr` has num_nodes+1 elements, and row_ptr[node] gives the start index for node&#x27;s edges. So row_ptr defines which edges belong to which node.
+
+If edge_scores has shape [total_edges, num_heads] (2D), then edge_scores[start:end] would be [num_edges_in_row, num_heads], and softmax(dim=0) would normalize across edges for each head.
+
+But the description says `edge_scores` is a tensor without specifying its shape. Let me infer from the code:
+- `out = torch.empty_like(edge_scores)` - out has same shape as edge_scores
+- `out[start:end] = torch.softmax(edge_scores[start:end], dim=0)` - 1D indexing suggests edge_scores is at least 1D
+
+Given the description &quot;Each row is normalized independently for each head&quot;, I think:
+- edge_scores could be 2D: [total_edges, num_heads]
+- softmax is applied over edges (dim 0) for each head
+
+But `edge_scores[start:end]` with integer indices suggests edge_scores is 1D or 2D. Let me assume it&#x27;s 2D [total_edges, num_heads].
+
+Actually, looking more carefully at the code: `row_ptr[node]` and `row_ptr[node+1]` define edge indices, not element indices. So if edge_scores is [total_edges, num_heads], then edge_scores[start:end] gives [num_edges_in_row, num_heads], and softmax(dim=0) computes softmax across the first dimension (edges) for each head separately.
+
+Let me verify with the inputs: num_nodes=518, avg_degree=18, num_heads=8
+- Total edges ≈ 518 * 18 = 9324
+- edge_scores shape: [9324, 8] if 2D, or [9324 * 8] = [74592] if 1D flattened
+
+I&#x27;ll assume it&#x27;s 2D [total_edges, num_heads] for now, but I need to handle both cases.
+
+Actually, let me look at `popcorn_pri.make_csr_multihead_edge_scores` - this would tell me the exact format. Since I don&#x27;t have access to that function, I&#x27;ll need to infer from the code.
+
+Given the line `out[start:end] = torch.softmax(edge_scores[start:end], dim=0)`:
+- If edge_scores is 1D, then start:end are element indices
+- If edge_scores is 2D, then start:end are row indices
+
+The fact that row_ptr defines &quot;edges&quot; and we do softmax over edges suggests the latter: edge_scores is 2D [num_edges, num_heads], and we softmax over edges.
+
+So the kernel should:
+1. For each node, for each head, compute softmax over the edges belonging to that node
+2. Input: edge_scores [num_edges, num_heads]
+3. Output: out [num_edges, num_heads]
+
+Now let me write a proper kernel:
+
+```cpp
+template &lt;typename scalar_t&gt;
+__global__ void csr_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const scalar_t* __restrict__ edge_scores,
+    scalar_t* __restrict__ out,
+    int num_nodes,
+    int num_heads) {
+    
+    // One thread per (node, head) pair
+    int node = blockIdx.x;
+    int head = threadIdx.x;
+    
+    if (node &gt;= num_nodes || head &gt;= num_heads) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    // Compute max for this head&#x27;s edges
+    scalar_t max_val = -INFINITY;
+    for (int e = 0; e &lt; num_edges; e++) {
+        int edge_idx = start + e;
+        scalar_t val = edge_scores[edge_idx * num_heads + head];
+        if (val &gt; max_val) max_val = val;
+    }
+    
+    // Compute sum of exp
+    scalar_t sum_exp = 0;
+    for (int e = 0; e &lt; num_edges; e++) {
+        int edge_idx = start + e;
+        scalar_t val = exp(edge_scores[edge_idx * num_heads + head] - max_val);
+        out[edge_idx * num_heads + head] = val;
+        sum_exp += val;
+    }
+    
+    // Normalize
+    scalar_t inv_sum = 1.0 / sum_exp;
+    for (int e = 0; e &lt; num_edges; e++) {
+        int edge_idx = start + e;
+        out[edge_idx * num_heads + head] *= inv_sum;
+    }
+}
+```
+
+This uses one thread block per node and one thread per head within the block. Each thread iterates over edges serially.
+
+Launch config: grid = num_nodes blocks, block = num_heads threads (or rounded up to next power of 2 / 32).
+
+But wait - this might not have great occupancy since num_heads = 8 is small.
+
+Alternative: Use one thread to handle multiple (node, head) pairs:
+- Thread k handles (node, head) pair at index k
+- Total threads needed: num_nodes * num_heads = 518 * 8 = 4144
+- Launch as a 1D grid
+
+Let me try that:
+
+```cpp
+template &lt;typename scalar_t&gt;
+__global__ void csr_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const scalar_t* __restrict__ edge_scores,
+    scalar_t* __restrict__ out,
+    int num_nodes,
+    int num_heads) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_nodes * num_heads;
+    
+    if (idx &gt;= total) return;
+    
+    int node = idx / num_heads;
+    int head = idx % num_heads;
+    
+    // ... rest same as above
+}
+```
+
+With 518 * 8 = 4144 threads, we could launch with 256 threads per block, giving us ~16 blocks. This should work.
+
+Let me write the full kernel now.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me start by understanding the problem and writing a CUDA kernel for the multi-head CSR edge softmax.
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_fp16.h&gt;\n#include &lt;cfloat&gt;\n\ntemplate &lt;typename scalar_t&gt;\n__global__ void csr_softmax_kernel(\n    const int64_t* __restrict__ row_ptr,\n    const scalar_t* __restrict__ edge_scores,\n    scalar_t* __restrict__ out,\n    const int num_nodes,\n    const int num_heads) {\n    \n    // One thread per (node, head) pair\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int total = num_nodes * num_heads;\n    \n    if (idx &gt;= total) return;\n    \n    int node = idx / num_heads;\n    int head = idx % num_heads;\n    \n    int64_t start = row_ptr[node];\n    int64_t end = row_ptr[node + 1];\n    int64_t num_edges = end - start;\n    \n    if (num_edges == 0) return;\n    \n    // Compute max for this head&#x27;s edges\n    scalar_t max_val = -FLT_MAX;\n    for (int64_t e = 0; e &lt; num_edges; e++) {\n        int64_t edge_idx = start + e;\n        scalar_t val = edge_scores[edge_idx * num_heads + head];\n        if (val &gt; max_val) max_val = val;\n    }\n    \n    // Compute sum of exp and write exp values\n    scalar_t sum_exp = scalar_t(0);\n    for (int64_t e = 0; e &lt; num_edges; e++) {\n        int64_t edge_idx = start + e;\n        scalar_t val = exp(edge_scores[edge_idx * num_heads + head] - max_val);\n        out[edge_idx * num_heads + head] = val;\n        sum_exp += val;\n    }\n    \n    // Normalize\n    scalar_t inv_sum = scalar_t(1) / sum_exp;\n    for (int64_t e = 0; e &lt; num_edges; e++) {\n        int64_t edge_idx = start + e;\n        out[edge_idx * num_heads + head] *= inv_sum;\n    }\n}\n\ntorch::Tensor csr_softmax_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores, int num_heads) {\n    int num_nodes = row_ptr.numel() - 1;\n    auto out = torch::empty_like(edge_scores);\n    \n    int total_threads = num_nodes * num_heads;\n    int threads_per_block = 256;\n    int num_blocks = (total_threads + threads_per_block - 1) / threads_per_block;\n    \n    AT_DISPATCH_FLOATING_TYPES(edge_scores.scalar_type(), \&quot;csr_softmax_kernel\&quot;, ([&amp;] {\n        csr_softmax_kernel&lt;scalar_t&gt;&lt;&lt;&lt;num_blocks, threads_per_block&gt;&gt;&gt;(\n            row_ptr.data_ptr&lt;int64_t&gt;(),\n            edge_scores.data_ptr&lt;scalar_t&gt;(),\n            out.data_ptr&lt;scalar_t&gt;(),\n            num_nodes,\n            num_heads\n        );\n    }));\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor csr_softmax_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores, int num_heads);\n\&quot;\&quot;\&quot;\n\ncsr_extension = load_inline(\n    name=&#x27;csr_softmax&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;csr_softmax_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:\n        # Infer num_heads from edge_scores shape\n        # edge_scores could be 2D [num_edges, num_heads] or 1D [num_edges * num_heads]\n        if edge_scores.dim() == 2:\n            num_heads = edge_scores.shape[1]\n        else:\n            # For 1D case, we need to know num_heads - assume it&#x27;s provided or infer\n            # From the problem: num_heads = 8\n            num_heads = 8\n        \n        return csr_extension.csr_softmax_cuda(row_ptr.contiguous(), edge_scores.contiguous(), num_heads)&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
