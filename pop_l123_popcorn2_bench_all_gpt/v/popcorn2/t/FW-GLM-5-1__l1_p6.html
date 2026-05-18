@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-18 17:16:05 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-18 17:18:28 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_EdgeSoftmaxMultiHeadCSR.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">2449</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">10125</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -111,5 +111,466 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 411.1s turn · 49.3s LLM · tokens in=2,431 · out=5,245 · total=7,676 · 21,168 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>411.1s turn · 49.3s LLM · 361.8s tools · <span class="turn-tokens">tokens in=2,431 · out=5,245 · total=7,676</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me understand the problem better. The reference implementation:
+1. Takes `row_ptr` (CSR format row pointers) and `edge_scores` (multi-head edge scores)
+2. For each node (row), performs softmax over the edges for that node
+3. `edge_scores` has shape [num_edges * num_heads] - each edge has `num_heads` scores
+
+The current implementation is slow because it loops over nodes sequentially in Python.
+
+I need to write a CUDA kernel that:
+1. Processes each node in parallel
+2. For each node, computes softmax over its edges
+3. Each edge has `num_heads` scores that should be treated together
+
+Wait, let me think about the data layout. If `avg_degree = 18` and `num_heads = 8`, then each row has about 18 edges, and each edge has 8 scores.
+
+The `edge_scores` tensor has shape `[num_edges * num_heads]`. The softmax is applied per-head across edges in the same row. So for a node with 3 edges:
+- edges 0, 1, 2 belong to this node
+- edge_scores[0:3] contains head 0 scores for edges 0, 1, 2
+- etc... but wait, that&#x27;s not right either.
+
+Actually, looking at the reference code more carefully:
+```python
+out[start:end] = torch.softmax(edge_scores[start:end], dim=0)
+```
+
+This applies softmax over the contiguous block `edge_scores[start:end]`. So the layout is that each edge has all its head scores stored contiguously. But that doesn&#x27;t match with `num_heads = 8` being passed separately.
+
+Let me reconsider. The function signature mentions &quot;multi-head&quot; but the implementation just does row-wise softmax on contiguous blocks. The `edge_scores` tensor is laid out as:
+- For each edge, there are `num_heads` scores
+- The total length is `num_edges * num_heads`
+
+When we do `edge_scores[start:end]` where `start` and `end` are from `row_ptr`, we&#x27;re getting `end - start = degree` elements. But that doesn&#x27;t match with `num_heads = 8`.
+
+Actually, I think the layout is:
+- `row_ptr` is standard CSR with `num_nodes + 1` elements
+- `edge_scores` has shape `[total_edges, num_heads]` flattened to 1D
+
+But then `row_ptr` indices would need to be multiplied by something to get the right offsets in `edge_scores`.
+
+Let me look at the problem again. The reference says:
+```
+edge_scores[start:end] = torch.softmax(edge_scores[start:end], dim=0)
+```
+
+So `row_ptr` directly indexes into `edge_scores`. This means for a node with degree d (d edges), we have d values in `edge_scores`. Each value is probably a score for one head? No, that doesn&#x27;t match `num_heads = 8`.
+
+Actually wait - maybe the layout is:
+- `row_ptr` has shape `[num_nodes + 1]`
+- `edge_scores` has shape `[total_edges * num_heads]`
+- But `row_ptr` is scaled: the actual indices are `row_ptr[i] * num_heads` to `row_ptr[i+1] * num_heads`
+
+No, the reference code directly uses `row_ptr[node]` and `row_ptr[node + 1]` without scaling.
+
+Let me think about this differently. The reference code works and I need to match its behavior. If `edge_scores[start:end]` is a contiguous block for each node, and we softmax over dim=0, then:
+- `end - start = degree` for that node
+- If this represents multi-head attention, maybe the shape is `[degree, num_heads]` but flattened, and softmax is applied per-head?
+
+Hmm, but `dim=0` softmax would normalize across rows (across edges for each head), not across heads.
+
+I think the data layout might be:
+- `edge_scores` is `[total_edges * num_heads]` 
+- For each node, its edges are stored contiguously
+- Each edge has all heads&#x27; scores stored contiguously (stride = num_heads)
+- `row_ptr` indexes edges, so `edge_scores[row_ptr[i] * num_heads : row_ptr[i+1] * num_heads]` gives all data for node i
+
+But the reference code doesn&#x27;t multiply by num_heads, so maybe:
+- `row_ptr` is already scaled by num_heads?
+
+Or maybe the problem is simpler:
+- `row_ptr` is standard CSR for edges
+- `edge_scores` is per-edge (one score per edge), with total_edges entries
+- The `num_heads` parameter is used elsewhere in data generation but not in the softmax itself
+
+Actually, looking at the problem name &quot;MultiHeadCSR&quot;, I think the layout is:
+- Each edge has `num_heads` scores
+- `edge_scores` is of size `total_edges * num_heads`
+- For node i with edges [e_start, e_end), its scores are at indices `e_start * num_heads` to `e_end * num_heads` in edge_scores
+
+But the reference code uses `row_ptr` directly without multiplication. Let me just implement what the reference does:
+1. For each node, softmax over `edge_scores[start:end]` where start/end come from row_ptr
+2. The result is written to `out[start:end]`
+
+I&#x27;ll parallelize this over nodes. For each node, a block of threads handles the softmax computation.
+
+Let me write the initial kernel:
+
+```cuda
+__global__ void edge_softmax_kernel(
+    const int* __restrict__ row_ptr,
+    const float* __restrict__ edge_scores,
+    float* __restrict__ out,
+    int num_nodes) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int degree = end - start;
+    
+    if (degree == 0) return;
+    
+    // Each thread handles one element
+    // First, find max for numerical stability
+    extern __shared__ float shared_data[];
+    
+    float local_max = -INFINITY;
+    for (int i = threadIdx.x; i &lt; degree; i += blockDim.x) {
+        float val = edge_scores[start + i];
+        local_max = fmaxf(local_max, val);
+    }
+    shared_data[threadIdx.x] = local_max;
+    __syncthreads();
+    
+    // Reduce to find max
+    for (int stride = blockDim.x / 2; stride &gt; 0; stride &gt;&gt;= 1) {
+        if (threadIdx.x &lt; stride) {
+            shared_data[threadIdx.x] = fmaxf(shared_data[threadIdx.x], shared_data[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    
+    float max_val = shared_data[0];
+    __syncthreads();
+    
+    // Compute exp(x - max) and sum
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i &lt; degree; i += blockDim.x) {
+        float val = expf(edge_scores[start + i] - max_val);
+        out[start + i] = val;  // Store intermediate exp values
+        local_sum += val;
+    }
+    shared_data[threadIdx.x] = local_sum;
+    __syncthreads();
+    
+    // Reduce to find sum
+    for (int stride = blockDim.x / 2; stride &gt; 0; stride &gt;&gt;= 1) {
+        if (threadIdx.x &lt; stride) {
+            shared_data[threadIdx.x] += shared_data[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    
+    float sum_val = shared_data[0];
+    float inv_sum = 1.0f / sum_val;
+    
+    // Normalize
+    for (int i = threadIdx.x; i &lt; degree; i += blockDim.x) {
+        out[start + i] *= inv_sum;
+    }
+}
+```
+
+This approach has issues:
+1. One block per node is inefficient for small degrees
+2. We need to handle variable degree sizes
+
+Let me think of a better approach. With avg_degree = 18 and num_nodes = 518, the total edges is about 518 * 18 = 9324 edges. If each edge has num_heads = 8 scores, total elements is about 75,000.
+
+For small degrees (average 18), using one warp per node might be better. Or we can use a single kernel that processes all nodes with careful indexing.
+
+Actually, let me think about this more carefully. The `num_heads = 8` is a parameter in the problem but I need to understand how it relates to the data layout.
+
+Looking at the reference again:
+- `row_ptr` has `num_nodes + 1` entries
+- `edge_scores` is processed in blocks from `row_ptr[node]` to `row_ptr[node+1]`
+- `torch.softmax(edge_scores[start:end], dim=0)` applies softmax to a 1D slice
+
+If `edge_scores` has shape `[total_edges, num_heads]` (flattened to 1D), then:
+- `row_ptr` might be pre-multiplied by num_heads
+- Or `row_ptr` counts edges and we need to scale by num_heads
+
+Given the reference works correctly, let me assume `row_ptr` directly indexes `edge_scores` as a 1D tensor.
+
+For the kernel, I&#x27;ll use a different approach:
+1. Launch one thread per edge (or per score)
+2. Each thread finds its node, then participates in softmax reduction
+
+But this is complex due to variable degrees. Let me try a simpler approach first:
+- One block per node
+- Block size adapts to degree (up to 1024 threads)
+- Use shared memory for reduction
+
+Let me also consider using warp shuffles for efficiency:
+
+```cuda
+__global__ void edge_softmax_kernel(
+    const int* __restrict__ row_ptr,
+    const float* __restrict__ edge_scores,
+    float* __restrict__ out,
+    int num_nodes) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int degree = end - start;
+    
+    if (degree == 0) return;
+    
+    // Use warp shuffle for small degrees
+    // Use shared memory for larger degrees
+    // ...
+}
+```
+
+Actually, let me start with a simple, correct implementation and optimize later.
+
+Let me write a straightforward kernel:
+
+```cuda
+__global__ void edge_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const float* __restrict__ edge_scores,
+    float* __restrict__ out,
+    int num_nodes) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int64_t start = row_ptr[node];
+    int64_t end = row_ptr[node + 1];
+    int64_t degree = end - start;
+    
+    if (degree == 0) return;
+    
+    // Use a single thread to handle the softmax
+    // (Simple but inefficient - will optimize later)
+    if (threadIdx.x == 0) {
+        // Find max
+        float max_val = edge_scores[start];
+        for (int64_t i = 1; i &lt; degree; i++) {
+            max_val = fmaxf(max_val, edge_scores[start + i]);
+        }
+        
+        // Compute exp and sum
+        float sum = 0.0f;
+        for (int64_t i = 0; i &lt; degree; i++) {
+            float val = expf(edge_scores[start + i] - max_val);
+            out[start + i] = val;
+            sum += val;
+        }
+        
+        // Normalize
+        float inv_sum = 1.0f / sum;
+        for (int64_t i = 0; i &lt; degree; i++) {
+            out[start + i] *= inv_sum;
+        }
+    }
+}
+```
+
+This is serial within each node but parallel across nodes. For 518 nodes with avg_degree 18, this might still be faster than the Python loop.
+
+But I should do better. Let me parallelize within each node using all threads in the block.
+
+For shared memory sizing, I need to dynamically allocate based on block size. Let me write a more optimized version:
+
+```cuda
+__global__ void edge_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const float* __restrict__ edge_scores,
+    float* __restrict__ out,
+    int num_nodes) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int64_t start = row_ptr[node];
+    int64_t end = row_ptr[node + 1];
+    int64_t degree = end - start;
+    
+    if (degree == 0) return;
+    
+    extern __shared__ float shared_mem[];
+    
+    // Phase 1: Find max
+    float local_max = -FLT_MAX;
+    for (int64_t i = threadIdx.x; i &lt; degree; i += blockDim.x) {
+        float val = edge_scores[start + i];
+        local_max = fmaxf(local_max, val);
+    }
+    
+    // Warp-level max reduction
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    
+    // First thread in each warp writes to shared memory
+    if (threadIdx.x % 32 == 0) {
+        shared_mem[threadIdx.x / 32] = local_max;
+    }
+    __syncthreads();
+    
+    // First warp reduces shared memory
+    if (threadIdx.x &lt; (blockDim.x + 31) / 32) {
+        local_max = shared_mem[threadIdx.x];
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+        }
+        if (threadIdx.x == 0) {
+            shared_mem[0] = local_max;
+        }
+    }
+    __syncthreads();
+    
+    float global_max = shared_mem[0];
+    
+    // Phase 2: Compute exp and sum
+    float local_sum = 0.0f;
+    for (int64_t i = threadIdx.x; i &lt; degree; i += blockDim.x) {
+        float val = expf(edge_scores[start + i] - global_max);
+        out[start + i] = val;  // Store exp for later normalization
+        local_sum += val;
+    }
+    
+    // Warp-level sum reduction
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    
+    if (threadIdx.x % 32 == 0) {
+        shared_mem[threadIdx.x / 32] = local_sum;
+    }
+    __syncthreads();
+    
+    if (threadIdx.x &lt; (blockDim.x + 31) / 32) {
+        local_sum = shared_mem[threadIdx.x];
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+        }
+        if (threadIdx.x == 0) {
+            shared_mem[0] = local_sum;
+        }
+    }
+    __syncthreads();
+    
+    float global_sum = shared_mem[0];
+    float inv_sum = 1.0f / global_sum;
+    
+    // Phase 3: Normalize
+    for (int64_t i = threadIdx.x; i &lt; degree; i += blockDim.x) {
+        out[start + i] *= inv_sum;
+    }
+}
+```
+
+This kernel uses warp shuffles for efficiency. The shared memory needs to be sized for `(blockDim.x + 31) / 32` floats.
+
+Actually, I realize I&#x27;m overcomplicating this. Let me simplify and use a block-level reduction pattern that works for all block sizes.
+
+Let me write a cleaner implementation:
+
+```cpp
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cmath&gt;
+#include &lt;limits&gt;
+
+__global__ void edge_softmax_kernel(
+    const int64_t* __restrict__ row_ptr,
+    const float* __restrict__ edge_scores,
+    float* __restrict__ out,
+    int num_nodes) {
+    
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int64_t start = row_ptr[node];
+    int64_t end = row_ptr[node + 1];
+    int64_t degree = end - start;
+    
+    if (degree == 0) return;
+    
+    // Shared memory for reduction
+    extern __shared__ float sdata[];
+    
+    // Find max for numerical stability
+    float local_max = -std::numeric_limits&lt;float&gt;::infinity();
+    for (int64_t i = threadIdx.x; i &lt; degree; i += blockDim.x) {
+        float val = edge_scores[start + i];
+        if (val &gt; local_max) local_max = val;
+    }
+    sdata[threadIdx.x] = local_max;
+    __syncthreads();
+    
+    // Block reduction for max
+    for (unsigned int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+        if (threadIdx.x &lt; s) {
+            if (sdata[threadIdx.x + s] &gt; sdata[threadIdx.x]) {
+                sdata[threadIdx.x] = sdata[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+    
+    float max_val = sdata[0];
+    __syncthreads();
+    
+    // Compute exp(x - max) and sum
+    float local_sum = 0.0f;
+    for (int64_t i = threadIdx.x; i &lt; degree; i += blockDim.x) {
+        float val = expf(edge_scores[start + i] - max_val);
+        out[start + i] = val;
+        local_sum += val;
+    }
+    sdata[threadIdx.x] = local_sum;
+    __syncthreads();
+    
+    // Block reduction for sum
+    for (unsigned int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+        if (threadIdx.x &lt; s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    
+    float sum_val = sdata[0];
+    float inv_sum = 1.0f / sum_val;
+    
+    // Normalize
+    for (int64_t i = threadIdx.x; i &lt; degree; i += blockDim.x) {
+        out[start + i] *= inv_sum;
+    }
+}
+
+torch::Tensor edge_softmax_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores) {
+    int num_nodes = row_ptr.numel() - 1;
+    auto out = torch::empty_like(edge_scores);
+    
+    int block_size = 256;  // Can tune this
+    int num_blocks = num_nodes;
+    size_t shared_mem_size = block_size * sizeof(float);
+    
+    edge_softmax_kernel&lt;&lt;&lt;num_blocks, block_size, shared_mem_size&gt;&gt;&gt;(
+        row_ptr.data_ptr&lt;int64_t&gt;(),
+        edge_scores.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(),
+        num_nodes
+    );
+    
+    return out;
+}
+```
+
+Wait, I need to check if `row_ptr` is int64 or int32. In PyTorch, int tensors are usually int64 (long). Let me handle both cases.
+
+Also, I realized I need to be careful about the block size. For degrees less than 256, some threads will be idle. But for avg_degree of 18, a warp (32 threads) should be enough. Let me use 32 threads per block.
+
+Actually, a better approach is to use warp-level primitives. Let me write a version that uses 32 threads (one warp) per node:
+
+For avg_degree = 18, using one warp per node is efficient. For larger degrees, we can use more threads.
+
+Let me write the final version:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Looking at this problem, I need to implement a multi-head row-wise softmax over CSR edge scores. The reference uses a Python loop which is very slow. I&#x27;ll create a CUDA kernel that parallelizes over nodes.
+
+Let me start by writing and testing a kernel:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n#include &lt;limits&gt;\n\n__global__ void edge_softmax_kernel(\n    const int64_t* __restrict__ row_ptr,\n    const float* __restrict__ edge_scores,\n    float* __restrict__ out,\n    int num_nodes) {\n    \n    int node = blockIdx.x;\n    if (node &gt;= num_nodes) return;\n    \n    int64_t start = row_ptr[node];\n    int64_t end = row_ptr[node + 1];\n    int64_t degree = end - start;\n    \n    if (degree == 0) return;\n    \n    // Shared memory for reduction (sized for one value per thread in block)\n    extern __shared__ float sdata[];\n    \n    // Find max for numerical stability\n    float local_max = -INFINITY;\n    for (int64_t i = threadIdx.x; i &lt; degree; i += blockDim.x) {\n        float val = edge_scores[start + i];\n        local_max = fmaxf(local_max, val);\n    }\n    sdata[threadIdx.x] = local_max;\n    __syncthreads();\n    \n    // Block reduction for max\n    for (unsigned int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {\n        if (threadIdx.x &lt; s) {\n            sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);\n        }\n        __syncthreads();\n    }\n    \n    float max_val = sdata[0];\n    __syncthreads();\n    \n    // Compute exp(x - max) and store in out, also compute sum\n    float local_sum = 0.0f;\n    for (int64_t i = threadIdx.x; i &lt; degree; i += blockDim.x) {\n        float val = expf(edge_scores[start + i] - max_val);\n        out[start + i] = val;\n        local_sum += val;\n    }\n    sdata[threadIdx.x] = local_sum;\n    __syncthreads();\n    \n    // Block reduction for sum\n    for (unsigned int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {\n        if (threadIdx.x &lt; s) {\n            sdata[threadIdx.x] += sdata[threadIdx.x + s];\n        }\n        __syncthreads();\n    }\n    \n    float sum_val = sdata[0];\n    float inv_sum = 1.0f / sum_val;\n    \n    // Normalize\n    for (int64_t i = threadIdx.x; i &lt; degree; i += blockDim.x) {\n        out[start + i] *= inv_sum;\n    }\n}\n\ntorch::Tensor edge_softmax_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores) {\n    TORCH_CHECK(row_ptr.dtype() == torch::kInt64, \&quot;row_ptr must be int64\&quot;);\n    TORCH_CHECK(edge_scores.dtype() == torch::kFloat32, \&quot;edge_scores must be float32\&quot;);\n    \n    int num_nodes = row_ptr.numel() - 1;\n    auto out = torch::empty_like(edge_scores);\n    \n    int block_size = 256;\n    int num_blocks = num_nodes;\n    size_t shared_mem_size = block_size * sizeof(float);\n    \n    edge_softmax_kernel&lt;&lt;&lt;num_blocks, block_size, shared_mem_size&gt;&gt;&gt;(\n        row_ptr.data_ptr&lt;int64_t&gt;(),\n        edge_scores.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        num_nodes\n    );\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;torch::Tensor edge_softmax_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores);\&quot;\n\nedge_softmax_module = load_inline(\n    name=&#x27;edge_softmax&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;edge_softmax_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:\n        return edge_softmax_module.edge_softmax_cuda(row_ptr, edge_scores)&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
