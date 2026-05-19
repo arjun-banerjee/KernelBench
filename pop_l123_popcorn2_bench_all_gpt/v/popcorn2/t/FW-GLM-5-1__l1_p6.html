@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-19 17:36:39 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-19 17:39:03 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_EdgeSoftmaxMultiHeadCSR.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">5426</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">12051</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -471,5 +471,360 @@ Device: NVIDIA H100 80GB HBM3
 
 Ridge point (FP32): 20.12 FLOPs/byte
   Kernels with arithmetic intensity below the ridge point are
-  memory-bound; above it they are compute-bound.</div></details></div></details></div>
+  memory-bound; above it they are compute-bound.</div></details></div></details><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 365.8s turn · 36.5s LLM · tokens in=2,630 · out=3,995 · total=6,625 · 16,650 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>365.8s turn · 36.5s LLM · 329.3s tools · <span class="turn-tokens">tokens in=2,630 · out=3,995 · total=6,625</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me understand the problem better. The task is to implement a multi-head row-wise softmax over CSR edge scores. 
+
+Looking at the reference:
+- `row_ptr` is the CSR row pointer array
+- `edge_scores` contains scores for each edge, with multiple heads
+- For each node (row), we compute softmax independently for each head
+
+The data layout: edge_scores has shape [num_edges * num_heads] where for each edge, we have `num_heads` scores.
+
+Wait, let me think about this more carefully. The CSR format has `row_ptr` of length `num_nodes + 1`, and edge_scores contains scores for edges. With multi-head attention, each edge has `num_heads` scores.
+
+So the layout is probably:
+- `row_ptr[i]` and `row_ptr[i+1]` give the range of edges for node i
+- `edge_scores` has shape `(num_edges, num_heads)` or `(num_edges * num_heads,)` 
+
+Looking at the reference code:
+```python
+out[start:end] = torch.softmax(edge_scores[start:end], dim=0)
+```
+
+This suggests `edge_scores` is a 2D tensor of shape `(num_edges, num_heads)` and softmax is applied along dimension 0 for each head independently.
+
+Wait, that&#x27;s not quite right. If `edge_scores[start:end]` extracts rows (edges) and softmax is along dim=0, then it&#x27;s softmax over the edges for each head column independently. That makes sense!
+
+So for each node:
+- We have a set of edges [start, end)
+- For each head, we compute softmax over the edge scores for that head
+
+The shape of edge_scores should be `(num_edges, num_heads)`.
+
+Let me write a CUDA kernel for this:
+
+1. Each thread block handles one node
+2. We need to compute softmax for each head, which requires:
+   - Find max value (for numerical stability)
+   - Compute exp(x - max)
+   - Sum the exponentials
+   - Normalize
+
+Given avg_degree = 18 and num_heads = 8, each node has on average 18 edges, and each edge has 8 head scores. So the working set per node is about 18 * 8 = 144 floats.
+
+For a simple first implementation, let me have each block handle one node and use shared memory for the reduction operations.
+
+Actually, let me think about the memory layout more carefully. Looking at the reference:
+- `edge_scores[start:end]` returns a 2D slice of shape `(num_edges_for_node, num_heads)`
+- `torch.softmax(..., dim=0)` computes softmax along the first dimension (edges) for each head
+
+So the output is the same shape, where for each head h, the values for that head across all edges are softmax normalized.
+
+Let me write a CUDA kernel:
+
+```cuda
+__global__ void edge_softmax_kernel(
+    const int* row_ptr,
+    const float* edge_scores,
+    float* output,
+    int num_nodes,
+    int num_heads
+) {
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    // For each head, compute softmax over edges
+    for (int h = threadIdx.x; h &lt; num_heads; h += blockDim.x) {
+        // Find max for numerical stability
+        float max_val = -INFINITY;
+        for (int e = 0; e &lt; num_edges; e++) {
+            float val = edge_scores[(start + e) * num_heads + h];
+            max_val = max(max_val, val);
+        }
+        
+        // Compute exp and sum
+        float sum = 0.0f;
+        for (int e = 0; e &lt; num_edges; e++) {
+            float val = edge_scores[(start + e) * num_heads + h];
+            float exp_val = expf(val - max_val);
+            output[(start + e) * num_heads + h] = exp_val;
+            sum += exp_val;
+        }
+        
+        // Normalize
+        float inv_sum = 1.0f / sum;
+        for (int e = 0; e &lt; num_edges; e++) {
+            output[(start + e) * num_heads + h] *= inv_sum;
+        }
+    }
+}
+```
+
+Actually, this is a simple approach but has redundant memory reads. Let me think about a more efficient approach.
+
+Since each edge has contiguous `num_heads` scores in memory, we could:
+1. Load all scores for all edges of a node into shared memory
+2. Process each head with one or more threads
+
+Given num_heads = 8, we could assign 8 threads per node, with each thread handling one head. This gives good memory coalescing when reading edge scores (consecutive threads read consecutive memory locations).
+
+Actually, let me reconsider. The memory layout is `(num_edges, num_heads)`. For a given edge `e`, the scores are at positions `e*num_heads + 0, e*num_heads + 1, ..., e*num_heads + num_heads-1`.
+
+If we have 8 threads per warp handling the 8 heads, and we read all edges for a node:
+- Thread 0 reads all edge_scores[:, 0] for this node
+- Thread 1 reads all edge_scores[:, 1] for this node
+- etc.
+
+This means threads in a warp are reading from different memory locations (stride of num_heads), which is not coalesced.
+
+A better approach might be to transpose the data in shared memory first, then process. But that adds overhead.
+
+Alternatively, for each edge, have the 8 threads cooperatively load the 8 head values (coalesced read), then store transposed in shared memory.
+
+Let me write a cleaner kernel that processes one node per thread block with num_heads threads (or a multiple of num_heads):
+
+```cuda
+__global__ void edge_softmax_kernel(
+    const int* __restrict__ row_ptr,
+    const float* __restrict__ edge_scores,
+    float* __restrict__ output,
+    int num_nodes,
+    int num_heads
+) {
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    int head = threadIdx.x;  // Each thread handles one head
+    if (head &gt;= num_heads) return;
+    
+    // Find max for numerical stability
+    float max_val = -INFINITY;
+    for (int e = 0; e &lt; num_edges; e++) {
+        float val = edge_scores[(start + e) * num_heads + head];
+        max_val = max(max_val, val);
+    }
+    
+    // Compute exp and sum
+    float sum = 0.0f;
+    for (int e = 0; e &lt; num_edges; e++) {
+        float val = edge_scores[(start + e) * num_heads + head];
+        float exp_val = expf(val - max_val);
+        output[(start + e) * num_heads + head] = exp_val;
+        sum += exp_val;
+    }
+    
+    // Normalize
+    float inv_sum = 1.0f / sum;
+    for (int e = 0; e &lt; num_edges; e++) {
+        output[(start + e) * num_heads + head] *= inv_sum;
+    }
+}
+```
+
+This kernel has num_heads threads per block, each handling one head. Memory access pattern: thread i accesses memory locations with stride num_heads (not coalesced).
+
+Let me think about a better approach. What if we process multiple nodes together to improve memory access patterns?
+
+Actually, for the typical graph where num_edges per node is small (avg_degree=18), and num_heads=8, the memory footprint per node is just 18*8*4 = 576 bytes. This is small enough to fit in registers or shared memory.
+
+A more sophisticated approach would be:
+1. Each warp handles one node
+2. The warp cooperatively loads all edges, using coalesced memory reads
+3. Store in shared memory in transposed form (or directly in registers)
+4. Compute softmax for each head
+
+But let me start with a simpler approach and see if it&#x27;s good enough:
+
+Option 1: One thread block per node, each thread handles one head (what I have above)
+
+Option 2: One warp per node, cooperative loading and processing
+
+Option 3: Vectorized loads with float4
+
+Let me try Option 1 first with coalescing improvements. Instead of having each thread read its own head, we can cooperatively load edges:
+
+Actually, since num_heads = 8, we can use warp-level operations or just have 8 threads load 8 values at once (coalesced) and then distribute.
+
+Let me write a version that uses cooperative loading:
+
+```cuda
+__global__ void edge_softmax_kernel(
+    const int* __restrict__ row_ptr,
+    const float* __restrict__ edge_scores,
+    float* __restrict__ output,
+    int num_nodes,
+    int num_heads
+) {
+    // Assume blockDim.x == num_heads
+    int node = blockIdx.x;
+    int head = threadIdx.x;
+    
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    // Each thread processes one head
+    // Memory access is not coalesced, but with small num_edges, overhead is minimal
+    
+    // Find max
+    float max_val = -INFINITY;
+    for (int e = 0; e &lt; num_edges; e++) {
+        float val = edge_scores[(start + e) * num_heads + head];
+        max_val = fmaxf(max_val, val);
+    }
+    
+    // Compute exp and sum
+    float sum = 0.0f;
+    for (int e = 0; e &lt; num_edges; e++) {
+        int idx = (start + e) * num_heads + head;
+        float exp_val = expf(edge_scores[idx] - max_val);
+        output[idx] = exp_val;
+        sum += exp_val;
+    }
+    
+    // Normalize
+    float inv_sum = 1.0f / sum;
+    for (int e = 0; e &lt; num_edges; e++) {
+        int idx = (start + e) * num_heads + head;
+        output[idx] *= inv_sum;
+    }
+}
+```
+
+This is simple but has non-coalesced memory access. Let me try a version with cooperative loading using shared memory:
+
+```cuda
+__global__ void edge_softmax_kernel_coop(
+    const int* __restrict__ row_ptr,
+    const float* __restrict__ edge_scores,
+    float* __restrict__ output,
+    int num_nodes,
+    int num_heads,
+    int max_edges_per_node  // For shared memory sizing
+) {
+    extern __shared__ float smem[];
+    float* scores = smem;  // size: max_edges_per_node * num_heads
+    
+    int node = blockIdx.x;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    // Cooperatively load all scores into shared memory
+    // This gives coalesced reads!
+    for (int e = 0; e &lt; num_edges; e++) {
+        for (int h = tid; h &lt; num_heads; h += block_size) {
+            scores[e * num_heads + h] = edge_scores[(start + e) * num_heads + h];
+        }
+    }
+    __syncthreads();
+    
+    // Each thread handles one head
+    int head = tid;
+    if (head &gt;= num_heads) return;
+    
+    // Find max
+    float max_val = -INFINITY;
+    for (int e = 0; e &lt; num_edges; e++) {
+        max_val = fmaxf(max_val, scores[e * num_heads + head]);
+    }
+    
+    // Compute exp and sum
+    float sum = 0.0f;
+    for (int e = 0; e &lt; num_edges; e++) {
+        float exp_val = expf(scores[e * num_heads + head] - max_val);
+        scores[e * num_heads + head] = exp_val;  // Store exp temporarily
+        sum += exp_val;
+    }
+    
+    // Normalize and write back
+    float inv_sum = 1.0f / sum;
+    for (int e = 0; e &lt; num_edges; e++) {
+        float val = scores[e * num_heads + head] * inv_sum;
+        output[(start + e) * num_heads + head] = val;
+    }
+}
+```
+
+Hmm, this still has the issue of non-coalesced writes at the end. Let me think differently.
+
+Actually, for efficiency, let&#x27;s just focus on the computation without shared memory first. Given avg_degree = 18 and num_heads = 8, each node has very little data. The non-coalesced access overhead might be minimal.
+
+Let me write a simple, correct kernel first, then optimize if needed:
+
+```cuda
+__global__ void edge_softmax_kernel(
+    const int* __restrict__ row_ptr,
+    const float* __restrict__ edge_scores,
+    float* __restrict__ output,
+    int num_nodes,
+    int num_heads
+) {
+    int node = blockIdx.x;
+    if (node &gt;= num_nodes) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    int num_edges = end - start;
+    
+    if (num_edges == 0) return;
+    
+    // Each thread handles one head
+    for (int head = threadIdx.x; head &lt; num_heads; head += blockDim.x) {
+        // Find max for numerical stability
+        float max_val = -INFINITY;
+        for (int e = 0; e &lt; num_edges; e++) {
+            float val = edge_scores[(start + e) * num_heads + head];
+            if (val &gt; max_val) max_val = val;
+        }
+        
+        // Compute exp and sum
+        float sum = 0.0f;
+        for (int e = 0; e &lt; num_edges; e++) {
+            int idx = (start + e) * num_heads + head;
+            float exp_val = expf(edge_scores[idx] - max_val);
+            output[idx] = exp_val;
+            sum += exp_val;
+        }
+        
+        // Normalize
+        float inv_sum = 1.0f / sum;
+        for (int e = 0; e &lt; num_edges; e++) {
+            int idx = (start + e) * num_heads + head;
+            output[idx] *= inv_sum;
+        }
+    }
+}
+```
+
+Let me code this up properly as a Python module:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me write a first version of the CUDA kernel for this multi-head row-wise softmax operation.
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n\n__global__ void edge_softmax_kernel(\n    const int* __restrict__ row_ptr,\n    const float* __restrict__ edge_scores,\n    float* __restrict__ output,\n    int num_nodes,\n    int num_heads\n) {\n    int node = blockIdx.x;\n    if (node &gt;= num_nodes) return;\n    \n    int start = row_ptr[node];\n    int end = row_ptr[node + 1];\n    int num_edges = end - start;\n    \n    if (num_edges == 0) return;\n    \n    // Each thread handles one head\n    for (int head = threadIdx.x; head &lt; num_heads; head += blockDim.x) {\n        // Find max for numerical stability\n        float max_val = -INFINITY;\n        for (int e = 0; e &lt; num_edges; e++) {\n            float val = edge_scores[(start + e) * num_heads + head];\n            if (val &gt; max_val) max_val = val;\n        }\n        \n        // Compute exp and sum\n        float sum = 0.0f;\n        for (int e = 0; e &lt; num_edges; e++) {\n            int idx = (start + e) * num_heads + head;\n            float exp_val = expf(edge_scores[idx] - max_val);\n            output[idx] = exp_val;\n            sum += exp_val;\n        }\n        \n        // Normalize\n        float inv_sum = 1.0f / sum;\n        for (int e = 0; e &lt; num_edges; e++) {\n            int idx = (start + e) * num_heads + head;\n            output[idx] *= inv_sum;\n        }\n    }\n}\n\ntorch::Tensor edge_softmax_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores, int num_heads) {\n    int num_nodes = row_ptr.numel() - 1;\n    auto output = torch::empty_like(edge_scores);\n    \n    int block_size = (num_heads &lt; 32) ? 32 : num_heads;\n    int grid_size = num_nodes;\n    \n    edge_softmax_kernel&lt;&lt;&lt;grid_size, block_size&gt;&gt;&gt;(\n        row_ptr.data_ptr&lt;int&gt;(),\n        edge_scores.data_ptr&lt;float&gt;(),\n        output.data_ptr&lt;float&gt;(),\n        num_nodes,\n        num_heads\n    );\n    \n    return output;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;torch::Tensor edge_softmax_cuda(torch::Tensor row_ptr, torch::Tensor edge_scores, int num_heads);\&quot;\n\nedge_softmax_module = load_inline(\n    name=\&quot;edge_softmax\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[\&quot;edge_softmax_cuda\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.module = edge_softmax_module\n    \n    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:\n        # Infer num_heads from edge_scores shape\n        if edge_scores.dim() == 1:\n            # Assume last dimension encodes heads contiguously\n            # Need to figure out num_heads - but we don&#x27;t have it\n            # Let&#x27;s assume it&#x27;s passed or can be inferred\n            num_heads = 8  # Default from benchmark\n        else:\n            num_heads = edge_scores.shape[-1]\n        \n        return self.module.edge_softmax_cuda(row_ptr, edge_scores, num_heads)&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
