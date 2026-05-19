@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-19 09:08:36 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-19 09:10:59 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_TriangularAttention.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">3073</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">10006</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -147,5 +147,87 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 269.9s turn · 38.4s LLM · tokens in=3,030 · out=3,903 · total=6,933 · 15,253 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>269.9s turn · 38.4s LLM · 231.5s tools · <span class="turn-tokens">tokens in=3,030 · out=3,903 · total=6,933</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now let me analyze the reference implementation more carefully:
+
+The forward function:
+1. LayerNorm on pair_repr
+2. Gate = sigmoid(gate(x))
+3. bias = bias_proj(x).permute(0, 3, 1, 2)  # (B, num_heads, N, N)
+4. Reshape x to (B*N, N, D)
+5. Query = query(x_flat).view(B*N, N, h, d).transpose(1, 2)  # (B*N, h, N, d)
+6. Key, Value similarly
+7. Attention = Q @ K^T / sqrt(d)  # (B*N, h, N, N)
+8. Reshape attn to (B, N, h, N, N)
+9. Add bias: attn + bias.unsqueeze(1)  # bias is (B, h, N, N), becomes (B, 1, h, N, N)
+10. Apply mask
+11. Reshape back to (B*N, h, N, N)
+12. Softmax
+13. Dropout
+14. Output = attn @ V, reshape to (B, N, N, D)
+15. Multiply by gate
+16. out_proj
+
+The key observation is:
+- Each row i in the pair matrix (N x N) performs self-attention across the column dimension j
+- There are B*N separate attention operations (one per row)
+- Each attention is h heads, sequence length N
+
+For a fused kernel approach, I need to:
+1. Fuse LayerNorm, query/key/value/bias_proj projections
+2. Fused attention computation
+3. Fused output projection
+
+Let me think about tiling:
+- For H100, we have 228KB shared memory per SM
+- With head_dim = 16, we can fit several rows in shared memory
+- We need to compute Q @ K^T for each (batch, row) independently
+
+Actually, let me look at this more carefully. The shape of pair_repr is (B, N, N, D). So for each batch element and each row i, we have N columns with D features each.
+
+The computation essentially treats each row independently:
+- For row i, we attend across all columns j=0..N-1
+- The query for position (i, j) comes from x[i, j, :]
+- The key for position (i, j) comes from x[i, j, :]
+- The value for position (i, j) comes from x[i, j, :]
+
+Wait, that&#x27;s not quite right. Let me re-read the code:
+
+```python
+x_flat = x.reshape(B * N, N, D)
+q = self.query(x_flat).view(B * N, N, h, d).transpose(1, 2)
+```
+
+So x_flat has shape (B*N, N, D). This is treating each batch*row combination as a separate sequence of length N. The reshape `(B, N, N, D) -&gt; (B*N, N, D)` effectively takes each row i across all batches and treats the N columns as a sequence.
+
+So for each row i, we compute attention over the N columns j. The Q, K, V projections are applied to each position (i, j).
+
+The attention matrix is (B*N, h, N, N) which is then reshaped to (B, N, h, N, N). Then bias is added where bias has shape (B, h, N, N).
+
+The bias comes from bias_proj(x) which takes the entire pair matrix and projects to num_heads channels.
+
+For a custom kernel, I&#x27;ll fuse:
+1. LayerNorm (can use cuDNN or custom)
+2. Linear projections for Q, K, V, gate, bias_proj
+3. Attention computation (Q @ K^T, softmax, @ V)
+4. Gate multiplication and output projection
+
+This is quite complex. Let me start with a simpler approach - fuse just the attention part (Q @ K^T + bias + mask + softmax + @ V) using shared memory tiling.
+
+Actually, let me first write a basic implementation that:
+1. Uses PyTorch for the LayerNorm and linear projections
+2. Fuses the attention computation in a custom kernel
+
+This way I can verify correctness first, then work on optimization.
+
+Let me write the kernel code:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Let me analyze the reference implementation and create an optimized kernel. This is a triangular self-attention operation with:
+- LayerNorm followed by Q/K/V/gate/bias projections
+- Flash-attention style computation with bias and mask
+- Gate multiplication and output projection
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport math\nfrom torch.utils.cpp_extension import load_inline\n\n# Fused triangular attention kernel\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;c10/cuda/CUDAException.h&gt;\n#include &lt;ATen/cuda/Atomic.cuh&gt;\n\ntemplate &lt;typename scalar_t, int HEAD_DIM&gt;\n__device__ __forceinline__ void compute_qk_block(\n    const scalar_t* __restrict__ q_ptr,\n    const scalar_t* __restrict__ k_ptr,\n    scalar_t* __restrict__ s_shared,\n    int query_idx, int key_idx, int head_idx, int seq_len, int num_heads, int head_dim) {\n    \n    // Load Q and K into registers, compute dot product\n    scalar_t q_reg[HEAD_DIM];\n    scalar_t k_reg[HEAD_DIM];\n    \n    #pragma unroll\n    for (int d = 0; d &lt; HEAD_DIM; d++) {\n        q_reg[d] = q_ptr[query_idx * num_heads * head_dim + head_idx * head_dim + d];\n        k_reg[d] = k_ptr[key_idx * num_heads * head_dim + head_idx * head_dim + d];\n    }\n    \n    scalar_t dot = scalar_t(0);\n    #pragma unroll\n    for (int d = 0; d &lt; HEAD_DIM; d++) {\n        dot += q_reg[d] * k_reg[d];\n    }\n    s_shared[query_idx * seq_len + key_idx] = dot;\n}\n\ntemplate &lt;typename scalar_t&gt;\n__global__ void triangular_attention_kernel(\n    // Query, Key, Value: (B*N, h, N, d)\n    const scalar_t* __restrict__ q,\n    const scalar_t* __restrict__ k,\n    const scalar_t* __restrict__ v,\n    // Bias: (B, h, N, N)\n    const scalar_t* __restrict__ bias,\n    // Mask: (B, N, N)\n    const int* __restrict__ mask,\n    // Output: (B*N, h, N, d)\n    scalar_t* __restrict__ out,\n    int batch_size, int seq_len, int num_heads, int head_dim, float scale) {\n    \n    // Each block handles one (batch, head, query_position)\n    // where trial = batch_idx * seq_len + row_idx\n    int trial = blockIdx.x;\n    int head_idx = blockIdx.y;\n    int query_idx = blockIdx.z;\n    \n    if (trial &gt;= batch_size * seq_len || head_idx &gt;= num_heads || query_idx &gt;= seq_len) return;\n    \n    int batch_idx = trial / seq_len;\n    int row_idx = trial % seq_len;\n    \n    // Pointers for this block\n    // Q, K, V shape is (B*N, h, N, d) stored as (B*N, h, N, d)\n    int qkv_offset = trial * num_heads * seq_len * head_dim + head_idx * seq_len * head_dim;\n    const scalar_t* q_row = q + qkv_offset;  // Point to Q for this trial/head\n    const scalar_t* k_all = k + trial * num_heads * seq_len * head_dim;  // All keys for this trial\n    const scalar_t* v_all = v + trial * num_heads * seq_len * head_dim;  // All values for this trial\n    \n    // Shared memory for attention scores: seq_len x seq_len for block\n    extern __shared__ char smem[];\n    scalar_t* s_scores = reinterpret_cast&lt;scalar_t*&gt;(smem);  // seq_len elements per thread block\n    \n    // Compute attention scores for this query against all keys\n    // Each thread handles one key position\n    scalar_t max_score = -INFINITY;\n    scalar_t sum_exp = scalar_t(0);\n    \n    // Online softmax computation\n    for (int key_idx = threadIdx.x; key_idx &lt; seq_len; key_idx += blockDim.x) {\n        // Compute Q @ K^T for this (query, key) pair\n        scalar_t score = scalar_t(0);\n        const scalar_t* q_ptr = q_row + query_idx * head_dim;\n        const scalar_t* k_ptr = k_all + head_idx * seq_len * head_dim + key_idx * head_dim;\n        \n        for (int d = 0; d &lt; head_dim; d++) {\n            score += q_ptr[d] * k_ptr[d];\n        }\n        \n        score *= scale;\n        \n        // Add bias if provided\n        if (bias != nullptr) {\n            // Bias shape: (B, h, N, N) - bias[batch, head, row, col]\n            score += bias[batch_idx * num_heads * seq_len * seq_len + \n                          head_idx * seq_len * seq_len + \n                          row_idx * seq_len + key_idx];\n        }\n        \n        // Apply mask\n        if (mask != nullptr) {\n            int mask_val = mask[batch_idx * seq_len * seq_len + row_idx * seq_len + key_idx];\n            if (mask_val == 0) {\n                score = -INFINITY;\n            }\n        }\n        \n        s_scores[key_idx] = score;\n    }\n    \n    __syncthreads();\n    \n    // Compute max for numerical stability (reduce across all threads)\n    // Use shared memory for reduction\n    __shared__ float s_max[32];  // For warp reduction\n    __shared__ float s_sum[32];\n    \n    float local_max = -INFINITY;\n    for (int i = threadIdx.x; i &lt; seq_len; i += blockDim.x) {\n        local_max = fmaxf(local_max, __half2float(s_scores[i]));\n    }\n    \n    // Warp reduction for max\n    int lane_id = threadIdx.x % 32;\n    int warp_id = threadIdx.x / 32;\n    \n    #pragma unroll\n    for (int offset = 16; offset &gt; 0; offset /= 2) {\n        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));\n    }\n    \n    if (lane_id == 0) {\n        s_max[warp_id] = local_max;\n    }\n    __syncthreads();\n    \n    if (threadIdx.x == 0) {\n        float global_max = s_max[0];\n        for (int i = 1; i &lt; (blockDim.x + 31) / 32; i++) {\n            global_max = fmaxf(global_max, s_max[i]);\n        }\n        s_max[0] = global_max;\n    }\n    __syncthreads();\n    \n    float global_max = s_max[0];\n    \n    // Compute exp(score - max) and sum\n    float local_sum = 0.0f;\n    for (int i = threadIdx.x; i &lt; seq_len; i += blockDim.x) {\n        float exp_val = expf(__half2float(s_scores[i]) - global_max);\n        s_scores[i] = exp_val;  // Store exp for later use\n        local_sum += exp_val;\n    }\n    \n    // Warp reduction for sum\n    #pragma unroll\n    for (int offset = 16; offset &gt; 0; offset /= 2) {\n        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);\n    }\n    \n    if (lane_id == 0) {\n        s_sum[warp_id] = local_sum;\n    }\n    __syncthreads();\n    \n    if (threadIdx.x == 0) {\n        float global_sum = s_sum[0];\n        for (int i = 1; i &lt; (blockDim.x + 31) / 32; i++) {\n            global_sum += s_sum[i];\n        }\n        s_sum[0] = global_sum;\n    }\n    __syncthreads();\n    \n    float inv_sum = 1.0f / s_sum[0];\n    \n    // Compute output: weighted sum of values\n    // Each thread handles one dimension of the output\n    scalar_t local_out[16];  // Assume head_dim &lt;= 16\n    for (int d = 0; d &lt; head_dim; d++) {\n        local_out[d] = scalar_t(0);\n    }\n    \n    for (int key_idx = 0; key_idx &lt; seq_len; key_idx++) {\n        float weight = __half2float(s_scores[key_idx]) * inv_sum;\n        const scalar_t* v_ptr = v_all + head_idx * seq_len * head_dim + key_idx * head_dim;\n        \n        for (int d = threadIdx.x; d &lt; head_dim; d += blockDim.x) {\n            local_out[d] += scalar_t(weight) * v_ptr[d];\n        }\n    }\n    \n    // Write output\n    int out_offset = trial * num_heads * seq_len * head_dim + head_idx * seq_len * head_dim + query_idx * head_dim;\n    for (int d = threadIdx.x; d &lt; head_dim; d += blockDim.x) {\n        out[out_offset + d] = local_out[d];\n    }\n}\n\ntorch::Tensor triangular_attention_cuda(\n    torch::Tensor q,       // (B*N, h, N, d)\n    torch::Tensor k,       // (B*N, h, N, d)\n    torch::Tensor v,       // (B*N, h, N, d)\n    c10::optional&lt;torch::Tensor&gt; bias,  // (B, h, N, N) or None\n    c10::optional&lt;torch::Tensor&gt; mask,  // (B, N, N) or None\n    int batch_size, int seq_len, int num_heads, int head_dim) {\n    \n    auto options = q.options();\n    auto out = torch::zeros({batch_size * seq_len, num_heads, seq_len, head_dim}, options);\n    \n    float scale = 1.0f / sqrtf((float)head_dim);\n    \n    int num_trials = batch_size * seq_len;\n    \n    // Grid: (num_trials, num_heads, seq_len)\n    dim3 grid(num_trials, num_heads, seq_len);\n    dim3 block(std::min(128, seq_len * head_dim));\n    \n    // Shared memory for attention scores\n    size_t smem_size = seq_len * sizeof(float);\n    \n    const float* bias_ptr = bias.has_value() ? bias.value().data_ptr&lt;float&gt;() : nullptr;\n    const int* mask_ptr = mask.has_value() ? mask.value().data_ptr&lt;int&gt;() : nullptr;\n    \n    triangular_attention_kernel&lt;float&gt;&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(\n        q.data_ptr&lt;float&gt;(),\n        k.data_ptr&lt;float&gt;(),\n        v.data_ptr&lt;float&gt;(),\n        bias_ptr,\n        mask_ptr,\n        out.data_ptr&lt;float&gt;(),\n        batch_size, seq_len, num_heads, head_dim, scale\n    );\n    \n    C10_CUDA_CHECK(cudaGetLastError());\n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor triangular_attention_cuda(\n    torch::Tensor q, torch::Tensor k, torch::Tensor v,\n    c10::optional&lt;torch::Tensor&gt; bias, c10::optional&lt;torch::Tensor&gt; mask,\n    int batch_size, int seq_len, int num_heads, int head_dim);\n\&quot;\&quot;\&quot;\n\n# Try to compile\ntriangular_attention_module = load_inline(\n    name=&#x27;triangular_attention&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;triangular_attention_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;-std=c++17&#x27;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, pair_dim, num_heads, dropout=0.0):\n        super().__init__()\n        self.num_heads = num_heads\n        self.head_dim = pair_dim // num_heads\n        assert pair_dim % num_heads == 0\n        self.layer_norm = nn.LayerNorm(pair_dim)\n        self.query = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.key = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.value = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.gate = nn.Linear(pair_dim, pair_dim)\n        self.bias_proj = nn.Linear(pair_dim, num_heads, bias=False)\n        self.out_proj = nn.Linear(pair_dim, pair_dim)\n        self.dropout = nn.Dropout(dropout)\n\n    def forward(self, pair_repr: torch.Tensor, pair_mask: torch.Tensor) -&gt; torch.Tensor:\n        (B, N, _, D) = pair_repr.shape\n        h = self.num_heads\n        d = self.head_dim\n        x = self.layer_norm(pair_repr)\n        g = torch.sigmoid(self.gate(x))\n        bias = self.bias_proj(x).permute(0, 3, 1, 2)  # (B, h, N, N)\n        \n        x_flat = x.reshape(B * N, N, D)\n        q = self.query(x_flat).view(B * N, N, h, d).transpose(1, 2)  # (B*N, h, N, d)\n        k = self.key(x_flat).view(B * N, N, h, d).transpose(1, 2)\n        v = self.value(x_flat).view(B * N, N, h, d).transpose(1, 2)\n        \n        # Use custom CUDA kernel for attention\n        out = triangular_attention_module.triangular_attention_cuda(\n            q.contiguous(), k.contiguous(), v.contiguous(),\n            bias.contiguous(), pair_mask.int().contiguous(),\n            B, N, h, d\n        )\n        \n        out = out.transpose(1, 2).reshape(B, N, N, D)\n        out = g * out\n        return self.out_proj(out)&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;triangular_attention&#x27;</div></details></div></details></div>
 </body></html>
