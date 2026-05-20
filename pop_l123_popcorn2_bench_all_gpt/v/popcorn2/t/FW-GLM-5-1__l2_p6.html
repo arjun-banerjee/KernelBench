@@ -6,16 +6,16 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-20 08:16:23 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 6</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · pop_l123_popcorn2_bench_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-20 08:18:46 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_TriangularAttention.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">4</div></div>
-  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">17215</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">4 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">5</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">30030</div></div>
   <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
   <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
@@ -202,5 +202,195 @@ compile_kernel PASSED: kernel compiled without errors.</div></details></div></de
   &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.cpp_extension import load_inline\nimport math\n\n# Fused CUDA kernel for triangular attention\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;c10/cuda/CUDAGuard.h&gt;\n\n__device__ __forceinline__ float warp_reduce_max(float val) {\n    for (int mask = 16; mask &gt; 0; mask &gt;&gt;= 1) {\n        val = max(val, __shfl_xor_sync(0xffffffff, val, mask));\n    }\n    return val;\n}\n\n__device__ __forceinline__ float warp_reduce_sum(float val) {\n    for (int mask = 16; mask &gt; 0; mask &gt;&gt;= 1) {\n        val += __shfl_xor_sync(0xffffffff, val, mask);\n    }\n    return val;\n}\n\n// Fused attention kernel: computes softmax(QK^T + bias) * V\n// Grid: (B * N * h) blocks, each block handles one attention head for one row\n// Block size: 256 threads, processes N sequence positions\n\ntemplate &lt;int BLOCK_SIZE&gt;\n__global__ void triangular_attention_kernel(\n    const float* __restrict__ query,    // (B, N, h, d) - but stored as (B*N, h, N, d)\n    const float* __restrict__ key,      // (B, N, h, d) - but stored as (B*N, h, N, d)\n    const float* __restrict__ value,    // (B, N, h, d) - but stored as (B*N, h, N, d)\n    const float* __restrict__ bias,     // (B, h, N, N)\n    const bool* __restrict__ mask,      // (B, N, N)\n    float* __restrict__ output,         // (B, N, h, d) -&gt; will be reshaped to (B, N, N, D)\n    int B, int N, int h, int d, float scale\n) {\n    // Each block handles one (batch_idx, row_idx, head_idx) tuple\n    int batch_row_idx = blockIdx.x / h;  // B*N total\n    int head_idx = blockIdx.x % h;\n    int batch_idx = batch_row_idx / N;\n    int row_idx = batch_row_idx % N;\n    \n    int tid = threadIdx.x;\n    \n    // Query pointer for this row: query[batch_idx, row_idx, head_idx, :]\n    // Layout is (B*N, h, N, d) - query is transposed\n    const float* q_ptr = query + (batch_row_idx * h + head_idx) * N * d + row_idx * d;\n    \n    // Key pointer: key[batch_idx, head_idx, :, :] for all positions\n    // Need to compute dot product with all N keys\n    const float* k_base = key + (batch_row_idx * h + head_idx) * N * d;\n    \n    // Compute QK^T for this row across all columns\n    // Each thread handles a subset of columns\n    float attn_scores[BLOCK_SIZE / 32];  // Each warp handles multiple positions\n    int positions_per_thread = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;\n    \n    __shared__ float shared_attn[BLOCK_SIZE];  // Shared attention scores\n    __shared__ float shared_max;\n    __shared__ float shared_sum;\n    \n    // First pass: compute all attention scores\n    for (int pos = tid; pos &lt; N; pos += BLOCK_SIZE) {\n        const float* k_ptr = k_base + pos * d;\n        \n        float dot = 0.0f;\n        for (int i = 0; i &lt; d; i++) {\n            dot += q_ptr[i] * k_ptr[i];\n        }\n        \n        // Add bias\n        float b = bias[batch_idx * h * N * N + head_idx * N * N + row_idx * N + pos];\n        dot = dot * scale + b;\n        \n        // Apply mask\n        bool m = mask[batch_idx * N * N + row_idx * N + pos];\n        if (!m) {\n            dot = -INFINITY;\n        }\n        \n        shared_attn[pos % BLOCK_SIZE] = dot;\n    }\n    __syncthreads();\n    \n    // Find max for numerical stability\n    float local_max = -INFINITY;\n    for (int pos = tid; pos &lt; N; pos += BLOCK_SIZE) {\n        float val = shared_attn[pos % BLOCK_SIZE];\n        local_max = max(local_max, val);\n    }\n    \n    // Reduce max across block\n    float block_max = warp_reduce_max(local_max);\n    if (tid % 32 == 0) {\n        shared_attn[tid / 32] = block_max;\n    }\n    __syncthreads();\n    \n    if (tid &lt; 32) {\n        float val = (tid &lt; (BLOCK_SIZE + 31) / 32) ? shared_attn[tid] : -INFINITY;\n        val = warp_reduce_max(val);\n        if (tid == 0) {\n            shared_max = val;\n        }\n    }\n    __syncthreads();\n    \n    float max_val = shared_max;\n    \n    // Compute exp and sum\n    float local_sum = 0.0f;\n    for (int pos = tid; pos &lt; N; pos += BLOCK_SIZE) {\n        float val = shared_attn[pos % BLOCK_SIZE];\n        val = expf(val - max_val);\n        shared_attn[pos % BLOCK_SIZE] = val;\n        local_sum += val;\n    }\n    \n    // Reduce sum across block\n    float block_sum = warp_reduce_sum(local_sum);\n    if (tid % 32 == 0) {\n        shared_attn[tid / 32] = block_sum;\n    }\n    __syncthreads();\n    \n    if (tid &lt; 32) {\n        float val = (tid &lt; (BLOCK_SIZE + 31) / 32) ? shared_attn[tid] : 0.0f;\n        val = warp_reduce_sum(val);\n        if (tid == 0) {\n            shared_sum = val;\n        }\n    }\n    __syncthreads();\n    \n    float sum_val = shared_sum;\n    float inv_sum = 1.0f / sum_val;\n    \n    // Normalize\n    for (int pos = tid; pos &lt; N; pos += BLOCK_SIZE) {\n        shared_attn[pos % BLOCK_SIZE] *= inv_sum;\n    }\n    __syncthreads();\n    \n    // Compute output: sum over positions of attn[pos] * value[pos]\n    // Value pointer: value[batch_idx, head_idx, :, :]\n    const float* v_base = value + (batch_row_idx * h + head_idx) * N * d;\n    \n    // Output pointer: output[batch_idx, row_idx, head_idx, :]\n    float* out_ptr = output + (batch_idx * N * h + row_idx * h + head_idx) * d;\n    \n    // Initialize output\n    for (int i = tid; i &lt; d; i += BLOCK_SIZE) {\n        out_ptr[i] = 0.0f;\n    }\n    __syncthreads();\n    \n    // Accumulate weighted values\n    for (int pos = 0; pos &lt; N; pos++) {\n        float attn_weight = shared_attn[pos % BLOCK_SIZE];\n        const float* v_ptr = v_base + pos * d;\n        \n        for (int i = tid; i &lt; d; i += BLOCK_SIZE) {\n            atomicAdd(&amp;out_ptr[i], attn_weight * v_ptr[i]);\n        }\n        __syncthreads();\n    }\n}\n\ntorch::Tensor triangular_attention_cuda(\n    torch::Tensor query,\n    torch::Tensor key,\n    torch::Tensor value,\n    torch::Tensor bias,\n    torch::Tensor mask,\n    int B, int N, int h, int d\n) {\n    auto output = torch::empty({B * N, h, d}, query.options());\n    float scale = 1.0f / sqrtf((float)d);\n    \n    const int BLOCK_SIZE = 256;\n    int num_blocks = B * N * h;\n    \n    triangular_attention_kernel&lt;BLOCK_SIZE&gt;&lt;&lt;&lt;num_blocks, BLOCK_SIZE&gt;&gt;&gt;(\n        query.data_ptr&lt;float&gt;(),\n        key.data_ptr&lt;float&gt;(),\n        key.data_ptr&lt;float&gt;(),\n        bias.data_ptr&lt;float&gt;(),\n        mask.data_ptr&lt;bool&gt;(),\n        output.data_ptr&lt;float&gt;(),\n        B, N, h, d, scale\n    );\n    \n    return output;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor triangular_attention_cuda(\n    torch::Tensor query,\n    torch::Tensor key,\n    torch::Tensor value,\n    torch::Tensor bias,\n    torch::Tensor mask,\n    int B, int N, int h, int d);\n\&quot;\&quot;\&quot;\n\ntriangular_attention_module = load_inline(\n    name=&#x27;triangular_attention&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;triangular_attention_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, pair_dim, num_heads, dropout=0.0):\n        super().__init__()\n        self.num_heads = num_heads\n        self.head_dim = pair_dim // num_heads\n        assert pair_dim % num_heads == 0\n        self.layer_norm = nn.LayerNorm(pair_dim)\n        self.query = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.key = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.value = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.gate = nn.Linear(pair_dim, pair_dim)\n        self.bias_proj = nn.Linear(pair_dim, num_heads, bias=False)\n        self.out_proj = nn.Linear(pair_dim, pair_dim)\n        self.dropout = nn.Dropout(dropout)\n\n    def forward(self, pair_repr: torch.Tensor, pair_mask: torch.Tensor) -&gt; torch.Tensor:\n        (B, N, _, D) = pair_repr.shape\n        h = self.num_heads\n        d = self.head_dim\n        \n        x = self.layer_norm(pair_repr)\n        g = torch.sigmoid(self.gate(x))\n        bias = self.bias_proj(x).permute(0, 3, 1, 2)\n        \n        x_flat = x.reshape(B * N, N, D)\n        q = self.query(x_flat).view(B * N, N, h, d).transpose(1, 2)\n        k = self.key(x_flat).view(B * N, N, h, d).transpose(1, 2)\n        v = self.value(x_flat).view(B * N, N, h, d).transpose(1, 2)\n        \n        # Use custom CUDA kernel for attention\n        # q, k, v are (B*N, h, N, d)\n        # bias is (B, h, N, N)\n        # mask is (B, N, N)\n        \n        attn_out = triangular_attention_module.triangular_attention_cuda(\n            q.contiguous(), k.contiguous(), v.contiguous(),\n            bias.contiguous(), pair_mask.bool().contiguous(),\n            B, N, h, d\n        )\n        # attn_out is (B*N, h, d)\n        \n        out = attn_out.view(B, N, h, d).transpose(1, 2).reshape(B, N, N, D)\n        out = g * out\n        return self.out_proj(out)&quot;
 }</div></details><details open><summary>result ← run_correctness (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>run_correctness</b>
 run_correctness FAILED: ? trials did not all match.
-runtime_error: shape &#x27;[5, 65, 65, 64]&#x27; is invalid for input of size 20800</div></details></div></details></div>
+runtime_error: shape &#x27;[5, 65, 65, 64]&#x27; is invalid for input of size 20800</div></details></div></details><details class="turn-collapse"><summary><b>turn 3</b> · 1 tool call(s) · 384.5s turn · 42.5s LLM · tokens in=8,188 · out=4,627 · total=12,815 · 16,954 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 3</span><span>384.5s turn · 42.5s LLM · 341.9s tools · <span class="turn-tokens">tokens in=8,188 · out=4,627 · total=12,815</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">There&#x27;s a shape mismatch. Let me trace through the shapes:
+
+Input: (B, N, N, D)
+After layer_norm: (B, N, N, D)
+After gate: g = (B, N, N, D)
+After bias_proj: (B, N, N, num_heads) -&gt; permute to (B, h, N, N)
+
+x_flat = x.reshape(B * N, N, D) - this reshapes to (B*N, N, D)
+q = self.query(x_flat) -&gt; (B*N, N, pair_dim) since query projects D -&gt; D
+q.view(B * N, N, h, d) -&gt; (B*N, N, h, d)
+q.transpose(1, 2) -&gt; (B*N, h, N, d)
+
+So q, k, v are (B*N, h, N, d)
+
+In the reference:
+attn = q @ k.transpose(-1, -2) / sqrt(d) -&gt; (B*N, h, N, N)
+attn = attn.view(B, N, h, N, N) -&gt; B, N, h, N, N
+
+Then after attention:
+out = (attn @ v).transpose(1, 2).reshape(B, N, N, D)
+attn @ v -&gt; (B*N, h, N, d)
+transpose(1, 2) -&gt; (B*N, N, h, d)
+reshape(B, N, N, D) -&gt; (B, N, N, D)
+
+My kernel output is (B*N, h, d), which represents the output for each batch-row-head combination.
+
+But wait, I need to properly handle this. The issue is that my output shape is wrong. Let me trace through again.
+
+For each (batch_idx, row_idx, head_idx) tuple, I&#x27;m computing:
+- q[row_idx] @ k.transpose @ v -&gt; should produce a d-dimensional output
+
+But actually, the attention is computed as:
+attn[q_row_idx, col_idx] = softmax(Q[q_row_idx] @ K[col_idx]^T + bias) for all col_idx
+output = attn @ V
+
+So for a given row_idx and head_idx:
+- q = Q[batch_idx, row_idx, head_idx, :] - shape (d,)
+- For all columns j, compute q @ K[batch_idx, :, head_idx, j, :]^T = q @ K[batch_idx, head_idx, j, :].T
+  Wait, the layout is (B*N, h, N, d) for k. So k[b*n_idx, h_idx, pos_idx, :] gives d values.
+
+Let me reconsider the layout:
+- q: (B*N, h, N, d) - batch_row_idx, head_idx, position_idx, d_val
+- For a given (batch_row_idx, head_idx), we have N positions, each with a d-dimensional vector.
+
+For attention at row_idx:
+- Q row: q[batch_row_idx, head_idx, row_idx, :] - this is a d-dim vector
+- We compute Q[row_idx] @ K.T for all N keys: for each col in [0, N), compute q[row_idx, :] @ k[batch_row_idx, head_idx, col, :].T
+
+The attention scores are (N,) for each row.
+Then output = sum over col of attn[col] * v[batch_row_idx, head_idx, col, :]
+
+The output for row_idx, head_idx is a d-dimensional vector.
+
+So my output shape (B*N, h, d) doesn&#x27;t make sense because it should be (B*N, h, N, d) - one output per position.
+
+Wait, looking at the reference more carefully:
+
+out = (attn @ v).transpose(1, 2).reshape(B, N, N, D)
+
+attn @ v: attn is (B*N, h, N, N), v is (B*N, h, N, d)
+Result: (B*N, h, N, d)
+
+transpose(1, 2): (B*N, N, h, d)
+reshape(B, N, N, D): (B, N, N, D)
+
+So the output should have shape (B*N, h, N, d), not (B*N, h, d).
+
+Each row produces N outputs, one for each position, but wait... that&#x27;s not right either.
+
+Let me think about this again. In standard attention:
+- Q, K, V each have N positions
+- For each query position i, we compute attention over all key positions j
+- output[i] = sum_j(softmax(Q[i] @ K[j]^T / sqrt(d)) * V[j])
+
+So for N query positions, we get N outputs.
+
+In the triangular attention here:
+- We have a pair representation (B, N, N, D)
+- x_flat = x.reshape(B * N, N, D) means we&#x27;re treating each row independently
+- For each batch-row pair, we have N positions (columns), each with D features
+- Q, K, V are computed from this
+- Standard self-attention is performed: for each position in the row, attend to all other positions in the row
+
+So the output should be (B*N, h, N, d) where for each (batch, row, head), we have N outputs corresponding to the N positions.
+
+My kernel is wrong - I was only computing one output per (batch, row, head) tuple, but I should compute N outputs.
+
+Actually wait, let me re-read the reference code more carefully:
+
+```python
+x_flat = x.reshape(B * N, N, D)
+q = self.query(x_flat).view(B * N, N, h, d).transpose(1, 2)
+```
+
+So q is (B*N, h, N, d). For each (batch*N_idx, head_idx), we have N positions, each with d features.
+
+Then:
+```python
+attn = q @ k.transpose(-1, -2) / math.sqrt(d)
+```
+attn is (B*N, h, N, N) - for each (batch*N_idx, head_idx), we have an N x N attention matrix.
+
+```python
+attn = attn.view(B, N, h, N, N)
+```
+Reshape to (B, N, h, N, N). This separates batch*N back into batch and N dimensions.
+
+```python
+out = (attn @ v).transpose(1, 2).reshape(B, N, N, D)
+```
+attn @ v: (B, N, h, N, d)
+transpose(1, 2): (B, h, N, N, d)? No wait, that doesn&#x27;t make sense.
+
+Hmm, let me trace this more carefully:
+attn = attn.view(B, N, h, N, N) -&gt; (B, N, h, N, N)
+v is still (B*N, h, N, d)
+
+If we do attn @ v after viewing, it&#x27;s not clear. Let me check the reference again:
+
+```python
+attn = attn.view(B, N, h, N, N)
+attn = attn + bias.unsqueeze(1)
+mask = pair_mask.unsqueeze(1).unsqueeze(2)
+attn = attn.masked_fill(mask == 0, float(&#x27;-inf&#x27;))
+attn = attn.view(B * N, h, N, N)
+attn = F.softmax(attn, dim=-1)
+```
+
+Ah, attn is reshaped back to (B*N, h, N, N) before softmax.
+
+Then:
+```python
+out = (attn @ v).transpose(1, 2).reshape(B, N, N, D)
+```
+attn: (B*N, h, N, N)
+v: (B*N, h, N, d)
+attn @ v: (B*N, h, N, d)
+transpose(1, 2): (B*N, N, h, d)
+reshape(B, N, N, D): (B, N, N, D)
+
+So the output is (B, N, N, D), meaning for each batch, we have N rows, and each row has N positions, each with D features.
+
+OK so my kernel design is wrong. I was trying to compute the output for a single row, but I should be computing outputs for all positions in that row.
+
+Let me redesign:
+- Each block handles one (batch_idx, row_idx, head_idx) combination
+- For this combination, we need to compute attention for all N query positions in that row
+- Output: N positions, each with d features
+
+Actually, for standard self-attention, each position in the sequence attends to all other positions. So for a row of N positions:
+- For position i (column i), we compute: output[i] = sum_j(softmax(Q[i] @ K[j]^T / sqrt(d) + bias) * V[j])
+
+But looking at the reference code more carefully:
+- x_flat = x.reshape(B * N, N, D) treats each row as a separate sequence
+- For each &quot;batch*N_idx&quot;, which corresponds to (batch, row), we perform self-attention over the N columns
+
+So for a single row (batch_idx, row_idx):
+- Q, K, V are computed from the N positions in that row
+- Standard self-attention is performed
+
+The output for each position in the row is a d-dimensional vector (per head). Total output per row per head: N * d.
+
+So my kernel should output (B*N, h, N, d) not (B*N, h, d).
+
+Actually, let me redesign the kernel:
+- Each thread block handles one (batch_idx, row_idx, head_idx) combination
+- The block computes attention for all N positions in that row
+- For each position i, we compute attention scores over all positions j, then weight the values
+
+This is essentially batched self-attention where each batch is a row.
+
+For efficiency, I should use shared memory to cache the Q, K, V for the row:
+- Q: N x d
+- K: N x d
+- V: N x d
+
+Then for each position i:
+- Compute Q[i] @ K.T -&gt; N attention scores
+- Apply bias, mask, softmax
+- Compute output[i] = attn @ V
+
+With N=64, d=16, h=4, this is small enough to fit in shared memory.
+
+Let me rewrite the kernel.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>I see the issue - my kernel output shape is wrong. Let me trace through the shapes more carefully and fix the kernel.
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.cpp_extension import load_inline\nimport math\n\n# Fused CUDA kernel for triangular attention\n# Each (batch, row) is treated as a separate sequence for self-attention\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;c10/cuda/CUDAGuard.h&gt;\n\n__device__ __forceinline__ float warp_reduce_max(float val) {\n    for (int mask = 16; mask &gt; 0; mask &gt;&gt;= 1) {\n        val = max(val, __shfl_xor_sync(0xffffffff, val, mask));\n    }\n    return val;\n}\n\n__device__ __forceinline__ float warp_reduce_sum(float val) {\n    for (int mask = 16; mask &gt; 0; mask &gt;&gt;= 1) {\n        val += __shfl_xor_sync(0xffffffff, val, mask);\n    }\n    return val;\n}\n\n// Fused attention kernel: computes softmax(QK^T + bias) * V for each row\n// Grid: (B * N * h) blocks, each block handles one attention head for one row\n// Block size: 256 threads\n// Each block computes all N outputs for its (batch, row, head)\n\ntemplate &lt;int BLOCK_SIZE, int MAX_SEQ&gt;\n__global__ void triangular_attention_kernel(\n    const float* __restrict__ query,    // (B*N, h, N, d)\n    const float* __restrict__ key,      // (B*N, h, N, d)\n    const float* __restrict__ value,    // (B*N, h, N, d)\n    const float* __restrict__ bias,     // (B, h, N, N)\n    const bool* __restrict__ mask,      // (B, N, N)\n    float* __restrict__ output,         // (B*N, h, N, d)\n    int B, int N, int h_dim, int d, float scale\n) {\n    // Each block handles one (batch_idx, row_idx, head_idx) tuple\n    int batch_row_idx = blockIdx.x / h_dim;\n    int head_idx = blockIdx.x % h_dim;\n    int batch_idx = batch_row_idx / N;\n    int row_idx = batch_row_idx % N;\n    \n    int tid = threadIdx.x;\n    \n    // Pointers to Q, K, V for this (batch_row, head)\n    const float* q_base = query + (batch_row_idx * h_dim + head_idx) * N * d;\n    const float* k_base = key + (batch_row_idx * h_dim + head_idx) * N * d;\n    const float* v_base = value + (batch_row_idx * h_dim + head_idx) * N * d;\n    \n    // Shared memory for K, V (N x d each)\n    extern __shared__ float shared_mem[];\n    float* shared_k = shared_mem;                  // N * d floats\n    float* shared_v = shared_mem + N * d;          // N * d floats  \n    float* shared_attn = shared_mem + 2 * N * d;   // N floats for attention scores\n    \n    // Load K and V into shared memory\n    // Each thread loads multiple elements\n    for (int idx = tid; idx &lt; N * d; idx += BLOCK_SIZE) {\n        shared_k[idx] = k_base[idx];\n        shared_v[idx] = v_base[idx];\n    }\n    __syncthreads();\n    \n    // Output pointer\n    float* out_base = output + (batch_row_idx * h_dim + head_idx) * N * d;\n    \n    // For each query position, compute attention and output\n    // Each thread handles one or more query positions\n    for (int q_pos = tid; q_pos &lt; N; q_pos += BLOCK_SIZE) {\n        // Load query vector into registers\n        const float* q_ptr = q_base + q_pos * d;\n        \n        // Compute attention scores for this query position\n        // Q[q_pos] @ K.T for all positions\n        float local_max = -INFINITY;\n        \n        for (int k_pos = 0; k_pos &lt; N; k_pos++) {\n            float dot = 0.0f;\n            for (int i = 0; i &lt; d; i++) {\n                dot += q_ptr[i] * shared_k[k_pos * d + i];\n            }\n            \n            // Add bias\n            float b = bias[batch_idx * h_dim * N * N + head_idx * N * N + row_idx * N + k_pos];\n            dot = dot * scale + b;\n            \n            // Apply mask (row-based mask)\n            bool m = mask[batch_idx * N * N + row_idx * N + k_pos];\n            if (!m) {\n                dot = -INFINITY;\n            }\n            \n            shared_attn[k_pos] = dot;\n            local_max = max(local_max, dot);\n        }\n        \n        // Online softmax: compute max and exp sum\n        float max_val = local_max;\n        float sum_val = 0.0f;\n        \n        for (int k_pos = 0; k_pos &lt; N; k_pos++) {\n            float val = expf(shared_attn[k_pos] - max_val);\n            shared_attn[k_pos] = val;\n            sum_val += val;\n        }\n        \n        float inv_sum = 1.0f / sum_val;\n        \n        // Normalize and compute weighted sum of values\n        float out_vec[MAX_SEQ];  // Register storage for output\n        for (int i = 0; i &lt; d; i++) {\n            out_vec[i] = 0.0f;\n        }\n        \n        for (int k_pos = 0; k_pos &lt; N; k_pos++) {\n            float attn_weight = shared_attn[k_pos] * inv_sum;\n            for (int i = 0; i &lt; d; i++) {\n                out_vec[i] += attn_weight * shared_v[k_pos * d + i];\n            }\n        }\n        \n        // Write output\n        for (int i = 0; i &lt; d; i++) {\n            out_base[q_pos * d + i] = out_vec[i];\n        }\n    }\n}\n\ntorch::Tensor triangular_attention_cuda(\n    torch::Tensor query,\n    torch::Tensor key,\n    torch::Tensor value,\n    torch::Tensor bias,\n    torch::Tensor mask,\n    int B, int N, int h_dim, int d\n) {\n    // Output: (B*N, h, N, d)\n    auto output = torch::empty({B * N, h_dim, N, d}, query.options());\n    float scale = 1.0f / sqrtf((float)d);\n    \n    const int BLOCK_SIZE = 256;\n    int num_blocks = B * N * h_dim;\n    \n    // Shared memory: K (N*d) + V (N*d) + attn (N)\n    size_t shared_mem_size = (2 * N * d + N) * sizeof(float);\n    \n    // Launch kernel with dynamic shared memory\n    void* args[] = {\n        &amp;query, &amp;key, &amp;value, &amp;bias, &amp;mask, &amp;output,\n        &amp;B, &amp;N, &amp;h_dim, &amp;d, &amp;scale\n    };\n    \n    cudaLaunchConfig_t config = {0};\n    config.gridDim = num_blocks;\n    config.blockDim = BLOCK_SIZE;\n    config.sharedMem = shared_mem_size;\n    \n    if (d &lt;= 16) {\n        triangular_attention_kernel&lt;BLOCK_SIZE, 16&gt;&lt;&lt;&lt;config&gt;&gt;&gt;(query, key, value, bias, mask, output, B, N, h_dim, d, scale);\n    } else if (d &lt;= 32) {\n        triangular_attention_kernel&lt;BLOCK_SIZE, 32&gt;&lt;&lt;&lt;config&gt;&gt;&gt;(query, key, value, bias, mask, output, B, N, h_dim, d, scale);\n    } else {\n        triangular_attention_kernel&lt;BLOCK_SIZE, 64&gt;&lt;&lt;&lt;config&gt;&gt;&gt;(query, key, value, bias, mask, output, B, N, h_dim, d, scale);\n    }\n    \n    return output;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor triangular_attention_cuda(\n    torch::Tensor query,\n    torch::Tensor key,\n    torch::Tensor value,\n    torch::Tensor bias,\n    torch::Tensor mask,\n    int B, int N, int h_dim, int d);\n\&quot;\&quot;\&quot;\n\ntriangular_attention_module = load_inline(\n    name=&#x27;triangular_attention&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;triangular_attention_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;-maxrregcount=128&#x27;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, pair_dim, num_heads, dropout=0.0):\n        super().__init__()\n        self.num_heads = num_heads\n        self.head_dim = pair_dim // num_heads\n        assert pair_dim % num_heads == 0\n        self.layer_norm = nn.LayerNorm(pair_dim)\n        self.query = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.key = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.value = nn.Linear(pair_dim, pair_dim, bias=False)\n        self.gate = nn.Linear(pair_dim, pair_dim)\n        self.bias_proj = nn.Linear(pair_dim, num_heads, bias=False)\n        self.out_proj = nn.Linear(pair_dim, pair_dim)\n        self.dropout = nn.Dropout(dropout)\n\n    def forward(self, pair_repr: torch.Tensor, pair_mask: torch.Tensor) -&gt; torch.Tensor:\n        (B, N, _, D) = pair_repr.shape\n        h = self.num_heads\n        d = self.head_dim\n        \n        x = self.layer_norm(pair_repr)\n        g = torch.sigmoid(self.gate(x))\n        bias = self.bias_proj(x).permute(0, 3, 1, 2)\n        \n        x_flat = x.reshape(B * N, N, D)\n        q = self.query(x_flat).view(B * N, N, h, d).transpose(1, 2)\n        k = self.key(x_flat).view(B * N, N, h, d).transpose(1, 2)\n        v = self.value(x_flat).view(B * N, N, h, d).transpose(1, 2)\n        \n        # Use custom CUDA kernel for attention\n        # q, k, v are (B*N, h, N, d)\n        # bias is (B, h, N, N)\n        # mask is (B, N, N)\n        \n        attn_out = triangular_attention_module.triangular_attention_cuda(\n            q.contiguous(), k.contiguous(), v.contiguous(),\n            bias.contiguous(), pair_mask.bool().contiguous(),\n            B, N, h, d\n        )\n        # attn_out is (B*N, h, N, d)\n        \n        out = attn_out.view(B * N, h, N, d).transpose(1, 2).reshape(B, N, N, D)\n        out = g * out\n        return self.out_proj(out)&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;triangular_attention_v1&#x27;</div></details></div></details></div>
 </body></html>
