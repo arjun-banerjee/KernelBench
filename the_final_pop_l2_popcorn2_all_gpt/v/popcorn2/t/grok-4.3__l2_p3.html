@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L2 P3 · popcorn2</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 3</a></div><div class="site-subtitle">grok-4.3 · popcorn2 · the_final_pop_l2_popcorn2_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/grok-4.3.html">← grok-4.3</a><span class="meta">generated 2026-05-27 17:03:15 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html">FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html" class=current>grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-in_progress">in_progress</span>
+  <span style="font-size:13px;">3_FusedCrossAttentionRoPEDropout.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">grok-4.3</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 75</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">12579</div></div>
+  <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn2</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-27T16:45:31Z</div></div>
+</div>
+
+
+
+</div><details class="ref-source"><summary>reference PyTorch source (the prompt the agent sees)</summary><pre class="block"># popcorn2: large-tier module centers (scripts/gen_popcorn2_centers.py).
+# Source: KernelBench/level2/popcorn/3_FusedCrossAttentionRoPEDropout.py
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    &quot;&quot;&quot;
+    Single-layer multi-head cross-attention with RoPE on Q and K, attention
+    dropout, and output projection—intended as a fusion target for robotics
+    stacks (e.g. proprio / action queries attending to vision or memory).
+
+    Pipeline (conceptually one fused kernel): linear Q from query stream,
+    linear K/V from key–value stream → reshape heads → apply RoPE separately
+    along query positions (T_q) and key positions (T_k) → scaled dot-product,
+    softmax, dropout on weights → aggregate values → output projection.
+    &quot;&quot;&quot;
+
+    def __init__(self, dim: int, num_heads: int, dropout: float=0.0, rope_base: float=10000.0):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert self.head_dim % 2 == 0, &#x27;RoPE requires an even head dimension&#x27;
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+        inv_freq = 1.0 / rope_base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
+        self.register_buffer(&#x27;inv_freq&#x27;, inv_freq, persistent=False)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -&gt; torch.Tensor:
+        (x1, x2) = x.chunk(2, dim=-1)
+        return torch.cat([-x2, x1], dim=-1)
+
+    def _rope(self, x: torch.Tensor, seq_len: int) -&gt; torch.Tensor:
+        &quot;&quot;&quot;Apply RoPE along the sequence dimension (last-but-one after head). x: (B, H, L, d).&quot;&quot;&quot;
+        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos = emb.cos().view(1, 1, seq_len, self.head_dim)
+        sin = emb.sin().view(1, 1, seq_len, self.head_dim)
+        return x * cos + self._rotate_half(x) * sin
+
+    def forward(self, x_query: torch.Tensor, x_kv: torch.Tensor) -&gt; torch.Tensor:
+        &quot;&quot;&quot;
+        Args:
+            x_query: (B, T_q, dim) — e.g. robot or decoder tokens
+            x_kv:    (B, T_k, dim) — e.g. encoder / memory tokens
+        Returns:
+            (B, T_q, dim)
+        &quot;&quot;&quot;
+        (B, T_q, _) = x_query.shape
+        (_, T_k, _) = x_kv.shape
+        (h, d) = (self.num_heads, self.head_dim)
+        q = self.q_proj(x_query).view(B, T_q, h, d).transpose(1, 2)
+        k = self.k_proj(x_kv).view(B, T_k, h, d).transpose(1, 2)
+        v = self.v_proj(x_kv).view(B, T_k, h, d).transpose(1, 2)
+        q = self._rope(q, T_q)
+        k = self._rope(k, T_k)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, T_q, self.dim)
+        return self.out_proj(out)
+
+class ModelNew(nn.Module):
+    &quot;&quot;&quot;
+    KernelBench candidate entry point (`eval_kernel_against_ref` / `run_and_check`).
+    Replace this class with a fused CUDA/Triton (etc.) implementation; the default
+    delegates to `Model` so you can smoke-test the harness with the same file for
+    both `ref_arch_src_path` and `kernel_src_path`.
+    &quot;&quot;&quot;
+
+    def __init__(self, dim: int, num_heads: int, dropout: float=0.0, rope_base: float=10000.0):
+        super().__init__()
+        self._impl = Model(dim, num_heads, dropout, rope_base)
+
+    def forward(self, x_query: torch.Tensor, x_kv: torch.Tensor) -&gt; torch.Tensor:
+        return self._impl(x_query, x_kv)
+batch_size = 8
+seq_len_q = 64
+seq_len_kv = 128
+dim = 320
+num_heads = 8
+dropout_p = 0.0
+
+def get_inputs():
+    p = popcorn_pri
+    mode = p.sample_input_mode()
+    bs = p.trial_dim(batch_size, &#x27;batch_size&#x27;, mode=mode)
+    tq = p.trial_dim(seq_len_q, &#x27;seq_len_q&#x27;, mode=mode)
+    tk = p.trial_dim(seq_len_kv, &#x27;seq_len_kv&#x27;, mode=mode)
+    x_query = torch.randn(bs, tq, dim)
+    x_kv = torch.randn(bs, tk, dim)
+    return [x_query, x_kv]
+
+def get_init_inputs():
+    return [dim, num_heads, dropout_p]
+</pre></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>2.1s turn · 2.1s LLM · 0.0s tools · <span class="turn-tokens">tokens in=3,109 · out=6 · total=3,324</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">The task is to replace the forward computation of this PyTorch model with a custom CUDA kernel. The model is a single-layer multi-head cross-attention with RoPE on Q and K, attention dropout, and outp...
+</div></details><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>75.9s turn · 2.8s LLM · 73.1s tools · <span class="turn-tokens">tokens in=3,557 · out=231 · total=4,074</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">It&#x27;s an H100, so high performance, tensor cores available.
+The task requires replacing the forward computation with a custom CUDA kernel in ModelNew, using torch.utils.cpp_extension.load_inline, ensuring numerical equivalence at fp32, and faster execution.
+
+Key points:
+- Same constructor args.
+- Same forward signature.
+- Equivalent outputs.
+- Faster.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = &#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\ntorch::Tensor fused_attention(torch::Tensor x_query, torch::Tensor x_kv) {\n    // Placeholder\n    return x_query;\n}\n&#x27;&#x27;&#x27;\n\ncpp_source = &#x27;&#x27;&#x27;\ntorch::Tensor fused_attention(torch::Tensor x_query, torch::Tensor x_kv);\n&#x27;&#x27;&#x27;\n\nmodule = load_inline(\n    name=&#x27;fused_attn&#x27;,\n    cpp_sources=[cpp_source],\n    cuda_sources=[cuda_source],\n    functions=[&#x27;fused_attention&#x27;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim: int, num_heads: int, dropout: float=0.0, rope_base: float=10000.0):\n        super().__init__()\n        self._impl = None  # placeholder\n\n    def forward(self, x_query: torch.Tensor, x_kv: torch.Tensor) -&gt; torch.Tensor:\n        return module.fused_attention(x_query, x_kv)\nprint(&#x27;Compiled successfully&#x27;)\n&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>261.7s turn · 8.1s LLM · 253.6s tools · <span class="turn-tokens">tokens in=4,091 · out=776 · total=5,181</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Good, basic compiles.
+
+Now, I need to implement the full thing. This will be a big task. I need to write the full CUDA kernel for this.
+The task requires replacing the forward computation with a custom CUDA kernel in ModelNew, ensuring numerical equivalence at fp32, same constructor args, and faster execution. Use torch.utils.cpp_extension.load_inline for inline CUDA compilation and binding.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport math\n\ncuda_source = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cublas_v2.h&gt;\n#include &lt;cmath&gt;\n\n__global__ void rope_kernel(float* x, const float* inv_freq, int B, int H, int L, int D, int head_dim) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int total = B * H * L * head_dim;\n    if (idx &gt;= total) return;\n    int d = idx % head_dim;\n    int l = (idx / head_dim) % L;\n    int rest = idx / (head_dim * L);\n    float freq = inv_freq[d / 2];\n    float t = (float)l;\n    float theta = t * freq;\n    float cos_theta = cosf(theta);\n    float sin_theta = sinf(theta);\n    if (d % 2 == 0) {\n        float x1 = x[idx];\n        float x2 = x[idx + 1];\n        x[idx] = x1 * cos_theta - x2 * sin_theta;\n        x[idx + 1] = x1 * sin_theta + x2 * cos_theta;\n    }\n}\n\ntorch::Tensor fused_cross_attention(\n    torch::Tensor x_query,\n    torch::Tensor x_kv,\n    torch::Tensor q_weight,\n    torch::Tensor k_weight,\n    torch::Tensor v_weight,\n    torch::Tensor out_weight,\n    torch::Tensor inv_freq,\n    float scale,\n    int num_heads,\n    int head_dim\n) {\n    // Simplified placeholder - return x_query for now\n    return x_query;\n}\n&#x27;&#x27;&#x27;\n\ncpp_source = r&#x27;&#x27;&#x27;\ntorch::Tensor fused_cross_attention(\n    torch::Tensor x_query,\n    torch::Tensor x_kv,\n    torch::Tensor q_weight,\n    torch::Tensor k_weight,\n    torch::Tensor v_weight,\n    torch::Tensor out_weight,\n    torch::Tensor inv_freq,\n    float scale,\n    int num_heads,\n    int head_dim\n);\n&#x27;&#x27;&#x27;\n\nmodule = load_inline(\n    name=&#x27;fused_cross_attn&#x27;,\n    cpp_sources=[cpp_source],\n    cuda_sources=[cuda_source],\n    functions=[&#x27;fused_cross_attention&#x27;],\n    extra_cuda_cflags=[&#x27;-lcublas&#x27;],\n    verbose=True\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim: int, num_heads: int, dropout: float=0.0, rope_base: float=10000.0):\n        super().__init__()\n        assert dim % num_heads == 0\n        self.dim = dim\n        self.num_heads = num_heads\n        self.head_dim = dim // num_heads\n        self.q_proj = nn.Linear(dim, dim, bias=False)\n        self.k_proj = nn.Linear(dim, dim, bias=False)\n        self.v_proj = nn.Linear(dim, dim, bias=False)\n        self.out_proj = nn.Linear(dim, dim, bias=False)\n        inv_freq = 1.0 / rope_base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)\n        self.register_buffer(&#x27;inv_freq&#x27;, inv_freq)\n        self.scale = 1.0 / math.sqrt(self.head_dim)\n\n    def forward(self, x_query: torch.Tensor, x_kv: torch.Tensor) -&gt; torch.Tensor:\n        return module.fused_cross_attention(\n            x_query, x_kv,\n            self.q_proj.weight, self.k_proj.weight, self.v_proj.weight, self.out_proj.weight,\n            self.inv_freq, self.scale, self.num_heads, self.head_dim\n        )\nprint(&#x27;Skeleton compiled&#x27;)\n&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></div>
+</body></html>

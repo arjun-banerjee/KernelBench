@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L2 P13 · popcorn2</title>
+<link rel="stylesheet" href="../../../style.css">
+<meta http-equiv="refresh" content="60">
+</head><body>
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 13</a></div><div class="site-subtitle">FW-GLM-5-1 · popcorn2 · the_final_pop_l2_popcorn2_all_gpt</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn2</a><a href="../models/FW-GLM-5-1.html">← FW-GLM-5-1</a><span class="meta">generated 2026-05-27 17:03:15 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn2:</span><a href="../../../v/popcorn2/index.html">overview</a><a href="../../../v/popcorn2/models/FW-GLM-5-1.html" class=current>FW-GLM-5-1</a><a href="../../../v/popcorn2/models/gpt-5.5-priority.html">gpt-5.5-priority</a><a href="../../../v/popcorn2/models/grok-4.3.html">grok-4.3</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<div class="card-row">
+  <span class="outcome-badge outcome-in_progress">in_progress</span>
+  <span style="font-size:13px;">13_QuantVLA_SelectiveLayoutFusion.py</span>
+</div>
+<div class="tldr-grid">
+  <div class="tldr-cell"><div class="l">model</div><div class="v">FW-GLM-5-1</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 75</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
+  <div class="tldr-cell"><div class="l">tokens (total)</div><div class="v">8700</div></div>
+  <div class="tldr-cell"><div class="l">wall clock</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">truncated</div><div class="v">no</div></div>
+  <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn2</div></div>
+  <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">ref runtime</div>
+    <div class="v">0.00 μs</div></div>
+  <div class="tldr-cell"><div class="l">speedup</div><div class="v">—</div></div>
+  <div class="tldr-cell"><div class="l">started</div><div class="v">2026-05-27T16:45:31Z</div></div>
+</div>
+
+
+
+</div><details class="ref-source"><summary>reference PyTorch source (the prompt the agent sees)</summary><pre class="block"># popcorn2: large-tier module centers (scripts/gen_popcorn2_centers.py).
+# Source: KernelBench/level2/popcorn/13_QuantVLA_SelectiveLayoutFusion.py
+
+import torch
+import torch.nn as nn
+
+def _fake_quant_symmetric_int8(x: torch.Tensor, scale: torch.Tensor) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Symmetric int8 fake-quant: round(x/scale) clamped to [-127, 127], times scale.&quot;&quot;&quot;
+    q = torch.clamp(torch.round(x / scale), -127.0, 127.0)
+    return q * scale
+
+class Model(nn.Module):
+    &quot;&quot;&quot;
+    **QuantVLA selective layout fusion** (reference target for a fused CUDA/Triton kernel).
+
+    Vision–language–action stacks often use **token-wise mixed precision**: some
+    timesteps or modalities tolerate aggressive quantization while others stay in
+    full precision. This module fuses in **one forward**:
+
+      1. **Layout routing** — ``sigmoid(layout_logits)`` yields a per-token mix
+         coefficient in ``(0, 1)`` (quant vs FP residual).
+      2. **Quantitative path** — global symmetric **int8-style fake quantization**
+         (scale from the tensor max, ``/ 127``).
+      3. **Selective blend** — ``α · x_quant + (1 - α) · x``.
+      4. **Head** — linear projection on the mixed activations.
+
+    This matches a “quantitative selective layout” block: the layout logits (from a
+    router, modality tags, or calibration) choose how strongly each position uses the
+    quantized layout vs the identity layout.
+    &quot;&quot;&quot;
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.out_proj = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x: torch.Tensor, layout_logits: torch.Tensor) -&gt; torch.Tensor:
+        &quot;&quot;&quot;
+        Args:
+            x: (B, T, D) VLA token activations (fused modalities).
+            layout_logits: (B, T) unbounded logits; larger → more mass on quantized path.
+        Returns:
+            (B, T, D) updated activations.
+        &quot;&quot;&quot;
+        (B, T, D) = x.shape
+        assert D == self.dim
+        assert layout_logits.shape == (B, T)
+        alpha = torch.sigmoid(layout_logits).unsqueeze(-1)
+        with torch.no_grad():
+            amax = x.detach().abs().max().clamp(min=1e-08)
+        scale = amax / 127.0
+        x_q = _fake_quant_symmetric_int8(x, scale)
+        mixed = alpha * x_q + (1.0 - alpha) * x
+        return self.out_proj(mixed)
+
+class ModelNew(nn.Module):
+    &quot;&quot;&quot;KernelBench candidate entry point; default delegates to ``Model``.&quot;&quot;&quot;
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self._impl = Model(dim)
+
+    def forward(self, x: torch.Tensor, layout_logits: torch.Tensor) -&gt; torch.Tensor:
+        return self._impl(x, layout_logits)
+batch_size = 16
+seq_len = 128
+dim = 160
+
+def get_inputs():
+    p = popcorn_pri
+    mode = p.sample_input_mode()
+    x = torch.randn(p.trial_dim(batch_size, &#x27;batch_size&#x27;, mode=mode), p.trial_dim(seq_len, &#x27;seq_len&#x27;, mode=mode), dim)
+    layout_logits = torch.randn(p.trial_dim(batch_size, &#x27;batch_size&#x27;, mode=mode), p.trial_dim(seq_len, &#x27;seq_len&#x27;, mode=mode))
+    return [x, layout_logits]
+
+def get_init_inputs():
+    return [dim]
+</pre></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>4.3s turn · 4.3s LLM · 0.0s tools · <span class="turn-tokens">tokens in=2,702 · out=257 · total=2,959</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me understand this task. I need to replace the forward computation of a PyTorch model with a custom CUDA kernel. The model does:
+
+1. Compute alpha = sigmoid(layout_logits).unsqueeze(-1)
+2. Compute amax = x.detach().abs().max().clamp(min=1e-08)
+3. Compute scale = amax / 127.0
+4. Compute x_q = fake_quant_symmetric_int8(x, scale) which is clamp(round(x/scale), -127, 127) * scale
+5. Compute mixed = alpha * x_q + (1 - alpha) * x
+6. Return out_proj(mixed)
+
+So the operations are:
+- Sigmoid on layout_logits (B, T) -&gt; alpha (B, T, 1)
+- Global abs max of x -&gt; scalar amax
+- Scale computation: amax / 127.0
+- Fake quant: round(x/scale), clamp to [-127, 127], multiply by scale
+- Blend: alpha * x_q + (1 - alpha) * x
+- Linear projection: mixed @ weight.T + bias
+
+Let me start by getting GPU specs to understand the hardware.
+</div></details><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>call → ert_roofline</summary><div class="block tool-args"><span class="role-tag">call</span><b>ert_roofline</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details><details><summary>result ← ert_roofline (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>ert_roofline</b>
+ert_roofline PASSED: empirical roofline benchmarks complete.
+=== Empirical Roofline Model ===
+Device: NVIDIA H100 80GB HBM3
+
+--- Measured Bandwidth ---
+  L1            13.6 GB/s  (working set: 32 KB)
+  L2           927.6 GB/s  (working set: 2048 KB)
+  DRAM        2577.3 GB/s  (working set: 262144 KB)
+
+--- Measured Compute Throughput ---
+  FP32                 51.85 TFLOPS
+  FP16 (tensor core)    758.77 TFLOPS
+
+Ridge point (FP32): 20.12 FLOPs/byte
+  Kernels with arithmetic intensity below the ridge point are
+  memory-bound; above it they are compute-bound.</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 190.9s turn · 32.2s LLM · tokens in=3,136 · out=2,605 · total=5,741 · 10,365 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>190.9s turn · 32.2s LLM · 158.7s tools · <span class="turn-tokens">tokens in=3,136 · out=2,605 · total=5,741</span></span></div><details open><summary>reasoning</summary><div class="block reasoning">Now I understand the hardware. Let me analyze the task:
+
+1. The forward pass computes:
+   - alpha = sigmoid(layout_logits).unsqueeze(-1)  -&gt; (B, T, 1)
+   - amax = x.detach().abs().max().clamp(min=1e-08)  -&gt; scalar
+   - scale = amax / 127.0
+   - x_q = clamp(round(x / scale), -127, 127) * scale
+   - mixed = alpha * x_q + (1 - alpha) * x
+   - return out_proj(mixed)
+
+2. Input shapes:
+   - x: (B, T, D) = (16, 128, 160) 
+   - layout_logits: (B, T) = (16, 128)
+
+3. Output: (B, T, D) = (16, 128, 160)
+
+This is a relatively small kernel. The data size is 16*128*160*4 = 1.28 MB for x, plus output.
+
+Let me write a CUDA kernel that fuses these operations. I&#x27;ll need to:
+1. Compute sigmoid for layout_logits
+2. Find the global max of abs(x)
+3. Compute fake quant
+4. Compute the blend
+5. Apply the linear projection
+
+For the linear projection, I can use cuBLAS for the matrix multiplication since it&#x27;s highly optimized, or I can write my own kernel.
+
+Let me start by writing a kernel that fuses everything up to the linear projection, then calls PyTorch&#x27;s linear for the final step.
+
+Actually, looking at this more carefully, the key optimizations are:
+1. Fusing the sigmoid + alpha computation
+2. Fusing the quantization and blend
+3. The linear projection might benefit from using tensor cores
+
+For the first attempt, let me fuse the quantize + blend operations into a single kernel, then use torch.nn.functional.linear for the projection.
+
+Let me write the kernel:
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>Now I understand the task. Let me analyze the forward pass:
+
+1. `alpha = sigmoid(layout_logits).unsqueeze(-1)` → (B, T, 1)
+2. `amax = x.abs().max()` → scalar (global max)
+3. `scale = amax / 127.0`
+4. `x_q = clamp(round(x / scale), -127, 127) * scale`
+5. `mixed = alpha * x_q + (1 - alpha) * x`
+6. `out_proj(mixed)` → linear projection
+
+The input is (16, 128, 160) = ~1.28 MB. Let me write a fused CUDA kernel for this:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.cpp_extension import load_inline\n\n# Compile the CUDA extension\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cmath&gt;\n\n// Warp reduce for max\n__device__ float warp_reduce_max(float val) {\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));\n    }\n    return val;\n}\n\n// Block reduce for max\n__device__ float block_reduce_max(float val) {\n    __shared__ float shared[32];\n    int lane = threadIdx.x % 32;\n    int wid = threadIdx.x / 32;\n    \n    val = warp_reduce_max(val);\n    \n    if (lane == 0) {\n        shared[wid] = val;\n    }\n    __syncthreads();\n    \n    val = (threadIdx.x &lt; blockDim.x / 32) ? shared[lane] : -INFINITY;\n    if (wid == 0) {\n        val = warp_reduce_max(val);\n    }\n    return val;\n}\n\n// Kernel to find global max of abs(x)\n__global__ void find_amax_kernel(const float* __restrict__ x, float* amax_out, int total_elements) {\n    float local_max = 0.0f;\n    \n    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i &lt; total_elements; i += blockDim.x * gridDim.x) {\n        float val = fabsf(x[i]);\n        local_max = fmaxf(local_max, val);\n    }\n    \n    float block_max = block_reduce_max(local_max);\n    \n    if (threadIdx.x == 0) {\n        atomicMax(reinterpret_cast&lt;int*&gt;(amax_out), __float_as_int(block_max));\n    }\n}\n\n// Faster sigmoid approximation\n__device__ __forceinline__ float fast_sigmoid(float x) {\n    // Approximate sigmoid: 0.5 + 0.5 * tanh(0.5 * x)\n    // Or use the hardware approximation\n    return 0.5f + 0.5f * tanhf(0.5f * x);\n}\n\n// Fused kernel: sigmoid + quantize + blend\n__global__ void fused_quant_blend_kernel(\n    const float* __restrict__ x,\n    const float* __restrict__ layout_logits,\n    float* __restrict__ out,\n    float scale,\n    int B, int T, int D\n) {\n    const int total = B * T * D;\n    const int D_stride = D;\n    \n    // Each thread handles multiple elements\n    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx &lt; total; idx += blockDim.x * gridDim.x) {\n        int d = idx % D;\n        int t = (idx / D) % T;\n        int b = idx / (T * D);\n        \n        int logit_idx = b * T + t;\n        \n        float x_val = x[idx];\n        float logit = layout_logits[logit_idx];\n        \n        // Compute sigmoid for alpha\n        float alpha = 1.0f / (1.0f + expf(-logit));\n        \n        // Quantize: round(x/scale), clamp, multiply back\n        float q_val = roundf(x_val / scale);\n        q_val = fmaxf(-127.0f, fminf(127.0f, q_val));\n        q_val = q_val * scale;\n        \n        // Blend: alpha * x_q + (1 - alpha) * x\n        float mixed = alpha * q_val + (1.0f - alpha) * x_val;\n        \n        out[idx] = mixed;\n    }\n}\n\n// Optimized version with vectorized loads\n__global__ void fused_quant_blend_kernel_vec4(\n    const float* __restrict__ x,\n    const float* __restrict__ layout_logits,\n    float* __restrict__ out,\n    float scale,\n    int B, int T, int D\n) {\n    const int total = B * T * D;\n    \n    // Process 4 elements at a time if aligned\n    if (D % 4 == 0) {\n        const float4* x_vec = reinterpret_cast&lt;const float4*&gt;(x);\n        float4* out_vec = reinterpret_cast&lt;float4*&gt;(out);\n        int total_vec4 = total / 4;\n        \n        for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx &lt; total_vec4; idx += blockDim.x * gridDim.x) {\n            int elem_idx = idx * 4;\n            int d = elem_idx % D;\n            int t = (elem_idx / D) % T;\n            int b = elem_idx / (T * D);\n            int logit_idx = b * T + t;\n            \n            float alpha = 1.0f / (1.0f + expf(-layout_logits[logit_idx]));\n            \n            float4 x4 = x_vec[idx];\n            float4 out4;\n            \n            out4.x = alpha * fminf(127.0f, fmaxf(-127.0f, roundf(x4.x / scale))) * scale + (1.0f - alpha) * x4.x;\n            out4.y = alpha * fminf(127.0f, fmaxf(-127.0f, roundf(x4.y / scale))) * scale + (1.0f - alpha) * x4.y;\n            out4.z = alpha * fminf(127.0f, fmaxf(-127.0f, roundf(x4.z / scale))) * scale + (1.0f - alpha) * x4.z;\n            out4.w = alpha * fminf(127.0f, fmaxf(-127.0f, roundf(x4.w / scale))) * scale + (1.0f - alpha) * x4.w;\n            \n            out_vec[idx] = out4;\n        }\n    } else {\n        // Fallback to scalar\n        for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx &lt; total; idx += blockDim.x * gridDim.x) {\n            int d = idx % D;\n            int t = (idx / D) % T;\n            int b = idx / (T * D);\n            int logit_idx = b * T + t;\n            \n            float x_val = x[idx];\n            float alpha = 1.0f / (1.0f + expf(-layout_logits[logit_idx]));\n            float q_val = roundf(x_val / scale);\n            q_val = fmaxf(-127.0f, fminf(127.0f, q_val));\n            float mixed = alpha * q_val * scale + (1.0f - alpha) * x_val;\n            out[idx] = mixed;\n        }\n    }\n}\n\n// Host functions\ntorch::Tensor find_amax_cuda(torch::Tensor x) {\n    int total_elements = x.numel();\n    \n    // Initialize with a small positive value\n    torch::Tensor amax_out = torch::zeros({}, x.options());\n    amax_out.fill_(1e-8);\n    \n    const int block_size = 256;\n    const int num_blocks = (total_elements + block_size - 1) / block_size;\n    \n    find_amax_kernel&lt;&lt;&lt;num_blocks, block_size&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(),\n        amax_out.data_ptr&lt;float&gt;(),\n        total_elements\n    );\n    \n    return amax_out;\n}\n\ntorch::Tensor fused_quant_blend_cuda(\n    torch::Tensor x,\n    torch::Tensor layout_logits,\n    float scale\n) {\n    auto sizes = x.sizes();\n    int B = sizes[0];\n    int T = sizes[1];\n    int D = sizes[2];\n    \n    auto out = torch::empty_like(x);\n    \n    const int total = B * T * D;\n    const int block_size = 256;\n    const int num_blocks = (total + block_size * 4 - 1) / (block_size * 4);\n    \n    fused_quant_blend_kernel_vec4&lt;&lt;&lt;num_blocks, block_size&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(),\n        layout_logits.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        scale,\n        B, T, D\n    );\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor find_amax_cuda(torch::Tensor x);\ntorch::Tensor fused_quant_blend_cuda(torch::Tensor x, torch::Tensor layout_logits, float scale);\n\&quot;\&quot;\&quot;\n\n# Load the extension\nfused_extension = load_inline(\n    name=&#x27;fused_quant_blend&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;find_amax_cuda&#x27;, &#x27;fused_quant_blend_cuda&#x27;],\n    verbose=False,\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;]\n)\n\nimport numpy as np\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim: int):\n        super().__init__()\n        self.dim = dim\n        self.out_proj = nn.Linear(dim, dim, bias=True)\n        \n    def forward(self, x: torch.Tensor, layout_logits: torch.Tensor) -&gt; torch.Tensor:\n        B, T, D = x.shape\n        \n        # Find global amax using CUDA kernel\n        amax = fused_extension.find_amax_cuda(x)\n        scale = amax / 127.0\n        \n        # Fused quantize + blend\n        mixed = fused_extension.fused_quant_blend_cuda(x, layout_logits, scale.item())\n        \n        # Linear projection\n        return self.out_proj(mixed)&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
+</body></html>
